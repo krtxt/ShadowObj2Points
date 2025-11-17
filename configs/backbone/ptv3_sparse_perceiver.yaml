@@ -1,0 +1,180 @@
+# PTv3 Sparse Encoder - Perceiver 策略配置
+# Perceiver-style 跨注意力压缩 + Surface-Aware 预筛选
+# 结合几何先验和可学习查询，专为抓取生成任务优化
+
+defaults:
+  - override /model/flow_matching/decoder/backbone@_here_: ptv3_sparse
+
+name: ptv3_sparse
+token_strategy: perceiver  # last_layer | fps | grid | learned | multiscale
+
+# ===== PTv3 Encoder 基础配置 =====
+
+# grid_size: 体素化精度
+#   - 影响初始点数和计算量
+#   - 推荐: 0.02 (平衡), 0.01 (更精细), 0.03 (更快)
+grid_size: 0.02
+
+# stride: Encoder 下采样步长
+#   - 长度必须是 len(encoder_channels) - 1
+#   - 每个值表示相邻阶段的下采样倍数
+stride: [2, 2, 2, 2]
+
+# encoder_channels: Encoder 各阶段通道数
+encoder_channels: [32, 64, 128, 256, 512]
+
+# encoder_depths: 各阶段 Transformer 层数
+encoder_depths: [1, 1, 2, 2, 1]
+
+# encoder_num_head: 各阶段注意力头数
+encoder_num_head: [2, 4, 8, 16, 16]
+
+# enc_patch_size: 各阶段 patch size
+enc_patch_size: [1024, 1024, 1024, 1024, 1024]
+
+# mlp_ratio: MLP 扩展比例
+mlp_ratio: 2
+
+# input_feature_dim: 输入特征维度（除 xyz 外）
+input_feature_dim: 1
+
+# out_dim: 输出特征维度
+out_dim: 512
+
+# target_num_tokens: 目标 token 数量
+target_num_tokens: 128
+
+# tokens_last: 输出格式
+#   - true: (B, K, D) - 适合 DiT/Transformer
+#   - false: (B, D, K) - 适合 CNN
+tokens_last: true  # true | false
+
+# use_flash_attention: 是否使用 Flash Attention
+use_flash_attention: true  # true | false
+
+# ===== Perceiver 策略专用配置 =====
+
+# perceiver_num_layers: Cross-Attention 层数
+#   - 1-2 层：快速，适合简单场景
+#   - 3-4 层：更强表达能力，适合复杂场景
+perceiver_num_layers: 2
+
+# perceiver_num_heads: 注意力头数
+#   - 必须能整除 out_dim
+perceiver_num_heads: 8
+
+# perceiver_mlp_ratio: FFN 扩展比例
+#   - 通常是 out_dim 的 2-4 倍
+perceiver_mlp_ratio: 4.0
+
+# perceiver_dropout: Dropout 比例
+perceiver_dropout: 0.1
+
+# perceiver_use_pos_embed: 是否使用位置编码
+#   - 建议: true (帮助模型理解空间关系)
+perceiver_use_pos_embed: true
+
+# perceiver_pos_embed_type: 位置编码类型
+#   - 'learnable': 学习 coord -> pos_embed 的映射 (推荐)
+#   - 'sinusoidal': 固定的 Sinusoidal 编码
+perceiver_pos_embed_type: learnable
+
+# ===== Surface-Aware 预筛选配置 =====
+
+# use_surface_prefilter: 是否使用 Surface-Aware 预筛选
+#   - true: 使用预筛选，降低计算量（推荐）
+#   - false: 直接从所有点中提取（计算量大）
+use_surface_prefilter: true
+
+# num_candidates: 预筛选的候选点数量
+#   - 推荐: target_num_tokens 的 4-8 倍
+#   - 太小: 可能丢失重要信息
+#   - 太大: 计算量增加，效果提升有限
+num_candidates: 512  # 128 * 4
+
+# surface_k_neighbors: 计算曲率时的近邻数
+#   - 用于局部几何特征估计
+surface_k_neighbors: 16
+
+# curvature_ratio: 高曲率点的比例
+#   - 0.8 表示 80% 来自高曲率区域，20% 来自均匀采样
+#   - 高曲率区域通常是边缘、角落等抓取关键位置
+curvature_ratio: 0.8
+
+# ===== 性能估计 =====
+
+# 输入: (B, 8192, 3)
+# PTv3 Encoder: 8192 -> ~2000 点（取决于 grid_size 和 stride）
+# Surface Prefilter: 2000 -> 512 候选点
+# Perceiver Query: 512 -> 128 tokens
+#
+# 计算复杂度:
+#   - Cross-Attention: O(K × M) = O(128 × 512) ≈ 65K 操作/layer
+#   - 总计（2层）: ~130K 操作
+#   - vs. 直接从 8192 中提取: O(128 × 8192) ≈ 1M 操作
+#   - 加速比: ~7.7x
+#
+# 显存占用:
+#   - Query embeddings: 128 * 512 * 4B ≈ 256 KB
+#   - Perceiver weights: ~15 MB
+#   - Activation: ~60 MB (per batch)
+#
+# 推理速度（估计，A100）:
+#   - PTv3 Encoder: ~100 ms
+#   - Surface Prefilter: ~10 ms
+#   - Perceiver Query: ~25 ms
+#   - 总计: ~135 ms/sample
+
+# ===== 使用建议 =====
+
+# 1. 训练初期：
+#    - 可以降低 perceiver_num_layers 到 1，加快训练
+#    - 观察 attention weights 可视化，确保 query 有意义
+#
+# 2. 调优：
+#    - 调整 num_candidates：太小可能丢失信息，太大增加计算量
+#    - 调整 curvature_ratio：不同物体可能需要不同比例
+#    - 调整 perceiver_num_layers：更多层可能提升性能但增加计算
+#
+# 3. 诊断：
+#    - 如果 attention 过于分散 → 增加 perceiver_num_layers
+#    - 如果 attention 过于集中 → 检查是否需要更多候选点
+#    - 如果坐标预测不准 → 检查 use_surface_prefilter 是否合适
+#
+# 4. 与 DiT 配合：
+#    - 确保 out_dim 与 DiT 的 d_model 一致
+#    - tokens_last=true 以便直接送入 DiT
+#    - 可以使用 return_full_res=True 可视化中间结果
+
+# ===== 预设配置 =====
+
+# 预设1: 快速原型（最少计算）
+# perceiver_num_layers: 1
+# num_candidates: 256
+# target_num_tokens: 64
+# → 适合快速验证想法
+
+# 预设2: 平衡（推荐）✅
+# perceiver_num_layers: 2
+# num_candidates: 512
+# target_num_tokens: 128
+# → 性能和效率平衡
+
+# 预设3: 高质量（更多 tokens）
+# perceiver_num_layers: 3
+# num_candidates: 1024
+# target_num_tokens: 256
+# → 追求最佳效果，计算量较大
+
+# ===== 对比旧实现 =====
+
+# 本配置等效于：
+# - SceneTokenizer (use_local_features=false)
+# - Surface-Aware + DETR-Style Query 混合方案
+#
+# 优势：
+# - 统一到 PTv3SparseEncoder 框架
+# - 与其他策略公平对比
+# - 配置更清晰，易于调优
+# - 代码维护成本更低
+

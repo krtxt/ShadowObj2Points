@@ -1,0 +1,31 @@
+name: pointnext
+
+# 输出模式：sparse 或 dense
+mode: dense        # sparse | dense
+                    # dense: 输出 N 个逐点特征 (B, N, 3) 和 (B, dense_out_dim, N)
+
+# dense 模式下的输出维度
+dense_out_dim: 512
+
+num_points: 8192
+num_tokens: 128
+out_dim: 512
+
+width: 24
+blocks: [1, 1, 1, 1, 1]
+strides: [1, 2, 2, 4, 4]
+
+use_res: true
+radius: 0.1
+nsample: 32
+sa_layers: 1
+sa_use_res: false
+expansion: 4
+
+# 输入特征维度：xyz(3) + mask(1) = 4
+# 如果使用 RGB: xyz(3) + rgb(3) = 6
+# 如果使用 RGB+mask: xyz(3) + rgb(3) + mask(1) = 7
+input_feature_dim: 4
+use_xyz: true  # true | false
+normalize_xyz: true  # true | false
+use_fps: true  # true | false

@@ -1,0 +1,37 @@
+# PyTorch Lightning Trainer Configuration
+accelerator: gpu
+devices: 1
+precision: 32  # 16-mixed | 32 | 64
+max_epochs: 500
+# strategy: ddp_find_unused_parameters_true
+
+# Training settings
+gradient_clip_val: 1.0
+gradient_clip_algorithm: norm
+accumulate_grad_batches: 1
+
+# Validation settings
+check_val_every_n_epoch: 1
+val_check_interval: null  # 如果想在epoch内验证，设置为0.5等
+
+# Logging
+log_every_n_steps: 15
+
+# Checkpointing (通过callbacks配置)
+enable_checkpointing: true
+
+# Progress bar
+enable_progress_bar: true
+
+# Model summary
+enable_model_summary: true
+
+# Debugging
+fast_dev_run: false  # 快速测试运行
+overfit_batches: 0   # 过拟合测试
+
+# Deterministic training
+deterministic: false  # 设为true会更慢但可复现
+
+# Other settings
+num_sanity_val_steps: 0

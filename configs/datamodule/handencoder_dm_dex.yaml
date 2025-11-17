@@ -1,0 +1,46 @@
+_target_: datamodules.HandEncoderDataModule.HandEncoderDataModule
+name: handencoder_dm_dex
+mode: dexgraspnet
+
+# HandEncoderDataModule constructor args
+batch_size: ${batch_size}
+num_workers: 8
+pin_memory: true
+rot_type: ${rot_type}           # 'quat' | 'r6d' | 'euler' | 'axis'
+trans_anchor: ${hand_anchor}    # 'base' | 'palm_center' | 'mjcf'
+hand_scale: 1.0
+urdf_assets_meta_path: ${paths.assets_dir}/urdf/urdf_assets_meta.json
+use_cached_keypoints: true
+cache_root: ${paths.data_dir}/DexGraspNet/cache_joint_key_points
+cache_max_shards_in_memory: 2  # 可设置为 'all' 以一次性载入内存
+use_local_pose_only: true
+norm_xyz_stats_path: ${paths.data_dir}/DexGraspNet/norm_xyz_stats_use_local_anchor-${hand_anchor}
+# Cached dataset behavior
+#  - cache_show_progress: 初始化/扫描分片时显示进度
+cache_show_progress: true
+# use_cached_keypoints: false
+# cache_root: null
+# cache_max_shards_in_memory: 2
+
+# Optional phases for splits
+train_phase: train
+val_phase: test
+test_phase: test
+
+# Graph construction options (follow the notebook defaults)
+use_palm_star: false
+connect_forearm: true
+add_middle_distal: true
+
+# Passed through to the underlying dataset (MyDexGraspNet)
+dataset_kwargs:
+  asset_dir: ${paths.data_dir}/DexGraspNet
+  phase: all
+  rot_type: ${rot_type}
+  trans_anchor: ${hand_anchor}
+  debug_mode: false
+  use_stats_normalization: true
+  normalization_stats_path: ${paths.assets_dir}/unified_normalization_stats
+  # Explicit debug files (override defaults when debug_mode: true)
+  pt_file_name: dexgraspnet_shadowhand_downsample.pt
+  split_file_name: grasp.json

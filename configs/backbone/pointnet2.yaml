@@ -1,0 +1,54 @@
+name: pointnet2
+mode: sparse  # sparse | dense
+dense_out_dim: 512
+use_pooling: false  # true | false
+
+layer1:
+  npoint: 2048
+  radius_list:
+    - 0.04
+  nsample_list:
+    - 64
+  mlp_list:
+    - 4  # xyz(3) + mask(1) = 4, 如果用 RGB 则改为 6 或 7
+    - 64
+    - 64
+    - 128
+
+layer2:
+  npoint: 1024
+  radius_list:
+    - 0.1
+  nsample_list:
+    - 32
+  mlp_list:
+    - 128
+    - 128
+    - 128
+    - 256
+
+layer3:
+  npoint: 512
+  radius_list:
+    - 0.2
+  nsample_list:
+    - 32
+  mlp_list:
+    - 256
+    - 128
+    - 128
+    - 256
+
+layer4:
+  npoint: 128
+  radius_list:
+    - 0.3
+  nsample_list:
+    - 16
+  mlp_list:
+    - 256
+    - 512
+    - 512
+
+use_xyz: true  # true | false
+normalize_xyz: true  # true | false

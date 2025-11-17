@@ -1,0 +1,70 @@
+# PointNext 大容量配置
+# - 面向与 PTv3 类似的容量级别，提供更强表达能力
+# - 建议在大批量训练或追求最佳性能时使用
+
+name: pointnext
+
+# ============= 基本参数 =============
+
+# 输出模式：sparse 或 dense
+mode: sparse        # sparse | dense
+                    # dense: 输出 N 个逐点特征 (B, N, 3) 和 (B, dense_out_dim, N)
+
+# dense 模式下的输出维度
+dense_out_dim: 512
+
+# 输入点数（与数据集保持一致）
+num_points: 8192
+
+# 输出 token 数量（与最终层下采样一致）
+num_tokens: 128
+
+# 输出特征维度，与下游解码器保持一致
+out_dim: 512
+
+# ============= PointNext 架构参数 =============
+
+# 基础通道宽度
+# - 64: 增强版（≈ 8M 参数，适度增加推理时间）
+width: 64
+
+# 每个阶段的 InvResMLP 块数量
+# - [1, 2, 2, 2, 1]: 兼顾深度与稳定性
+blocks: [1, 2, 2, 2, 1]
+
+# 分层下采样步长
+# - 1 * 2 * 2 * 4 * 4 = 64x，下采样后保留 128 tokens
+strides: [1, 2, 2, 4, 4]
+
+# ============= 局部聚合参数 =============
+
+use_res: true
+
+# 中等范围的球查询半径，适配 64 宽度
+radius: 0.12
+
+# 增大邻域数量以提高稳定性
+nsample: 48
+
+sa_layers: 2
+sa_use_res: true
+
+# InvResMLP 扩展比例
+expansion: 4
+
+# ============= 输入/输出配置 =============
+
+# 输入特征维度：xyz(3) + mask(1) = 4
+# 如果使用 RGB: xyz(3) + rgb(3) = 6
+# 如果使用 RGB+mask: xyz(3) + rgb(3) + mask(1) = 7
+input_feature_dim: 4
+use_xyz: true  # true | false
+normalize_xyz: true  # true | false
+
+# 默认使用 FPS 采样
+use_fps: true  # true | false
+sampler: fps
+
+# ============= 训练注意事项 =============
+# - 推荐将 batch_size 适当降低，或启用混合精度以控制显存
+# - 推理时间相较轻量版约提升 2.5~3 倍（视 GPU 而定）

@@ -1,0 +1,45 @@
+_target_: datamodules.HandEncoderDataModule.HandEncoderDataModule
+name: handencoder_dm_bodex
+mode: bodexhshadow
+
+# HandEncoderDataModule constructor args
+batch_size: ${batch_size}
+num_workers: 8
+pin_memory: true
+rot_type: ${rot_type}
+trans_anchor: ${hand_anchor}
+hand_scale: 1.0
+urdf_assets_meta_path: assets/urdf/urdf_assets_meta.json
+use_cached_keypoints: true
+cache_root: ${paths.data_dir}/bodex/bodex_shadow/cache_joint_key_points
+cache_max_shards_in_memory: 2  # 可设置为 'all' 以一次性载入内存
+use_local_pose_only: true
+norm_xyz_stats_path: ${paths.data_dir}/bodex/bodex_shadow/norm_xyz_stats_use_local_anchor-${hand_anchor}
+# Cached dataset behavior
+#  - cache_show_progress: 初始化/扫描分片时显示进度
+cache_show_progress: true
+# use_cached_keypoints: false
+# cache_root: null
+# cache_max_shards_in_memory: 2
+
+# Optional phases for splits
+train_phase: train
+val_phase: test
+test_phase: test
+
+# Graph construction options
+use_palm_star: false
+connect_forearm: true
+add_middle_distal: true
+
+# Passed through to the underlying dataset (MyBodexShadow)
+dataset_kwargs:
+  asset_dir: ./data/bodex/bodex_shadow
+  succ_grasp_subdir: succ_collect
+  phase: all
+  rot_type: ${rot_type}
+  trans_anchor: ${hand_anchor}
+  use_stats_normalization: true
+  normalization_stats_path: assets/unified_normalization_stats
+  split_file_name: bodex_split.json
+  debug_mode: false

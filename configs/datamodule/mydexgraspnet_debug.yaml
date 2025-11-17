@@ -1,0 +1,36 @@
+name: mydexgraspnet
+mode: dexgraspnet  # Debug 配置，默认加载较小的 256 样本集
+
+common: &common_cfg
+  asset_dir: ./data/DexGraspNet
+  num_grasps: ${target_num_grasps}
+  rot_type: ${rot_type}
+  max_grasps_per_object: null
+  max_points: 4096
+  grasp_sampling_strategy: farthest_point
+  use_exhaustive_sampling: false
+  exhaustive_sampling_strategy: sequential
+  trans_anchor: ${hand_anchor}
+  use_stats_normalization: true
+  normalization_stats_path: assets/unified_normalization_stats
+  pt_file_name: debug_grasp_data_256.pt
+  point_clouds_file_name: debug_point_clouds_256.pkl
+  split_file_name: debug_grasp_256.json
+
+train:
+  <<: *common_cfg
+  phase: all
+  batch_size: ${batch_size}
+  num_workers: 8
+
+val:
+  <<: *common_cfg
+  phase: all
+  batch_size: ${batch_size}
+  num_workers: 8
+
+test:
+  <<: *common_cfg
+  phase: all
+  batch_size: ${batch_size}
+  num_workers: 8

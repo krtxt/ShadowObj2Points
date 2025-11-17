@@ -1,0 +1,38 @@
+name: sonata_backbone
+
+output_mode: adapter  # raw | adapter
+out_dim: 512
+
+sonata_model_name: sonata
+sonata_pretrained: true  # true | false
+
+freeze_sonata: false  # true | false
+unfreeze_at_epoch: null
+unfreeze_lr_scale: 1.0
+
+sonata_custom_config:
+  enable_flash: true  # true | false
+  enc_patch_size: [256, 256, 256, 256, 256]
+  stride: [2, 2, 2, 2]
+
+num_tokens: 128
+token_dim: 512
+compression_mode: perceiver  # perceiver | detr | pooling
+num_cross_attn_layers: 2
+num_heads: 8
+mlp_ratio: 4.0
+dropout: 0.1
+
+use_prefilter: true  # true | false
+num_candidates: 1024
+prefilter_mode: fps  # fps | random | surface
+
+use_pos_embed: true  # true | false
+pos_embed_type: learnable  # learnable | sinusoidal
+
+return_coords: false  # true | false
+return_attention: false  # true | false
+
+grid_size: 0.001
+use_color: false  # true | false
+use_normal: false  # true | false

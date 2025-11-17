@@ -1,0 +1,7 @@
+# Base experiment merged at root
+# @package _global_
+
+# This file intentionally left minimal to allow experiment=<name>
+# to merge configs into the global namespace.
+
+# You can put common experiment-wide overrides here if needed.

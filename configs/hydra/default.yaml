@@ -1,0 +1,7 @@
+# Hydra Configuration (package: hydra)
+# Note: When inside the 'hydra' config package, do not prefix with 'hydra/' again
+# or Hydra will resolve it as hydra/hydra/* which causes override errors.
+defaults:
+  - override job_logging: stdout
+
+output_subdir: .hydra

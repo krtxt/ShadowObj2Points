@@ -1,0 +1,49 @@
+# Callbacks Configuration
+
+# Model Checkpoint - 保存最佳模型
+model_checkpoint:
+  _target_: pytorch_lightning.callbacks.ModelCheckpoint
+  dirpath: ${paths.output_dir}/checkpoints
+  filename: "epoch={epoch:03d}-val_loss={val/total:.4f}"
+  monitor: "val/total"
+  mode: "min"
+  save_top_k: 3
+  save_last: true
+  auto_insert_metric_name: false
+  verbose: true
+
+# Early Stopping
+early_stopping:
+  _target_: pytorch_lightning.callbacks.EarlyStopping
+  monitor: "val/total"
+  patience: 50
+  mode: "min"
+  verbose: true
+  min_delta: 0.0001
+
+# Learning Rate Monitor
+lr_monitor:
+  _target_: pytorch_lightning.callbacks.LearningRateMonitor
+  logging_interval: "epoch"
+  log_momentum: false
+
+# Model Summary
+model_summary:
+  _target_: pytorch_lightning.callbacks.RichModelSummary
+  max_depth: 2
+
+# Progress Bar
+rich_progress_bar:
+  _target_: pytorch_lightning.callbacks.RichProgressBar
+  leave: true
+  refresh_rate: 5
+  theme:
+    _target_: pytorch_lightning.callbacks.progress.rich_progress.RichProgressBarTheme
+    description: "bold italic #FF33AA"
+    progress_bar: "#33AAFF"
+    progress_bar_finished: "#55FF55"
+    progress_bar_pulse: "#FFAA33"
+    batch_progress: "bold #FF33AA"
+    time: "#AAAAAA"
+    processing_speed: "#FFD700"
+    metrics: "bold #33FFAA"

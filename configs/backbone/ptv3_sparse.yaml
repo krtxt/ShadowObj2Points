@@ -1,0 +1,19 @@
+name: ptv3_sparse
+use_flash_attention: true  # true | false
+
+grid_size: 0.02
+stride: [2, 2, 2, 2]
+target_num_tokens: 128
+token_strategy: multiscale  # last_layer | fps | grid | learned | multiscale
+tokens_last: true  # true | false
+
+encoder_channels: [32, 64, 128, 256, 512]
+# encoder_depths: [1, 1, 2, 2, 1]
+encoder_depths: [2, 2, 2, 6, 2]
+# encoder_num_head: [2, 4, 8, 16, 16]
+encoder_num_head: [2, 4, 8, 16, 32]
+enc_patch_size: [1024, 1024, 1024, 1024, 1024]
+mlp_ratio: 2
+
+out_dim: 512
+input_feature_dim: 1

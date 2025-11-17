@@ -1,0 +1,38 @@
+name: mybodexshadow
+mode: bodexshadow  # Debug 配置：复用 succ_collect 小集合直接读取 .npy
+debug_mode: true   # Debug 场景下总是走原始目录，方便快速迭代
+
+common: &common_cfg
+  asset_dir: ./data/bodex/bodex_shadow
+  succ_grasp_subdir: mini_succ_collect  # 轻量子集，配合 debug_mode 直接从 .npy 读取
+  num_grasps: ${target_num_grasps}
+  rot_type: ${rot_type}
+  max_grasps_per_object: null
+  max_points: 4096
+  grasp_sampling_strategy: random
+  use_exhaustive_sampling: true
+  exhaustive_sampling_strategy: random
+  trans_anchor: ${hand_anchor}
+  split_file_name: bodex_split.json
+  use_stats_normalization: true
+  normalization_stats_path: assets/unified_normalization_stats
+  point_clouds_file_name: object_pcds_nors.pkl
+  debug_mode: ${..debug_mode}
+
+train:
+  <<: *common_cfg
+  phase: all
+  batch_size: ${batch_size}
+  num_workers: 8
+
+val:
+  <<: *common_cfg
+  phase: all
+  batch_size: ${batch_size}
+  num_workers: 8
+
+test:
+  <<: *common_cfg
+  phase: all
+  batch_size: ${batch_size}
+  num_workers: 8

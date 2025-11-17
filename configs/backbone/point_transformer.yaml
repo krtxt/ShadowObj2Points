@@ -1,0 +1,6 @@
+name: point_transformer
+c: 6
+num_points: 32768
+out_dim: 512
+use_xyz: true  # true | false
+normalize_xyz: true  # true | false

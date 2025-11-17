@@ -1,0 +1,17 @@
+# Adam Optimizer Configuration (supports Hydra _target_ or legacy type)
+_target_: torch.optim.Adam
+lr: 3.0e-4
+weight_decay: 0.0
+
+# Example Hydra scheduler
+# scheduler:
+#   _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+#   T_max: 100
+#   eta_min: 1.0e-6
+
+# Legacy fallback
+type: adam
+scheduler:
+  type: cosine
+  t_max: 100
+  eta_min: 1.0e-6

@@ -1,0 +1,43 @@
+# Main Configuration File for HandPoseReconstruction Training
+# @package _global_
+
+# defaults list
+defaults:
+  - datamodule: handencoder_dm_dex
+  - model: 
+  - loss: total_loss
+  - optimizer: adamw
+  - trainer: default
+  - logger: null   # tensorboard
+  - callbacks: default
+  - experiment: null
+  - _self_
+
+# Experiment settings
+experiment_name: 
+seed: 42
+
+# Common hyperparameters (可被其他配置引用)
+batch_size: 5120
+rot_type: r6d  # 'quat' | 'r6d' | 'euler' | 'axis'
+hand_anchor: palm_center  # 'base' | 'palm_center' | 'mjcf'
+
+# Paths
+paths:
+  # Use the original working directory (project root), not Hydra's run dir
+  root_dir: ${hydra:runtime.cwd}
+  data_dir: ${paths.root_dir}/data
+  output_dir: ${paths.root_dir}/outputs/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
+  assets_dir: ${paths.root_dir}/assets
+
+# Hydra settings
+hydra:
+  run:
+    dir: ${paths.output_dir}
+  sweep:
+    dir: ${paths.root_dir}/outputs/sweeps/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: true  # Change working directory to output directory
+    env_set:
+      PYTHONPATH: ${hydra:runtime.cwd}/src:${oc.env:PYTHONPATH,}

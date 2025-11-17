@@ -1,0 +1,28 @@
+# Debug Trainer Configuration
+accelerator: gpu
+devices: 1
+precision: 32
+max_epochs: 5
+
+# Fast iteration for debugging
+fast_dev_run: false
+overfit_batches: 0
+limit_train_batches: 10  # 只用10个batch
+limit_val_batches: 5
+
+# Logging
+log_every_n_steps: 1
+
+# Checkpointing
+enable_checkpointing: false
+
+# Progress bar
+enable_progress_bar: true
+enable_model_summary: true
+
+# Sanity check
+num_sanity_val_steps: 1
+
+# Other
+gradient_clip_val: 1.0
+deterministic: false

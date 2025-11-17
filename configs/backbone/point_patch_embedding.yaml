@@ -1,0 +1,21 @@
+name: point_patch_embedding
+
+in_channels: 3
+hidden_size: 512
+out_dim: 512
+target_num_tokens: 128
+
+voxel_size: 32
+patch_size: 4
+
+normalize_points: true  # true | false
+use_cuda_voxelize: true  # true | false
+bias: true  # true | false
+
+learnable_positional_embedding: false  # true | false
+transformer_layers: 0
+transformer_heads: 8
+transformer_ffn_ratio: 4.0
+transformer_dropout: 0.1
+mlp_ratio: 4.0
+mlp_dropout: 0.1

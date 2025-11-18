@@ -15,6 +15,7 @@ testsba/
 lightning_logs/
 assets/
 third_party/
+3rd_party/
 __pycache__/
 *.pyc
 *.ipynb

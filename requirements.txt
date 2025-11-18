@@ -1,0 +1,38 @@
+# -e git+https://github.com/Silverster98/pytorch_kinematics#egg=pytorch_kinematics
+# git+https://github.com/otaheri/chamfer_distance.git@d2b524309db114d0f7ce18be6c01b3802cde9791
+# git+https://github.com/Silverster98/pointops
+# git+https://github.com/daveredrum/Pointnet2.ScanNet.git#subdirectory=pointnet2
+wandb
+h5py
+scipy
+trimesh
+einops
+tqdm
+matplotlib
+opencv-python
+numpy==1.26.4
+transforms3d
+open3d
+urdf_parser_py
+tensorboard
+coacd
+rich
+plotly
+ikpy
+PyOpenGL
+glfw
+pyglm
+healpy
+rtree
+omegaconf
+loguru
+hydra-core
+protobuf
+transformers
+termcolor
+pytorchse3
+ipdb
+# Note: pointnet2 is a local dependency and needs to be compiled separately.
+# Please refer to the project's documentation for instructions.
+
+# pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128

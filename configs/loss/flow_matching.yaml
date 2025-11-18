@@ -1,2 +1,1 @@
-_target_: src.models.components.losses.FlowMatchingLoss
 lambda_tangent: 1.0

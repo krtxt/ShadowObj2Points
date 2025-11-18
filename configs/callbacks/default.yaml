@@ -47,3 +47,9 @@ rich_progress_bar:
     time: "#AAAAAA"
     processing_speed: "#FFD700"
     metrics: "bold #33FFAA"
+
+# Image Logger
+image_logger:
+  _target_: callbacks.image_logger.ImageLogger
+  num_samples: 4
+  log_key: "val/hand_samples"

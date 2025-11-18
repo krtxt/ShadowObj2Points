@@ -1,7 +1,7 @@
 """Flow Matching model with Graph-aware DiT for dexterous hand keypoint generation."""
 
 from copy import deepcopy
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import torch
 import torch.nn as nn
@@ -11,6 +11,9 @@ from hydra.utils import instantiate as hydra_instantiate
 from omegaconf import DictConfig, OmegaConf
 
 from .components.losses import FlowMatchingLoss
+from .components.hand_encoder import build_hand_encoder
+from .components.graph_dit import build_dit
+from .backbone import build_backbone
 
 
 class TimestepEmbedding(nn.Module):
@@ -54,48 +57,45 @@ class HandFlowMatchingDiT(pl.LightningModule):
     
     Args:
         d_model: Token embedding dimension
-        graph_consts: Dictionary containing graph structure:
-            - finger_ids: (N,) finger indices for each keypoint
-            - joint_type_ids: (N,) joint type indices
-            - edge_index: (2, E) edge connectivity
-            - edge_type: (E,) edge type indices
-            - edge_rest_lengths: (E,) rest lengths for each edge
-            - template_xyz: (N, 3) optional template keypoints
+        graph_consts: Dictionary containing graph structure
         backbone: Scene point cloud encoder module
         hand_encoder: Hand keypoint encoder module
         dit: Graph-aware DiT module
-        lambda_tangent: Weight for tangent loss term
-        learning_rate: Optimizer learning rate
-        weight_decay: Optimizer weight decay
-        use_scheduler: Whether to use learning rate scheduler
-        scheduler_T_max: Cosine scheduler period in epochs
+        loss_cfg: Loss configuration
+        optimizer_cfg: Optimizer configuration
         sample_num_steps: Number of ODE steps for sampling
+        sample_solver: Solver type ('euler', 'heun', 'rk4')
+        sample_schedule: Time schedule type ('linear', 'cosine', 'shift')
+        schedule_shift: Shift factor for shift schedule (default 1.0)
         proj_num_iters: Number of edge length projection iterations
         proj_max_corr: Maximum correction per projection step
+        use_ema: Whether to use EMA
+        ema_decay: EMA decay rate
+        val_vis_num_samples: Number of samples to visualize during validation
     """
     def __init__(
         self,
         d_model: int,
         graph_consts: Dict[str, torch.Tensor],
         backbone: nn.Module,
-        hand_encoder: nn.Module,
-        dit: nn.Module,
+        hand_encoder: Any,
+        dit: Any,
         loss_cfg: Optional[DictConfig] = None,
         optimizer_cfg: Optional[DictConfig] = None,
-        lambda_tangent: float = 1.0,
-        learning_rate: float = 3e-4,
-        weight_decay: float = 1e-2,
-        use_scheduler: bool = True,
-        scheduler_T_max: int = 100,
+        # Sampling configuration
         sample_num_steps: int = 40,
         sample_solver: str = "euler",
+        sample_schedule: str = "shift",  # [New] Time schedule type
+        schedule_shift: float = 1.0,     # [New] Shift factor (SD3 uses 3.0)
         proj_num_iters: int = 2,
         proj_max_corr: float = 0.2,
+        # EMA configuration
+        use_ema: bool = True,
+        ema_decay: float = 0.999,
+        ema_device: Optional[str] = None,
     ):
         super().__init__()
-        self.save_hyperparameters(
-            ignore=["graph_consts", "backbone", "hand_encoder", "dit", "loss_cfg", "optimizer_cfg"]
-        )
+        self.save_hyperparameters(ignore=["graph_consts", "backbone", "hand_encoder", "dit"])
 
         # Parse graph structure constants
         finger_ids = graph_consts["finger_ids"].long()
@@ -129,9 +129,30 @@ class HandFlowMatchingDiT(pl.LightningModule):
             self.template_xyz = None
 
         # Core modules
-        self.backbone = backbone
-        self.hand_encoder = hand_encoder
-        self.dit = dit
+        if isinstance(backbone, nn.Module):
+            self.backbone = backbone
+        else:
+            self.backbone = build_backbone(backbone)
+
+        # Hand encoder: allow passing either a pre-built module or a config node
+        if isinstance(hand_encoder, nn.Module):
+            self.hand_encoder = hand_encoder
+        else:
+            self.hand_encoder = build_hand_encoder(
+                cfg=hand_encoder,
+                graph_consts=graph_consts,
+                out_dim=d_model,
+            )
+
+        # DiT: similarly allow module or config
+        if isinstance(dit, nn.Module):
+            self.dit = dit
+        else:
+            self.dit = build_dit(
+                cfg=dit,
+                graph_consts=graph_consts,
+                dim=d_model,
+            )
 
         # Timestep embedding and velocity prediction head
         self.timestep_embed = TimestepEmbedding(dim=d_model)
@@ -139,22 +160,26 @@ class HandFlowMatchingDiT(pl.LightningModule):
 
         # Loss function
         self.loss_cfg = self._prepare_loss_config(loss_cfg)
-        self.lambda_tangent = self._resolve_lambda(lambda_tangent)
-        self.loss_fn = self._build_loss_fn(self.lambda_tangent)
-        self.lambda_tangent = float(getattr(self.loss_fn, "lambda_tangent", self.lambda_tangent))
+        lambda_tangent = self._resolve_lambda(default_lambda=1.0)
+        self.loss_fn = self._build_loss_fn(lambda_tangent)
+        self.lambda_tangent = float(getattr(self.loss_fn, "lambda_tangent", lambda_tangent))
 
-        # Optimizer configuration
-        self.learning_rate = learning_rate
-        self.weight_decay = weight_decay
-        self.use_scheduler = use_scheduler
-        self.scheduler_T_max = scheduler_T_max
-        self.optimizer_cfg = self._prepare_optimizer_config(optimizer_cfg)
+        # Optimizer configuration (Hydra-driven)
+        self.optimizer_cfg = optimizer_cfg
 
         # Sampling configuration
         self.sample_num_steps = sample_num_steps
         self.sample_solver = str(sample_solver).lower()
+        self.sample_schedule = str(sample_schedule).lower()
+        self.schedule_shift = float(schedule_shift)
         self.proj_num_iters = proj_num_iters
         self.proj_max_corr = proj_max_corr
+
+        # EMA & validation visualization
+        self.use_ema = bool(use_ema)
+        self.ema_decay = float(ema_decay)
+        self.ema_device = ema_device
+        self.ema = self._build_ema() if self.use_ema else None
 
     def encode_scene_tokens(self, scene_pc: torch.Tensor) -> torch.Tensor:
         """Encode scene point cloud into tokens.
@@ -380,6 +405,8 @@ class HandFlowMatchingDiT(pl.LightningModule):
             with torch.no_grad():
                 edge_len_err = self._compute_edge_length_error(target)
             self.log("val/edge_len_err", edge_len_err, prog_bar=False, on_step=False, on_epoch=True)
+            # Collect a few batches for qualitative visualization at epoch end
+            self._maybe_collect_val_vis_batch(batch)
         except Exception as e:
             self.log("val/error_flag", 1.0, prog_bar=True, on_step=False, on_epoch=True)
             self.print(f"Validation step error at batch {batch_idx}: {e}")
@@ -424,6 +451,34 @@ class HandFlowMatchingDiT(pl.LightningModule):
         rel_error = (dist - rest_lengths).abs() / (rest_lengths + 1e-6)
         return rel_error.mean()
 
+    def _generate_timesteps(self, num_steps: int, device: torch.device) -> torch.Tensor:
+        """Generate time steps based on the configured schedule.
+        
+        Returns:
+            Timesteps tensor of shape (num_steps + 1,) from 0.0 to 1.0
+        """
+        # Base linear time [0, 1]
+        timesteps = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+        
+        if self.sample_schedule == "linear":
+            return timesteps
+            
+        elif self.sample_schedule == "cosine":
+            # Standard cosine schedule used in diffusion models
+            # Maps uniform t in [0,1] to cosine curve
+            return 1.0 - torch.cos(timesteps * (torch.pi / 2))
+
+        elif self.sample_schedule == "shift":
+            # Time shift schedule (e.g., from Stable Diffusion 3 / Flux)
+            # Formula: t' = (s * t) / (1 + (s - 1) * t)
+            # s > 1 pushes steps towards t=1 (data), prioritizing low-noise refinement.
+            s = self.schedule_shift
+            return (s * timesteps) / (1 + (s - 1) * timesteps)
+            
+        else:
+            # Default fallback
+            return timesteps
+
     @torch.no_grad()
     def sample(
         self,
@@ -445,61 +500,102 @@ class HandFlowMatchingDiT(pl.LightningModule):
         device = scene_pc.device
         B = scene_pc.size(0)
         N = self.N
+        
         num_steps = num_steps or self.sample_num_steps
+        
         if initial_noise is None:
             keypoints = torch.randn(B, N, 3, device=device)
         else:
             keypoints = initial_noise.to(device)
-        timesteps = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
-        solver = getattr(self, "sample_solver", "euler")
+            
+        # [Modified] Use the time schedule generator instead of linear space
+        timesteps = self._generate_timesteps(num_steps, device)
+        time_dtype = timesteps.dtype
+        
+        solver = str(getattr(self, "sample_solver", "euler")).lower()
+        
         for k in range(num_steps):
             t_curr = timesteps[k]
             t_next = timesteps[k + 1]
-            dt = t_next - t_curr
+            dt = t_next - t_curr  # delta t is now variable
+            
             if solver in ("heun", "rk2"):
                 # Heun's method (RK2): predictor-corrector
-                t_batch_curr = torch.full((B,), t_curr.item(), device=device)
+                t_batch_curr = torch.full((B,), t_curr.item(), device=device, dtype=time_dtype)
                 v1 = self.predict_velocity(keypoints, scene_pc, t_batch_curr)
+                
+                # Predictor step
                 keypoints_pred = keypoints + dt * v1
-                t_batch_next = torch.full((B,), t_next.item(), device=device)
+                
+                # Corrector step
+                t_batch_next = torch.full((B,), t_next.item(), device=device, dtype=time_dtype)
                 v2 = self.predict_velocity(keypoints_pred, scene_pc, t_batch_next)
+                
                 keypoints = keypoints + 0.5 * dt * (v1 + v2)
+                
+            elif solver in ("rk4", "runge_kutta4"):
+                # Standard RK4
+                t_batch_curr = torch.full((B,), t_curr.item(), device=device, dtype=time_dtype)
+                v1 = self.predict_velocity(keypoints, scene_pc, t_batch_curr)
+
+                # Half step point logic for RK4 with variable time steps:
+                # t_mid = t_curr + 0.5 * dt
+                half_step_time = (t_curr + 0.5 * dt).item()
+                t_batch_half = torch.full((B,), half_step_time, device=device, dtype=time_dtype)
+                
+                v2 = self.predict_velocity(keypoints + 0.5 * dt * v1, scene_pc, t_batch_half)
+                v3 = self.predict_velocity(keypoints + 0.5 * dt * v2, scene_pc, t_batch_half)
+
+                t_batch_next = torch.full((B,), t_next.item(), device=device, dtype=time_dtype)
+                v4 = self.predict_velocity(keypoints + dt * v3, scene_pc, t_batch_next)
+
+                keypoints = keypoints + (dt / 6.0) * (v1 + 2.0 * v2 + 2.0 * v3 + v4)
+                
             else:
                 # Default: explicit Euler
-                t_batch = torch.full((B,), t_curr.item(), device=device)
+                t_batch = torch.full((B,), t_curr.item(), device=device, dtype=time_dtype)
                 velocity = self.predict_velocity(keypoints, scene_pc, t_batch)
                 keypoints = keypoints + dt * velocity
+                
+            # Apply kinematic constraints (PBD)
             keypoints = self._project_edge_lengths(keypoints)
+            
         return keypoints
 
     def configure_optimizers(self):
-        """Configure optimizer and learning rate scheduler."""
-        if self.optimizer_cfg:
-            optimizer, scheduler_dict = self._configure_from_hydra()
-            if scheduler_dict is None:
-                return optimizer
-            return {"optimizer": optimizer, "lr_scheduler": scheduler_dict}
-
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
-        )
-        if not self.use_scheduler:
+        """Configure optimizer and learning rate scheduler via Hydra."""
+        if self.optimizer_cfg is None:
+            # Fallback: simple AdamW without scheduler (kept for backward compatibility)
+            optimizer = torch.optim.AdamW(self.parameters(), lr=3e-4, weight_decay=1e-2)
             return optimizer
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=self.scheduler_T_max,
-            eta_min=0.0,
-        )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "epoch",
-                "monitor": "val/loss",
-            },
+
+        opt_cfg = deepcopy(self.optimizer_cfg)
+        sched_cfg = None
+        if "scheduler" in opt_cfg:
+            sched_cfg = opt_cfg.scheduler
+            # Drop scheduler from optimizer cfg before instantiation
+            opt_cfg = deepcopy(opt_cfg)
+            opt_cfg.pop("scheduler", None)
+
+        optimizer = hydra_instantiate(opt_cfg, params=self.parameters())
+
+        if sched_cfg is None:
+            return optimizer
+
+        sched_cfg = deepcopy(sched_cfg)
+        interval = str(sched_cfg.pop("interval", "epoch"))
+        frequency = int(sched_cfg.pop("frequency", 1))
+        monitor = sched_cfg.pop("monitor", None)
+        scheduler = hydra_instantiate(sched_cfg, optimizer=optimizer)
+
+        scheduler_dict: Dict[str, Any] = {
+            "scheduler": scheduler,
+            "interval": interval,
+            "frequency": frequency,
         }
+        if monitor:
+            scheduler_dict["monitor"] = monitor
+        return {"optimizer": optimizer, "lr_scheduler": scheduler_dict}
 
     def _prepare_loss_config(self, loss_cfg: Optional[DictConfig]) -> Optional[Dict[str, Any]]:
         if loss_cfg is None:
@@ -527,122 +623,168 @@ class HandFlowMatchingDiT(pl.LightningModule):
             return FlowMatchingLoss(edge_index=self.edge_index, lambda_tangent=lambda_val)
         return FlowMatchingLoss(edge_index=self.edge_index, lambda_tangent=lambda_tangent)
 
-    def _prepare_optimizer_config(self, optimizer_cfg: Optional[DictConfig]) -> Optional[Dict[str, Any]]:
-        if optimizer_cfg is None:
-            return None
-        if isinstance(optimizer_cfg, DictConfig):
-            return OmegaConf.to_container(optimizer_cfg, resolve=True)
-        if isinstance(optimizer_cfg, dict):
-            return deepcopy(optimizer_cfg)
-        raise TypeError("optimizer_cfg must be a DictConfig or dict")
+    # -------------------------------------------------------------------------
+    # EMA utilities and validation visualization
+    # -------------------------------------------------------------------------
+    def _build_ema(self):
+        """Create an EMA copy of the model (parameters only)."""
+        with torch.no_grad():
+            ema_model = deepcopy(self)
+            # Drop EMA on the copy to avoid recursion
+            ema_model.ema = None
+            for p in ema_model.parameters():
+                p.requires_grad_(False)
+            if self.ema_device is not None:
+                ema_model.to(self.ema_device)
+        return _ModelEmaWrapper(ema_model, decay=self.ema_decay)
 
-    def _configure_from_hydra(self):
-        cfg = deepcopy(self.optimizer_cfg)
-        scheduler_cfg = cfg.pop("scheduler", None)
-        optimizer = self._instantiate_optimizer(cfg)
-        scheduler_dict = self._instantiate_scheduler(optimizer, scheduler_cfg)
-        return optimizer, scheduler_dict
+    def on_train_batch_end(self, outputs, batch, batch_idx, dataloader_idx: int = 0) -> None:
+        if self.ema is not None:
+            self.ema.update(self)
 
-    def _instantiate_optimizer(self, cfg: Dict[str, Any]) -> torch.optim.Optimizer:
-        cfg = deepcopy(cfg)
-        target = cfg.pop("_target_", None)
-        opt_type = cfg.pop("type", None)
-        if target:
-            hydra_cfg = OmegaConf.create({"_target_": target, **cfg})
-            return hydra_instantiate(hydra_cfg, params=self.parameters())
-        opt_key = (opt_type or "adamw").lower()
-        aliases = {
-            "adamw": torch.optim.AdamW,
-            "adam": torch.optim.Adam,
-            "sgd": torch.optim.SGD,
-            "rmsprop": torch.optim.RMSprop,
-        }
-        if opt_key not in aliases:
-            raise ValueError(f"Unsupported optimizer type: {opt_type}")
-        optimizer_cls = aliases[opt_key]
-        return optimizer_cls(self.parameters(), **cfg)
+    def on_validation_start(self) -> None:
+        # Reset visualization buffer
+        self._val_vis_batches = []
+        # Swap to EMA weights for evaluation, if enabled
+        if self.ema is not None:
+            self.ema.store(self)
+            self.ema.copy_to(self)
 
-    def _instantiate_scheduler(
-        self,
-        optimizer: torch.optim.Optimizer,
-        scheduler_cfg: Optional[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
-        if not scheduler_cfg:
-            return None
-        cfg = deepcopy(scheduler_cfg)
-        interval = cfg.pop("interval", "epoch")
-        frequency = int(cfg.pop("frequency", 1))
-        monitor = cfg.pop("monitor", None)
-        reduce_on_plateau_flag = bool(cfg.pop("reduce_on_plateau", False))
-        target = cfg.pop("_target_", None)
-        sched_type = cfg.pop("type", None)
-        if target:
-            hydra_cfg = OmegaConf.create({"_target_": target, **cfg})
-            scheduler = hydra_instantiate(hydra_cfg, optimizer=optimizer)
-        else:
-            scheduler = self._build_legacy_scheduler(optimizer, sched_type, cfg)
-        if scheduler is None:
-            return None
-        scheduler_dict = {"scheduler": scheduler, "interval": interval, "frequency": frequency}
-        if monitor:
-            scheduler_dict["monitor"] = monitor
-        if reduce_on_plateau_flag or isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler_dict["reduce_on_plateau"] = True
-            if not monitor:
-                scheduler_dict["monitor"] = "val/loss"
-        return scheduler_dict
+    def on_validation_end(self) -> None:
+        # Restore original weights after evaluation
+        if self.ema is not None:
+            self.ema.restore(self)
 
-    def _build_legacy_scheduler(
-        self,
-        optimizer: torch.optim.Optimizer,
-        sched_type: Optional[str],
-        cfg: Dict[str, Any],
-    ) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
-        if not sched_type or sched_type.lower() == "none":
-            return None
-        sched_key = sched_type.lower()
-        if sched_key == "cosine":
-            t_max = cfg.get("t_max") or cfg.get("T_max") or self.scheduler_T_max
-            eta_min = cfg.get("eta_min", 0.0)
-            return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, int(t_max)), eta_min=eta_min)
-        if sched_key == "step":
-            step_size = int(cfg.get("step_size", 30))
-            gamma = float(cfg.get("gamma", 0.1))
-            return torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
-        if sched_key == "reduce_on_plateau":
-            return torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode=cfg.get("mode", "min"),
-                factor=float(cfg.get("factor", 0.5)),
-                patience=int(cfg.get("patience", 10)),
-                threshold=float(cfg.get("threshold", 1e-4)),
-                min_lr=float(cfg.get("min_lr", 0.0)),
-            )
-        if sched_key == "warmup_cosine":
-            warmup_epochs = int(cfg.get("warmup_epochs", 0))
-            total_epochs = int(cfg.get("total_epochs", self.scheduler_T_max))
-            eta_min = float(cfg.get("eta_min", 0.0))
-            start_factor = float(cfg.get("warmup_start_factor", cfg.get("start_factor", 1e-3)))
-            if warmup_epochs <= 0:
-                return torch.optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer,
-                    T_max=max(1, total_epochs),
-                    eta_min=eta_min,
+    def on_test_start(self) -> None:
+        if self.ema is not None:
+            self.ema.store(self)
+            self.ema.copy_to(self)
+
+    def on_test_end(self) -> None:
+        if self.ema is not None:
+            self.ema.restore(self)
+
+    def _maybe_collect_val_vis_batch(self, batch: Dict[str, Any]) -> None:
+        """Collect a few validation batches for qualitative visualization."""
+        if len(self._val_vis_batches) >= self.val_vis_num_samples:
+            return
+        if "xyz" not in batch:
+            return
+        with torch.no_grad():
+            xyz = batch["xyz"].detach().cpu()
+            scene_pc = batch.get("scene_pc", None)
+            if scene_pc is not None:
+                scene_pc = scene_pc.detach().cpu()
+            self._val_vis_batches.append({"xyz": xyz, "scene_pc": scene_pc})
+
+    def on_validation_epoch_end(self) -> None:
+        if not self._val_vis_batches:
+            return
+        logger: Optional[Logger] = getattr(self, "logger", None)
+        if logger is None:
+            return
+
+        # Use at most val_vis_num_samples samples for visualization
+        num_samples = min(self.val_vis_num_samples, len(self._val_vis_batches))
+        images: List[np.ndarray] = []
+        captions: List[str] = []
+
+        device = self.device
+        for idx in range(num_samples):
+            entry = self._val_vis_batches[idx]
+            gt_xyz = entry["xyz"].to(device)
+            scene_pc = entry["scene_pc"]
+            if scene_pc is None:
+                B = gt_xyz.size(0)
+                scene_pc = torch.zeros(B, 0, 3, device=device, dtype=gt_xyz.dtype)
+            else:
+                scene_pc = scene_pc.to(device)
+
+            with torch.no_grad():
+                pred_xyz = self.sample(scene_pc, num_steps=self.sample_num_steps).detach().cpu()
+                gt_xyz_cpu = gt_xyz.detach().cpu()
+
+            # Only visualize the first element in the batch for this entry
+            img = self._render_hand_pair_image(gt_xyz_cpu[0], pred_xyz[0])
+            images.append(img)
+            captions.append(f"epoch={self.current_epoch}, sample={idx}")
+
+        # Try logger.log_image if available (e.g., WandbLogger), otherwise fall back to TensorBoard
+        if hasattr(logger, "log_image"):
+            logger.log_image(key="val/hand_samples", images=images, caption=captions, step=self.current_epoch)
+        elif isinstance(logger, TensorBoardLogger):
+            for i, img in enumerate(images):
+                logger.experiment.add_image(
+                    f"val/hand_samples/{i}",
+                    img,
+                    global_step=self.current_epoch,
+                    dataformats="HWC",
                 )
-            warmup = torch.optim.lr_scheduler.LinearLR(
-                optimizer,
-                start_factor=max(1e-8, start_factor),
-                end_factor=1.0,
-                total_iters=max(1, warmup_epochs),
-            )
-            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=max(1, total_epochs - warmup_epochs),
-                eta_min=eta_min,
-            )
-            return torch.optim.lr_scheduler.SequentialLR(
-                optimizer,
-                schedulers=[warmup, cosine],
-                milestones=[warmup_epochs],
-            )
-        raise ValueError(f"Unsupported scheduler type: {sched_type}")
+
+    def _render_hand_pair_image(self, gt_xyz: torch.Tensor, pred_xyz: torch.Tensor) -> np.ndarray:
+        """Render a side-by-side image of GT vs predicted hand keypoints."""
+        gt = gt_xyz.detach().cpu().numpy()
+        pred = pred_xyz.detach().cpu().numpy()
+        edges = self.edge_index.detach().cpu().numpy()
+
+        fig = plt.figure(figsize=(6, 3))
+
+        def _plot(subplot_idx: int, pts: np.ndarray, title: str, color_points: str, color_edges: str):
+            ax = fig.add_subplot(1, 2, subplot_idx, projection="3d")
+            ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=color_points, s=10)
+            for e in edges.T:
+                i, j = int(e[0]), int(e[1])
+                xs = [pts[i, 0], pts[j, 0]]
+                ys = [pts[i, 1], pts[j, 1]]
+                zs = [pts[i, 2], pts[j, 2]]
+                ax.plot(xs, ys, zs, color=color_edges, linewidth=0.5)
+            ax.set_title(title)
+            ax.set_axis_off()
+
+        _plot(1, gt, "GT", "#1f77b4", "#1f77b4")
+        _plot(2, pred, "Pred", "#d62728", "#d62728")
+        plt.tight_layout()
+
+        fig.canvas.draw()
+        width, height = fig.canvas.get_width_height()
+        image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(height, width, 3)
+        plt.close(fig)
+        return image
+
+
+class _ModelEmaWrapper:
+    """Lightweight EMA wrapper storing a non-trainable copy of the model."""
+
+    def __init__(self, ema_model: nn.Module, decay: float = 0.999):
+        self.ema_model = ema_model
+        self.decay = float(decay)
+        self._backup: Optional[Dict[str, torch.Tensor]] = None
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        ema_state = self.ema_model.state_dict()
+        model_state = model.state_dict()
+        for k, ema_v in ema_state.items():
+            if k not in model_state:
+                continue
+            model_v = model_state[k].detach()
+            if not torch.is_floating_point(ema_v):
+                ema_v.copy_(model_v.to(ema_v.device))
+                continue
+            model_v = model_v.to(ema_v.device)
+            ema_v.copy_(ema_v * self.decay + (1.0 - self.decay) * model_v)
+
+    @torch.no_grad()
+    def store(self, model: nn.Module) -> None:
+        self._backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    @torch.no_grad()
+    def copy_to(self, model: nn.Module) -> None:
+        model.load_state_dict(self.ema_model.state_dict(), strict=False)
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module) -> None:
+        if self._backup is None:
+            return
+        model.load_state_dict(self._backup, strict=False)
+        self._backup = None

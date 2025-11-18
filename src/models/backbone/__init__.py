@@ -1,6 +1,10 @@
 from .point_transformer_backbone import PointTransformerBackbone
-from .pointnet2 import Pointnet2Backbone
-from .pointnet2_3sa import Pointnet2Backbone_3sa
+try:
+    from .pointnet2 import Pointnet2Backbone
+    from .pointnet2_3sa import Pointnet2Backbone_3sa
+except ModuleNotFoundError:
+    Pointnet2Backbone = None
+    Pointnet2Backbone_3sa = None
 # from .pointnext_backbone import PointNextBackbone
 from .point_patch_embedding import PointPatchEmbeddingBackbone
 from .ptv3_backbone import PTV3Backbone
@@ -13,8 +17,18 @@ def build_backbone(backbone_cfg):
     if backbone_cfg.name.lower() == "resnet":
         return build_resnet_backbone(backbone_cfg)
     elif backbone_cfg.name.lower() == "pointnet2":
+        if Pointnet2Backbone is None:
+            raise ImportError(
+                "Backbone 'pointnet2' requires the 'pointnet2_modules' package. "
+                "Install it or choose a different backbone."
+            )
         return Pointnet2Backbone(backbone_cfg)
     elif backbone_cfg.name.lower() == "pointnet2_3sa":
+        if Pointnet2Backbone_3sa is None:
+            raise ImportError(
+                "Backbone 'pointnet2_3sa' requires the 'pointnet2_modules' package. "
+                "Install it or choose a different backbone."
+            )
         return Pointnet2Backbone_3sa(backbone_cfg)
     # elif backbone_cfg.name.lower() == "pointnext":
         # return PointNextBackbone(backbone_cfg)

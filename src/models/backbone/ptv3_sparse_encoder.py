@@ -14,6 +14,7 @@ PTv3 稀疏 Token 提取器
 
 import logging
 from typing import Tuple, Optional
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -33,10 +34,18 @@ class PTv3SparseEncoder(nn.Module):
         target_num_tokens: 目标 token 数量（可选，用于后处理）
     """
     
-    def __init__(self, cfg, target_num_tokens: Optional[int] = None, token_strategy: Optional[str] = None):
+    def __init__(
+        self,
+        cfg=None,
+        target_num_tokens: Optional[int] = None,
+        token_strategy: Optional[str] = None,
+        **kwargs,
+    ):
         super().__init__()
         
         self.logger = logging.getLogger(__name__)
+        if cfg is None:
+            cfg = SimpleNamespace(**kwargs)
         
         # 基础配置
         self.grid_size = getattr(cfg, 'grid_size', 0.003)  # 默认0.003以获得更密集的tokens

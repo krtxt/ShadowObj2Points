@@ -1,9 +1,12 @@
 # Model Configuration for HandFlowMatchingDiT (Flow Matching + Graph-aware DiT)
-# This config defines all static hyperparameters for the flow-matching hand DiT model.
-# Graph constants (graph_consts) are expected to be provided at runtime by the DataModule
+# @package model
+#
+# This config defines the LightningModule and lets Hydra recursively
+# instantiate all sub-modules (backbone, hand encoder, DiT, loss, optimizer).
+# Graph constants (graph_consts) are provided at runtime by the DataModule
 # via HandEncoderDataModule.get_graph_constants().
 
-_target_: src.models.flow_matching_hand_dit.HandFlowMatchingDiT
+_target_: models.flow_matching_hand_dit.HandFlowMatchingDiT
 
 # Note: graph_consts will be injected at runtime by train.py
 
@@ -17,62 +20,64 @@ d_model: 512
 # -----------------------------------------------------------------------------
 # 2. Sub-module configuration (hand encoder, backbone, DiT)
 # -----------------------------------------------------------------------------
-# These are configured via separate Hydra config groups:
-#   - backbone: configs/backbone/*.yaml (e.g., ptv3_sparse_perceiver)
-#   - hand_encoder: configs/hand_encoder/*.yaml (e.g., transformer_bias, egnn_lite)
-#   - dit: configs/dit/*.yaml (e.g., graph_dit_default)
+# These point to separate Hydra config groups so that components can be swapped
+# via command line overrides (e.g., backbone=ptv3_sparse).
 #
-# train.py wires these groups via dedicated builder functions before instantiating
-# HandFlowMatchingDiT:
-#   backbone = build_backbone(cfg.backbone)
-#   hand_encoder = build_hand_encoder(cfg.hand_encoder, graph_consts, out_dim=d_model)
-#   dit = build_dit(cfg.dit, graph_consts, dim=d_model)
-# so each component can be swapped via the defaults list without touching the model code.
+# When Hydra instantiates model=flow_matching_hand_dit with _recursive_=true,
+# the following nested configs are instantiated automatically and passed as
+# module instances to HandFlowMatchingDiT.__init__:
+#
+#   backbone     <- ${backbone}
+#   hand_encoder <- ${hand_encoder}
+#   dit          <- ${dit}
+#
+backbone: ${backbone}
+hand_encoder: ${hand_encoder}
+dit: ${dit}
 
 # -----------------------------------------------------------------------------
-# 3. Training / loss behaviour
+# 3. Flow Matching loss
 # -----------------------------------------------------------------------------
 # FlowMatchingLoss is defined in src/models/components/losses.py and receives
-# edge_index + lambda_tangent. That module is created inside
-# HandFlowMatchingDiT, so only the scalar weight needs to be configured here.
+# edge_index + lambda_tangent. We pass the loss config through so the model can
+# instantiate it (and inject graph constants) via Hydra.
+#
+# To change lambda_tangent, override:
+#   loss=flow_matching loss.lambda_tangent=0.5
+loss_cfg: ${loss}
 
 # -----------------------------------------------------------------------------
-# 4. Flow Matching loss & regularization
+# 4. Optimization (optimizer + scheduler)
 # -----------------------------------------------------------------------------
-# lambda_tangent: 切向约束损失权重
-#   - 0.0: 只优化 flow matching loss，不做边长切向约束
-#   - 1.0: 默认，兼顾生成质量与物理一致性
-#   - 更高的值会更严格地约束边长，但可能略微影响多样性
-lambda_tangent: 1.0
-
-# -----------------------------------------------------------------------------
-# 5. Optimization hyperparameters
-# -----------------------------------------------------------------------------
-# learning_rate: AdamW 学习率（HandFlowMatchingDiT.configure_optimizers 中使用）
-learning_rate: 3e-4
-
-# weight_decay: AdamW 权重衰减系数
-weight_decay: 1e-2
-
-# use_scheduler: 是否启用 CosineAnnealingLR 学习率调度器
-use_scheduler: true
-
-# scheduler_T_max: CosineAnnealingLR 的 T_max（以 epoch 为单位）
-scheduler_T_max: 100
+# Optimizer and scheduler are configured via configs/optimizer/*.yaml.
+# The full optimizer config (including nested `scheduler`) is passed through
+# and instantiated inside HandFlowMatchingDiT.configure_optimizers().
+optimizer_cfg: ${optimizer}
 
 # -----------------------------------------------------------------------------
-# 6. Sampling & constraint projection
+# 5. Sampling & constraint projection
 # -----------------------------------------------------------------------------
 # sample_num_steps: 采样时 ODE Euler 步数（从 t=0 积分到 t=1）
 #   - 20: 快速粗略采样
 #   - 40: 默认推荐
 #   - 60+: 更细粒度积分，推理更慢
-sample_num_steps: 40
+sample_num_steps: 20
 
 # sample_solver: 采样时使用的数值积分器
 #   - "euler": 显式 Euler（默认）
 #   - "heun": 二阶 Heun / RK2（更精确，每步多一次网络前向）
-sample_solver: euler
+#   - "rk4": 四阶 Runge-Kutta（最高精度，每步 4 次网络前向）
+sample_solver: rk4
+
+
+# 调度策略
+sample_schedule: shift 
+
+# 偏移量 (Shift)
+# 1.0 = 线性
+# > 1.0 (如 3.0) = 关注高频细节/数据端 (推荐用于高分辨率或复杂几何)
+# < 1.0 = 关注整体结构/噪声端
+schedule_shift: 3.0
 
 # proj_num_iters: 每个采样时间步中 PBD 边长投影的迭代次数
 #   - 0: 不做显式投影，只依赖网络和切向损失
@@ -81,3 +86,18 @@ proj_num_iters: 2
 
 # proj_max_corr: 每次投影的最大相对修正幅度（防止数值不稳定）
 proj_max_corr: 0.2
+
+# -----------------------------------------------------------------------------
+# 6. EMA & validation visualization (implemented in module)
+# -----------------------------------------------------------------------------
+# use_ema: 是否在训练过程中维护 EMA 模型（推荐开启）
+use_ema: true
+
+# ema_decay: EMA 衰减系数，越接近 1.0 越平滑
+ema_decay: 0.999
+
+# ema_device: 可选，将 EMA 权重放在特定设备上（如 "cpu"）
+ema_device: cpu
+
+# val_vis_num_samples: 每个 validation epoch 可视化的样本数量
+val_vis_num_samples: 0

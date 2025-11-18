@@ -1,5 +1,4 @@
-# AdamW Optimizer Configuration (supports both Hydra _target_ and legacy 'type' style)
-# Preferred Hydra style:
+# AdamW Optimizer Configuration (Hydra style)
 _target_: torch.optim.AdamW
 lr: 1.0e-4
 weight_decay: 0.01
@@ -7,8 +6,10 @@ betas: [0.9, 0.999]
 eps: 1.0e-8
 foreach: false
 
+# Scheduler config is nested under `scheduler` and will be instantiated
+# via Hydra inside HandFlowMatchingDiT.configure_optimizers().
 scheduler:
-  type: warmup_cosine
+  _target_: models.components.schedulers.build_warmup_cosine_scheduler
   warmup_epochs: 10
   total_epochs: ${trainer.max_epochs}
   eta_min: 1.0e-6

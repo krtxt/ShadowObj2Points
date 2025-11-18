@@ -647,83 +647,55 @@ def _collate_for_hand_encoder(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 class HandEncoderDataModule(pl.LightningDataModule if pl is not None else object):
     def __init__(
         self,
-        data_cfg: "DictConfig" = None,
-        # Direct params for Hydra instantiate compatibility (optional)
         name: Optional[str] = None,
-        mode: Optional[str] = None,
-        batch_size: Optional[int] = None,
-        num_workers: Optional[int] = None,
-        pin_memory: Optional[bool] = None,
-        rot_type: Optional[str] = None,
-        trans_anchor: Optional[str] = None,
-        hand_scale: Optional[float] = None,
+        mode: str = "dexgraspnet",
+        batch_size: int = 32,
+        num_workers: int = 4,
+        pin_memory: bool = True,
+        rot_type: str = "quat",
+        trans_anchor: str = "palm_center",
+        hand_scale: float = 1.0,
         urdf_assets_meta_path: Optional[str] = None,
-        use_palm_star: Optional[bool] = None,
-        connect_forearm: Optional[bool] = None,
-        add_middle_distal: Optional[bool] = None,
+        use_palm_star: bool = False,
+        connect_forearm: bool = True,
+        add_middle_distal: bool = True,
         dataset_kwargs: Optional[Dict[str, Any]] = None,
-        use_local_pose_only: Optional[bool] = None,
-        # Optional split phases
+        use_local_pose_only: bool = False,
         train_phase: Optional[str] = None,
         val_phase: Optional[str] = None,
         test_phase: Optional[str] = None,
+        use_cached_keypoints: bool = False,
+        cache_root: Optional[str] = None,
+        cache_max_shards_in_memory: Optional[Any] = None,
+        cache_max_shards: Optional[Any] = 2,
+        norm_xyz_stats_path: Optional[str] = None,
+        cache_preload_to_ram: bool = False,
+        cache_show_progress: bool = True,
+        prefetch_factor: int = 1,
+        persistent_workers: Optional[bool] = None,
+        # Legacy arg ignored
+        data_cfg: Optional[Any] = None,
     ) -> None:
         """
-        Initialize from a Hydra/OmegaConf DictConfig or direct keyword args.
-
-        Expected keys (see configs/datamodule/handencoder_*.yaml):
-          - mode, batch_size, num_workers, pin_memory
-          - rot_type, trans_anchor, hand_scale, urdf_assets_meta_path
-          - use_palm_star, connect_forearm, add_middle_distal
-          - dataset_kwargs (mapping passed to underlying dataset)
-          - optional train/val/test phases
+        Initialize via Hydra instantiation.
         """
         super().__init__()
 
-        # Helper to prioritize direct kwargs over DictConfig
-        params = {
-            'name': name,
-            'mode': mode,
-            'batch_size': batch_size,
-            'num_workers': num_workers,
-            'pin_memory': pin_memory,
-            'rot_type': rot_type,
-            'trans_anchor': trans_anchor,
-            'hand_scale': hand_scale,
-            'urdf_assets_meta_path': urdf_assets_meta_path,
-            'use_palm_star': use_palm_star,
-            'connect_forearm': connect_forearm,
-            'add_middle_distal': add_middle_distal,
-            'dataset_kwargs': dataset_kwargs,
-            'use_local_pose_only': use_local_pose_only,
-            'train_phase': train_phase,
-            'val_phase': val_phase,
-            'test_phase': test_phase,
-        }
+        self.name = name
+        self.mode = str(mode or "dexgraspnet").lower()
+        self.batch_size = int(batch_size)
+        self.num_workers = int(num_workers)
+        self.pin_memory = bool(pin_memory)
 
-        def _get(key: str, default: Any = None):
-            if key in params and params[key] is not None:
-                return params[key]
-            return getattr(data_cfg, key, default) if data_cfg is not None else default
+        # Dataset kwargs
+        if OmegaConf is not None and isinstance(dataset_kwargs, DictConfig):  # type: ignore
+            dataset_kwargs = OmegaConf.to_container(dataset_kwargs, resolve=True)
+        self.dataset_kwargs = dict(dataset_kwargs or {})
+        
+        self.use_cached_keypoints = bool(use_cached_keypoints)
+        self.cache_root = cache_root
 
-        # Basic settings
-        self.name = _get('name', None)
-        self.mode = str(_get('mode', 'dexgraspnet') or 'dexgraspnet').lower()
-        self.batch_size = int(_get('batch_size', 32) or 32)
-        self.num_workers = int(_get('num_workers', 4) or 4)
-        self.pin_memory = bool(_get('pin_memory', True) if _get('pin_memory', True) is not None else True)
-
-        # Dataset kwargs may be nested; convert to plain dict if OmegaConf
-        dk = _get('dataset_kwargs', {})
-        if OmegaConf is not None and isinstance(dk, DictConfig):  # type: ignore
-            dk = OmegaConf.to_container(dk, resolve=True)
-        self.dataset_kwargs = dict(dk or {})
-        self.use_cached_keypoints = bool(_get('use_cached_keypoints', False) or False)
-        self.cache_root = _get('cache_root', None)
-        # Respect both keys: cache_max_shards_in_memory (preferred) and cache_max_shards (legacy)
-        _cmsi = _get('cache_max_shards_in_memory', None)
-        _cms = _get('cache_max_shards', None)
-
+        # Cache shards parsing
         def _parse_cache_max(v: Any):
             if v is None:
                 return None
@@ -736,54 +708,53 @@ class HandEncoderDataModule(pl.LightningDataModule if pl is not None else object
                 except Exception:
                     return None
             try:
-                iv = int(v)
-                return iv
+                return int(v)
             except Exception:
                 return None
 
-        parsed = _parse_cache_max(_cmsi)
+        parsed = _parse_cache_max(cache_max_shards_in_memory)
         if parsed is None:
-            parsed = _parse_cache_max(_cms)
+            parsed = _parse_cache_max(cache_max_shards)
         self.cache_max_shards = parsed if parsed is not None else 2
+
         self._cache_mode_dir: Optional[Path] = None
         self._cache_meta_checked = False
-        # Cached dataset options
-        _cptr = _get('cache_preload_to_ram', None)
-        self.cache_preload_to_ram = bool(_cptr) if (_cptr is not None) else False
-        _csp = _get('cache_show_progress', None)
-        self.cache_show_progress = bool(_csp) if (_csp is not None) else True
-        # DataLoader performance knobs (safe defaults)
-        _pf = _get('prefetch_factor', None)
-        self.prefetch_factor = int(_pf) if (_pf is not None) else 1
-        _pw = _get('persistent_workers', None)
-        self.persistent_workers = bool(_pw) if (_pw is not None) else (self.num_workers > 0)
+        self.cache_preload_to_ram = bool(cache_preload_to_ram)
+        self.cache_show_progress = bool(cache_show_progress)
+        
+        self.prefetch_factor = int(prefetch_factor)
+        if persistent_workers is None:
+            self.persistent_workers = (self.num_workers > 0)
+        else:
+            self.persistent_workers = bool(persistent_workers)
+
+        # Normalization stats paths
         norm_stats_path = self.dataset_kwargs.get('normalization_stats_path')
         if norm_stats_path is not None:
             self.normalization_stats_path = str(norm_stats_path)
             self.dataset_kwargs['normalization_stats_path'] = self.normalization_stats_path
         else:
             self.normalization_stats_path = None
-        # Optional stats path for xyz normalization (use_local_pose_only 专用，可按 anchor 区分)
-        self.norm_xyz_stats_path = _get('norm_xyz_stats_path', None)
+            
+        self.norm_xyz_stats_path = norm_xyz_stats_path
 
         # Hand/rotation config
-        self.rot_type = str(_get('rot_type', 'quat') or 'quat')
-        self.trans_anchor = str(_get('trans_anchor', 'palm_center') or 'palm_center')
-        self.hand_scale = float(_get('hand_scale', 1.0) or 1.0)
-        self.urdf_assets_meta_path = _get('urdf_assets_meta_path', None)
+        self.rot_type = str(rot_type or 'quat')
+        self.trans_anchor = str(trans_anchor or 'palm_center')
+        self.hand_scale = float(hand_scale)
+        self.urdf_assets_meta_path = urdf_assets_meta_path
 
         # Graph options
-        self.use_palm_star = bool(_get('use_palm_star', False) or False)
-        self.connect_forearm = bool(_get('connect_forearm', True) or True)
-        self.add_middle_distal = bool(_get('add_middle_distal', True) or True)
+        self.use_palm_star = bool(use_palm_star)
+        self.connect_forearm = bool(connect_forearm)
+        self.add_middle_distal = bool(add_middle_distal)
 
-        # Optional phases
-        self.train_phase = _get('train_phase', None)
-        self.val_phase = _get('val_phase', None)
-        self.test_phase = _get('test_phase', None)
+        # Phases
+        self.train_phase = train_phase
+        self.val_phase = val_phase
+        self.test_phase = test_phase
 
-        # Local-only pose option
-        self.use_local_pose_only = bool(_get('use_local_pose_only', False) or False)
+        self.use_local_pose_only = bool(use_local_pose_only)
 
         # Datasets placeholders
         self.train_dataset: Optional[Dataset] = None
@@ -792,7 +763,6 @@ class HandEncoderDataModule(pl.LightningDataModule if pl is not None else object
 
         self._prepared_constants: Optional[Dict[str, Any]] = None
         self._norm_xyz_bounds: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-        # Track setup to avoid expensive re-initialization
         self._setup_done_stages: set = set()
 
     def prepare_data(self) -> None:
@@ -1129,6 +1099,19 @@ class HandEncoderDataModule(pl.LightningDataModule if pl is not None else object
         if want_train and self.train_dataset is None:
             train_phase = self.train_phase or self.dataset_kwargs.get('phase', 'all')
             base_train = self._make_base_dataset(phase=train_phase)
+            base_len = len(base_train)
+            if base_len == 0:
+                logger.error(
+                    "HandEncoderDataModule: base training dataset is empty "
+                    "(asset_dir=%s, phase=%s). Check DexGraspNet debug files and split JSON.",
+                    self.dataset_kwargs.get('asset_dir', 'unknown'),
+                    train_phase,
+                )
+                raise RuntimeError(
+                    "HandEncoderDataModule: training dataset has zero samples. "
+                    "This typically indicates a mismatch between the DexGraspNet "
+                    "split file and the .pt data, or missing debug assets."
+                )
             self.train_dataset = _HandEncoderPreparedDataset(
                 base_train,
                 hand_model,

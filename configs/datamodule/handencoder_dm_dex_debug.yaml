@@ -1,4 +1,8 @@
-_target_: datamodules.HandEncoderDataModule.HandEncoderDataModule
+# Note: we deliberately avoid using a Hydra _target_ here and let
+# train.py.instantiate_datamodule() construct HandEncoderDataModule
+# with this config as data_cfg. This sidesteps occasional target
+# resolution/import issues while keeping all parameters here.
+# _target_: datamodules.HandEncoderDataModule.HandEncoderDataModule
 name: handencoder_dm_dex_debug
 mode: dexgraspnet
 
@@ -19,9 +23,9 @@ use_local_pose_only: true
 norm_xyz_stats_path: ${paths.data_dir}/DexGraspNet/norm_xyz_stats_use_local_anchor-${hand_anchor}
 
 # Optional phases for splits
-train_phase: train
-val_phase: test
-test_phase: test
+train_phase: all
+val_phase: all
+test_phase: all
 
 # Graph construction options (follow the notebook defaults)
 use_palm_star: false

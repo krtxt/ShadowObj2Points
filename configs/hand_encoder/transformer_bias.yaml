@@ -24,4 +24,3 @@ dropout: 0.1
 
 # FFN expansion ratio inside Transformer blocks (hidden = ffn_ratio * d_model)
 ffn_ratio: 2
-

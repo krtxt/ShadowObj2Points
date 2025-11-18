@@ -21,7 +21,6 @@ from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import Callback
 from pytorch_lightning.loggers import Logger
 import torch
-import torch.nn as nn
 from rich.logging import RichHandler
 from rich.traceback import install as install_rich_traceback
 
@@ -32,10 +31,6 @@ if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
 from datamodules.HandEncoderDataModule import HandEncoderDataModule
-from models.flow_matching_hand_dit import HandFlowMatchingDiT
-from models.backbone import build_backbone
-from models.components.hand_encoder import build_hand_encoder
-from models.components.graph_dit import build_dit
 
 torch.set_float32_matmul_precision("high")
 
@@ -65,19 +60,13 @@ def setup_rich_logging(level: int = logging.INFO) -> None:
 def setup_callbacks(cfg: DictConfig) -> List[Callback]:
     """Instantiate callbacks from Hydra config."""
     callbacks: List[Callback] = []
-    if "callbacks" not in cfg:
+    if "callbacks" not in cfg or cfg.callbacks is None:
         return callbacks
-    callbacks_cfg = cfg.callbacks
-    if "model_checkpoint" in callbacks_cfg and callbacks_cfg.model_checkpoint is not None:
-        callbacks.append(hydra_instantiate(callbacks_cfg.model_checkpoint))
-    if "early_stopping" in callbacks_cfg and callbacks_cfg.early_stopping is not None:
-        callbacks.append(hydra_instantiate(callbacks_cfg.early_stopping))
-    if "lr_monitor" in callbacks_cfg and callbacks_cfg.lr_monitor is not None:
-        callbacks.append(hydra_instantiate(callbacks_cfg.lr_monitor))
-    if "model_summary" in callbacks_cfg and callbacks_cfg.model_summary is not None:
-        callbacks.append(hydra_instantiate(callbacks_cfg.model_summary))
-    if "rich_progress_bar" in callbacks_cfg and callbacks_cfg.rich_progress_bar is not None:
-        callbacks.append(hydra_instantiate(callbacks_cfg.rich_progress_bar))
+
+    for _, cb_conf in cfg.callbacks.items():
+        if isinstance(cb_conf, DictConfig) and "_target_" in cb_conf:
+            callbacks.append(hydra_instantiate(cb_conf))
+            
     return callbacks
 
 
@@ -89,7 +78,8 @@ def setup_logger(cfg: DictConfig) -> Optional[Logger]:
 
 
 def validate_core_config(cfg: DictConfig) -> None:
-    required_groups = ("datamodule", "model", "backbone", "hand_encoder", "dit", "trainer")
+    # Only require the core groups; submodules are configured inside cfg.model.
+    required_groups = ("datamodule", "model", "trainer")
     missing = [group for group in required_groups if OmegaConf.select(cfg, group) is None]
     if missing:
         raise ValueError(f"Missing required config group(s): {', '.join(missing)}")
@@ -126,79 +116,6 @@ def extract_graph_constants(datamodule: pl.LightningDataModule, log: logging.Log
     E = int(graph_consts["edge_index"].shape[1])
     log.info(f"Graph constants: [bold #55FF55]N={N}[/], [bold #55FF55]E={E}[/]")
     return graph_consts
-
-
-def build_backbone_module(backbone_cfg: DictConfig) -> nn.Module:
-    if "_target_" in backbone_cfg:
-        return hydra_instantiate(backbone_cfg, _recursive_=False)
-    return build_backbone(backbone_cfg)
-
-
-def build_hand_encoder_module(
-    hand_encoder_cfg: DictConfig,
-    graph_consts: Dict[str, torch.Tensor],
-    out_dim: int,
-) -> nn.Module:
-    if "_target_" in hand_encoder_cfg:
-        return hydra_instantiate(
-            hand_encoder_cfg,
-            graph_consts=graph_consts,
-            out_dim=out_dim,
-            _recursive_=False,
-        )
-    return build_hand_encoder(hand_encoder_cfg, graph_consts=graph_consts, out_dim=out_dim)
-
-
-def build_dit_module(
-    dit_cfg: DictConfig,
-    graph_consts: Dict[str, torch.Tensor],
-    dim: int,
-) -> nn.Module:
-    if "_target_" in dit_cfg:
-        return hydra_instantiate(
-            dit_cfg,
-            graph_consts=graph_consts,
-            dim=dim,
-            _recursive_=False,
-        )
-    return build_dit(dit_cfg, graph_consts=graph_consts, dim=dim)
-
-
-def build_model_modules(
-    cfg: DictConfig, graph_consts: Dict[str, torch.Tensor]
-) -> Tuple[nn.Module, nn.Module, nn.Module]:
-    """Build backbone / hand encoder / DiT modules from their respective config groups."""
-    d_model = int(cfg.model.d_model)
-    backbone = build_backbone_module(cfg.backbone)
-    hand_encoder = build_hand_encoder_module(cfg.hand_encoder, graph_consts=graph_consts, out_dim=d_model)
-    dit = build_dit_module(cfg.dit, graph_consts=graph_consts, dim=d_model)
-    return backbone, hand_encoder, dit
-
-
-def instantiate_model(
-    cfg: DictConfig,
-    graph_consts: Dict[str, torch.Tensor],
-    backbone: nn.Module,
-    hand_encoder: nn.Module,
-    dit: nn.Module,
-) -> nn.Module:
-    """Instantiate the LightningModule, injecting sub-modules from builders."""
-    if not hasattr(cfg, "model") or not hasattr(cfg.model, "_target_"):
-        raise ValueError("cfg.model must specify a Hydra '_target_'")
-    if hasattr(cfg, "loss") and hasattr(cfg.loss, "lambda_tangent"):
-        cfg.model.lambda_tangent = cfg.loss.lambda_tangent
-    loss_cfg = cfg.loss if hasattr(cfg, "loss") else None
-    optimizer_cfg = cfg.optimizer if hasattr(cfg, "optimizer") else None
-    return hydra_instantiate(
-        cfg.model,
-        graph_consts=graph_consts,
-        backbone=backbone,
-        hand_encoder=hand_encoder,
-        dit=dit,
-        loss_cfg=loss_cfg,
-        optimizer_cfg=optimizer_cfg,
-        _recursive_=False,
-    )
 
 
 def ensure_output_dir(cfg: DictConfig, log: logging.Logger) -> None:
@@ -255,12 +172,26 @@ def main(cfg: DictConfig) -> None:
     datamodule = instantiate_datamodule(cfg, log)
     graph_consts = extract_graph_constants(datamodule, log)
     
-    # Initialize Flow Matching model and its sub-modules
+    # Initialize Flow Matching model via Hydra (recursive instantiation)
     log.info("=" * 80)
     log.info("[bold italic #FFD700]Initializing Flow Matching Hand DiT model...[/]")
     log.info("=" * 80)
-    backbone, hand_encoder, dit = build_model_modules(cfg, graph_consts)
-    model = instantiate_model(cfg, graph_consts, backbone, hand_encoder, dit)
+    if not hasattr(cfg, "model") or not hasattr(cfg.model, "_target_"):
+        raise ValueError("cfg.model must specify a Hydra '_target_'")
+
+    model = hydra_instantiate(
+        cfg.model,
+        graph_consts=graph_consts,
+        _recursive_=False,
+    )
+
+    # Optional: PyTorch 2.0 compile for speedup
+    if cfg.get("compile", False):
+        if hasattr(torch, "compile"):
+            log.info("[bold italic #33FFAA]Compiling model with torch.compile()[/]")
+            model = torch.compile(model)  # type: ignore[attr-defined]
+        else:
+            log.warning("cfg.compile=True 但当前 PyTorch 版本不支持 torch.compile，已跳过编译。")
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info(f"Total parameters: [bold #33AAFF]{total_params:,}[/]")

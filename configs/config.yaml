@@ -17,13 +17,14 @@ defaults:
   - _self_
 
 # Experiment settings
-experiment_name: test
+experiment_name: new_env
 seed: 42
 
 # Common hyperparameters (可被其他配置引用)
-batch_size: 256
+batch_size: 128
 rot_type: r6d  # 'quat' | 'r6d' | 'euler' | 'axis'
 hand_anchor: palm_center  # 'base' | 'palm_center' | 'mjcf'
+compile: false
 
 # Paths
 paths:

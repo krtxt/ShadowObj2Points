@@ -2,9 +2,6 @@
 # Perceiver-style 跨注意力压缩 + Surface-Aware 预筛选
 # 结合几何先验和可学习查询，专为抓取生成任务优化
 
-defaults:
-  - override /model/flow_matching/decoder/backbone@_here_: ptv3_sparse
-
 name: ptv3_sparse
 token_strategy: perceiver  # last_layer | fps | grid | learned | multiscale
 

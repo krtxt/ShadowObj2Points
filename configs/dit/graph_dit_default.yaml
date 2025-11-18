@@ -1,0 +1,33 @@
+# Graph-aware DiT configuration for HandSceneGraphDiT
+# Controls graph bias, attention, and feed-forward settings.
+
+# Number of stacked HandSceneGraphDiT blocks
+depth: 8
+
+# Number of attention heads in each block
+num_heads: 8
+
+# Dimension of scene tokens used in cross-attention (defaults to d_model if null)
+cross_attention_dim: null
+
+# Feed-forward sub-layer options
+ff_inner_dim: null   # Defaults to 4 * d_model when null
+ff_bias: true
+
+# Enable long-skip concatenation inside each DiT block (default: false)
+skip: false
+
+# Dropout applied in attention and FFN blocks
+dropout: 0.0
+
+# Activation function used inside FeedForward blocks
+# Options follow diffusers: gelu | geglu | approx_gelu
+activation_fn: geglu
+
+# Whether to apply qk normalization in attention
+qk_norm: false
+
+# Structural bias configuration used by GraphAttentionBias
+graph_bias:
+  enabled: true
+  d_struct: 8

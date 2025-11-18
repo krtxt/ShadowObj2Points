@@ -1,35 +1,31 @@
-# hand_encoders.py
-# ------------------------------------------------------------
-# Hand encoders that map N hand keypoints to per-point tokens
-# of dimension out_dim (default 512), with strong inductive
-# biases for dexterous hands / kinematic trees.
-# ------------------------------------------------------------
-from typing import Optional, Tuple
+"""Hand encoder modules for mapping keypoints to token embeddings.
+
+Provides multiple architectures with strong inductive biases for dexterous
+hand modeling, including EGNN-lite and Transformer-based variants.
+"""
+
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Reuse FourierPositionalEmbedding from the provided attachment
-# (see embeddings.py)
-from .embeddings import FourierPositionalEmbedding  # noqa: F401
+from .embeddings import FourierPositionalEmbedding
 
-
-# -----------------------------
-# Small Shared Building Blocks
-# -----------------------------
 class HandPointEmbedding(nn.Module):
-    """
-    点级特征构建：
-      Fourier(xyz) + finger_id Embedding + joint_type Embedding -> 投到 d_model
-
+    """Embeds hand keypoint features combining spatial and structural information.
+    
+    Combines Fourier positional encoding of xyz coordinates with learned embeddings
+    for finger and joint type identifiers.
+    
     Args:
-        num_fingers: 手指数目（finger_id 取值范围大小）
-        num_joint_types: 关节类型数（joint_type_id 取值范围大小）
-        d_model: 中间特征维度（会再投到 out_dim）
-        finger_dim: finger embedding 维度
-        joint_dim: joint embedding 维度
-        num_frequencies: Fourier 频率数
+        num_fingers: Number of fingers (vocabulary size for finger_id)
+        num_joint_types: Number of joint types (vocabulary size for joint_type_id)
+        d_model: Hidden feature dimension
+        finger_dim: Finger embedding dimension
+        joint_dim: Joint type embedding dimension
+        num_frequencies: Number of Fourier frequencies
+        dropout: Dropout probability
     """
     def __init__(
         self,
@@ -66,27 +62,27 @@ class HandPointEmbedding(nn.Module):
         finger_ids: torch.Tensor,
         joint_type_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """
+        """Compute point-wise embeddings.
+        
         Args:
-            xyz: (B, N, 3)
-            finger_ids: (B, N)
-            joint_type_ids: (B, N)
+            xyz: Keypoint coordinates of shape (B, N, 3)
+            finger_ids: Finger indices of shape (B, N)
+            joint_type_ids: Joint type indices of shape (B, N)
 
         Returns:
-            h: (B, N, d_model)
+            Point embeddings of shape (B, N, d_model)
         """
-        f_xyz = self.fourier(xyz)                    # (B, N, Df)
-        f_finger = self.finger_emb(finger_ids)       # (B, N, df)
-        f_joint = self.joint_emb(joint_type_ids)     # (B, N, dj)
-        feats = torch.cat([f_xyz, f_finger, f_joint], dim=-1)
-        h = self.proj(feats)
-        return h
+        f_xyz = self.fourier(xyz)
+        f_finger = self.finger_emb(finger_ids)
+        f_joint = self.joint_emb(joint_type_ids)
+        features = torch.cat([f_xyz, f_finger, f_joint], dim=-1)
+        return self.proj(features)
 
-
-class PMA1(nn.Module):
-    """
-    Set Transformer 风格的 PMA（k=1）：将 N 个点级 token 汇聚为 1 个全局 token。
-    当前文件里新加的 per-point encoder 不再用它，但保留以向后兼容。
+class PooledMultiheadAttention(nn.Module):
+    """Set-Transformer style pooling with multihead attention (k=1 seed).
+    
+    Aggregates N point-level tokens into a single global token.
+    Kept for backward compatibility with older models.
     """
     def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.1):
         super().__init__()
@@ -100,16 +96,18 @@ class PMA1(nn.Module):
         self.ln = nn.LayerNorm(d_model)
 
     def forward(self, H: torch.Tensor) -> torch.Tensor:
-        """
+        """Pool point tokens into a single global token.
+        
         Args:
-            H: (B, N, d)
+            H: Point tokens of shape (B, N, d)
+            
         Returns:
-            z: (B, d)
+            Global token of shape (B, d)
         """
         B = H.size(0)
-        Q = self.seed.expand(B, -1, -1)  # (B,1,d)
-        Z, _ = self.attn(Q, H, H)        # (B,1,d)
-        return self.ln(Z.squeeze(1))     # (B,d)
+        Q = self.seed.expand(B, -1, -1)
+        Z, _ = self.attn(Q, H, H)
+        return self.ln(Z.squeeze(1))
 
 
 def _pairwise_edge_geom(
@@ -117,19 +115,7 @@ def _pairwise_edge_geom(
     edge_index: torch.Tensor,
     edge_rest_lengths: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    基于 batch 的边几何特征：dist, dist2, delta_d
-
-    Args:
-        xyz: (B, N, 3)
-        edge_index: (2, E)
-        edge_rest_lengths: (E,)
-
-    Returns:
-        dist:  (B, E, 1)
-        dist2: (B, E, 1)
-        delta:(B, E, 1)  # (dist - rest) / rest
-    """
+    """Batch edge geometry helper returning distance, squared distance, and deviation."""
     i, j = edge_index  # (E,), (E,)
     diff = xyz[:, i, :] - xyz[:, j, :]              # (B, E, 3)
     dist2 = (diff ** 2).sum(-1, keepdim=True)       # (B, E, 1)
@@ -143,13 +129,7 @@ def _pairwise_edge_geom(
 # Scheme A: EGNN-lite (no coord updates)
 # -----------------------------------------
 class EdgeStructEmbedding(nn.Module):
-    """
-    边结构 Embedding（例如：骨架边 / 跨指边 / 掌星形边 ...）
-
-    Args:
-        num_edge_types: edge_type 取值范围大小
-        d_struct: 边结构 embedding 维度
-    """
+    """Embedding table for discrete edge types (skeleton, cross-finger, etc.)."""
     def __init__(self, num_edge_types: int, d_struct: int = 8):
         super().__init__()
         self.emb = nn.Embedding(num_edge_types, d_struct)
@@ -160,13 +140,7 @@ class EdgeStructEmbedding(nn.Module):
 
 
 class EGNNLiteLayer(nn.Module):
-    """
-    极简 EGNN 风格层：仅做特征更新（不更新坐标），
-    消息中显式引入 dist^2 / delta_d / 结构 Embedding，并以门控形式作为增益。
-
-    输入输出：
-        H: (B, N, d_model) -> (B, N, d_model)
-    """
+    """Feature-only EGNN-style layer with geometric gating on messages."""
     def __init__(
         self,
         d_model: int,
@@ -176,12 +150,12 @@ class EGNNLiteLayer(nn.Module):
     ):
         super().__init__()
         self.edge_mlp = nn.Sequential(
-            nn.Linear(2 * d_model + 1 + 1 + d_struct, d_edge),  # [h_i, h_j, dist2, delta, struct]
+            nn.Linear(2 * d_model + 1 + 1 + d_struct, d_edge),
             nn.SiLU(),
             nn.Linear(d_edge, d_edge),
             nn.SiLU(),
         )
-        self.gate_mlp = nn.Sequential(  # 产生标量门控
+        self.gate_mlp = nn.Sequential(
             nn.Linear(1 + 1 + d_struct, 32),
             nn.SiLU(),
             nn.Linear(32, 1),
@@ -205,51 +179,24 @@ class EGNNLiteLayer(nn.Module):
     ) -> torch.Tensor:
         B, N, d = H.shape
         E = edge_index.size(1)
-        i, j = edge_index  # (E,), (E,)
-
-        Hi = H[:, i, :]                              # (B, E, d)
-        Hj = H[:, j, :]                              # (B, E, d)
-        dist, dist2, delta = _pairwise_edge_geom(
-            xyz, edge_index, edge_rest_lengths
-        )                                            # (B, E, 1)...
-        struct = edge_struct.unsqueeze(0).expand(B, E, -1)  # (B, E, d_struct)
-
-        # edge message
-        e_in = torch.cat([Hi, Hj, dist2, delta, struct], dim=-1)  # (B,E,2d+1+1+d_struct)
-        e_msg = self.edge_mlp(e_in)                               # (B,E,d_edge)
-
-        # gate
-        g = self.gate_mlp(torch.cat([dist2, delta, struct], dim=-1))  # (B,E,1)
-        e_msg = e_msg * g  # (B,E,d_edge)
-
-        # aggregate to nodes: sum over incoming edges j->i
-        agg = torch.zeros(
-            B, N, e_msg.size(-1),
-            device=H.device,
-            dtype=H.dtype,
-        )  # (B, N, d_edge)
+        i, j = edge_index
+        Hi = H[:, i, :]
+        Hj = H[:, j, :]
+        dist, dist2, delta = _pairwise_edge_geom(xyz, edge_index, edge_rest_lengths)
+        struct = edge_struct.unsqueeze(0).expand(B, E, -1)
+        e_in = torch.cat([Hi, Hj, dist2, delta, struct], dim=-1)
+        e_msg = self.edge_mlp(e_in)
+        g = self.gate_mlp(torch.cat([dist2, delta, struct], dim=-1))
+        e_msg = e_msg * g
+        agg = torch.zeros(B, N, e_msg.size(-1), device=H.device, dtype=H.dtype)
         idx = i.view(1, E, 1).expand(B, E, e_msg.size(-1))
         agg.scatter_add_(dim=1, index=idx, src=e_msg)
-
-        # node update (residual + LN)
         H_new = self.ln(H + self.node_mlp(torch.cat([H, agg], dim=-1)))
         return H_new
 
 
 class HandEncoderEGNNLiteGlobal(nn.Module):
-    """
-    原始方案 A：轻量等变图编码器（不更新坐标）+ PMA(k=1) -> 单个 512 维 hand-token
-    （保留以向后兼容；**新方案使用下面的 HandPointTokenEncoderEGNNLite**）
-
-    forward:
-        xyz: (B, N, 3)
-        finger_ids: (B, N)
-        joint_type_ids: (B, N)
-        edge_index: (2, E)
-        edge_type: (E,)
-        edge_rest_lengths: (E,)
-      -> (B, 512)
-    """
+    """Legacy EGNN-lite encoder pooling all points into a single global token."""
     def __init__(
         self,
         num_fingers: int,
@@ -291,7 +238,6 @@ class HandEncoderEGNNLiteGlobal(nn.Module):
             nn.Linear(256, out_dim),
         )
 
-    @torch.no_grad()
     def _edge_struct(self, edge_type: torch.Tensor) -> torch.Tensor:
         return self.edge_struct_emb(edge_type)  # (E, d_struct)
 
@@ -308,37 +254,22 @@ class HandEncoderEGNNLiteGlobal(nn.Module):
         edge_struct = self._edge_struct(edge_type)                # (E, d_struct)
         for layer in self.layers:
             H = layer(H, xyz, edge_index, edge_struct, edge_rest_lengths)
-        z = self.pma(H)                                           # (B, d)
-        return self.out(z)                                        # (B, 512)
-
+        z = self.pma(H)
+        return self.out(z)
 
 class HandPointTokenEncoderEGNNLite(nn.Module):
-    """
-    新方案 A（你要用的这个）：
-      轻量等变图编码器（不更新坐标） -> 按点输出 token，用于后续 DiT。
-
-    forward 输入：
-        xyz: (B, N, 3)
-        finger_ids: (B, N)
-        joint_type_ids: (B, N)
-        edge_index: (2, E)
-        edge_type: (E,)
-        edge_rest_lengths: (E,)
-
-    输出：
-        tokens: (B, N, out_dim)   # out_dim 默认 512，可以直接作为 DiT 的 d_model
-    """
+    """Per-point EGNN-lite encoder producing tokens for downstream DiT blocks."""
     def __init__(
         self,
         num_fingers: int,
         num_joint_types: int,
         num_edge_types: int,
-        d_model: int = 128,            # 中间维度
+        d_model: int = 128,            # hidden width inside EGNN
         n_layers: int = 3,
         d_edge: int = 64,
         d_struct: int = 8,
         num_frequencies: int = 10,
-        out_dim: int = 512,           # 每个点的 token 维度
+        out_dim: int = 512,           # token dimension per point
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -362,7 +293,7 @@ class HandPointTokenEncoderEGNNLite(nn.Module):
             ]
         )
 
-        # 最后一层将 d_model 映射到 out_dim（默认 512），按点输出
+        # Final projection from d_model to out_dim per point
         self.out = nn.Sequential(
             nn.Linear(d_model, 2 * d_model),
             nn.SiLU(),
@@ -371,7 +302,6 @@ class HandPointTokenEncoderEGNNLite(nn.Module):
             nn.LayerNorm(out_dim),
         )
 
-    @torch.no_grad()
     def _edge_struct(self, edge_type: torch.Tensor) -> torch.Tensor:
         return self.edge_struct_emb(edge_type)  # (E, d_struct)
 
@@ -388,24 +318,16 @@ class HandPointTokenEncoderEGNNLite(nn.Module):
         Returns:
             tokens: (B, N, out_dim)
         """
-        H = self.point_embed(xyz, finger_ids, joint_type_ids)     # (B, N, d_model)
-        edge_struct = self._edge_struct(edge_type)                # (E, d_struct)
+        H = self.point_embed(xyz, finger_ids, joint_type_ids)
+        edge_struct = self._edge_struct(edge_type)
         for layer in self.layers:
             H = layer(H, xyz, edge_index, edge_struct, edge_rest_lengths)
-        tokens = self.out(H)                                      # (B, N, out_dim)
+        tokens = self.out(H)
         return tokens
 
-
-# ------------------------------------------------
-# Scheme B: Transformer + structural attention bias
-# ------------------------------------------------
+# Transformer with structural attention bias
 class BiasedMHSA(nn.Module):
-    """
-    自定义多头自注意力，允许加性注意力偏置 attn_bias (B, 1, N, N)。
-
-    注意：这里直接手写 attention（而不是用 scaled_dot_product_attention 的 attn_mask），
-    更直观也更稳定。
-    """
+    """Multi-head self-attention with an additive bias tensor."""
     def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.1):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -427,7 +349,7 @@ class BiasedMHSA(nn.Module):
         """
         Args:
             x: (B, N, d)
-            attn_bias: (B, 1, N, N) 或 None，加入到注意力 logits（加性偏置）
+            attn_bias: (B, 1, N, N) or None, added to attention logits
 
         Returns:
             y: (B, N, d)
@@ -456,9 +378,7 @@ class BiasedMHSA(nn.Module):
 
 
 class TransformerEncoderLayerBias(nn.Module):
-    """
-    Pre-LN Transformer 编码层，内置 BiasedMHSA。
-    """
+    """Pre-LN Transformer encoder layer with BiasedMHSA."""
     def __init__(
         self,
         d_model: int,
@@ -481,21 +401,14 @@ class TransformerEncoderLayerBias(nn.Module):
         )
         self.drop2 = nn.Dropout(dropout)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        attn_bias: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_bias: Optional[torch.Tensor]) -> torch.Tensor:
         x = x + self.drop1(self.attn(self.ln1(x), attn_bias))
         x = x + self.drop2(self.ffn(self.ln2(x)))
         return x
 
 
 class EdgeBiasBuilder(nn.Module):
-    """
-    将边几何/结构特征映射为注意力偏置矩阵 (B, 1, N, N)，
-    非边位置使用一个可学习的默认偏置。
-    """
+    """Project edge geometry into an attention bias matrix with learnable fallback."""
     def __init__(self, d_struct: int = 8):
         super().__init__()
         self.edge_to_bias = nn.Sequential(
@@ -503,7 +416,7 @@ class EdgeBiasBuilder(nn.Module):
             nn.SiLU(),
             nn.Linear(32, 1),
         )
-        # 默认偏置，可以初始化为 0 或负值
+        # Learnable default bias for non-edge entries
         self.non_edge_bias = nn.Parameter(torch.tensor(0.0))
 
     def forward(
@@ -520,32 +433,17 @@ class EdgeBiasBuilder(nn.Module):
         dist, dist2, delta = _pairwise_edge_geom(
             xyz, edge_index, edge_rest_lengths
         )                               # (B,E,1)...
-        struct = edge_struct.unsqueeze(0).expand(B, E, -1)   # (B,E,d_struct)
-
-        edge_feat = torch.cat([dist2, delta, struct], dim=-1)  # (B,E, 1+1+d_struct)
-        edge_bias = self.edge_to_bias(edge_feat).squeeze(-1)   # (B,E)
-
-        # NxN 偏置矩阵，非边位置使用可学习的 non_edge_bias 作为初始值
-        bias = torch.ones(
-            (B, N, N),
-            device=xyz.device,
-            dtype=xyz.dtype,
-        ) * self.non_edge_bias
-        # 写入 i->j 与 j->i（无向）
-        for b in range(B):
-            bias[b].index_put_((i, j), edge_bias[b])
-            bias[b].index_put_((j, i), edge_bias[b])
-
-        # (B,1,N,N) 以便广播到 (B,h,N,N)
+        struct = edge_struct.unsqueeze(0).expand(B, E, -1)
+        edge_feat = torch.cat([dist2, delta, struct], dim=-1)
+        edge_bias = self.edge_to_bias(edge_feat).squeeze(-1)
+        bias = torch.ones((B, N, N), device=xyz.device, dtype=xyz.dtype) * self.non_edge_bias
+        bias[:, i, j] = edge_bias
+        bias[:, j, i] = edge_bias
         return bias.unsqueeze(1)
 
 
 class HandEncoderTransformerBiasGlobal(nn.Module):
-    """
-    原始方案 B：标准 Transformer（带结构/骨长注意力偏置）+ PMA(k=1)
-    -> 单个 512 维 hand-token。
-    （保留以向后兼容；**新方案使用 HandPointTokenEncoderTransformerBias**）
-    """
+    """Legacy Transformer encoder with structural bias pooled into one token."""
     def __init__(
         self,
         num_fingers: int,
@@ -591,7 +489,6 @@ class HandEncoderTransformerBiasGlobal(nn.Module):
             nn.Linear(256, out_dim),
         )
 
-    @torch.no_grad()
     def _edge_struct(self, edge_type: torch.Tensor) -> torch.Tensor:
         return self.edge_struct_emb(edge_type)  # (E, d_struct)
 
@@ -613,37 +510,22 @@ class HandEncoderTransformerBiasGlobal(nn.Module):
         for blk in self.blocks:
             H = blk(H, attn_bias)
 
-        z = self.pma(H)                                             # (B,d)
-        return self.out(z)                                          # (B,512)
-
+        z = self.pma(H)
+        return self.out(z)
 
 class HandPointTokenEncoderTransformerBias(nn.Module):
-    """
-    新方案 B（你要用的这个）：
-      标准 Transformer（带结构/骨长注意力偏置） -> 按点输出 token。
-
-    forward 输入：
-        xyz: (B, N, 3)
-        finger_ids: (B, N)
-        joint_type_ids: (B, N)
-        edge_index: (2, E)
-        edge_type: (E,)
-        edge_rest_lengths: (E,)
-
-    输出：
-        tokens: (B, N, out_dim)   # out_dim 默认 512，可直接作为 DiT 的输入 token
-    """
+    """Transformer encoder with structural bias that outputs per-point tokens."""
     def __init__(
         self,
         num_fingers: int,
         num_joint_types: int,
         num_edge_types: int,
-        d_model: int = 128,          # 中间维度
+        d_model: int = 128,          # hidden width inside Transformer
         n_layers: int = 3,
         n_heads: int = 4,
         d_struct: int = 8,
         num_frequencies: int = 10,
-        out_dim: int = 512,          # 每个点的 token 维度
+        out_dim: int = 512,          # token dimension per point
         dropout: float = 0.1,
         ffn_ratio: int = 2,
     ):
@@ -678,7 +560,6 @@ class HandPointTokenEncoderTransformerBias(nn.Module):
             nn.LayerNorm(out_dim),
         )
 
-    @torch.no_grad()
     def _edge_struct(self, edge_type: torch.Tensor) -> torch.Tensor:
         return self.edge_struct_emb(edge_type)  # (E, d_struct)
 
@@ -695,22 +576,93 @@ class HandPointTokenEncoderTransformerBias(nn.Module):
         Returns:
             tokens: (B, N, out_dim)
         """
-        H = self.point_embed(xyz, finger_ids, joint_type_ids)      # (B, N, d_model)
-        edge_struct = self._edge_struct(edge_type)                 # (E, d_struct)
-        attn_bias = self.bias_builder(
-            xyz, edge_index, edge_struct, edge_rest_lengths
-        )                                                           # (B,1,N,N)
-
+        H = self.point_embed(xyz, finger_ids, joint_type_ids)
+        edge_struct = self._edge_struct(edge_type)
+        attn_bias = self.bias_builder(xyz, edge_index, edge_struct, edge_rest_lengths)
         for blk in self.blocks:
             H = blk(H, attn_bias)
-
-        tokens = self.out(H)                                       # (B, N, out_dim)
+        tokens = self.out(H)
         return tokens
 
+# Factory function
+def build_hand_encoder(
+    cfg: Any,
+    graph_consts: Dict[str, torch.Tensor],
+    out_dim: int,
+) -> nn.Module:
+    """Build a hand encoder from a Hydra/OmegaConf config.
 
-# -------------------------
-# Minimal quick self-test
-# -------------------------
+    Args:
+        cfg:    Config node under the `hand_encoder` group.
+        graph_consts: Graph constants from the datamodule (see HandFlowMatchingDiT docstring).
+        out_dim: Output token dimension (should typically match cfg.model.d_model).
+    """
+    # Derive vocab sizes from graph constants
+    finger_ids = graph_consts["finger_ids"].long()
+    joint_type_ids = graph_consts["joint_type_ids"].long()
+    edge_type = graph_consts["edge_type"].long()
+
+    num_fingers = int(finger_ids.max().item()) + 1
+    num_joint_types = int(joint_type_ids.max().item()) + 1
+    num_edge_types = int(edge_type.max().item()) + 1
+
+    name = str(getattr(cfg, "name", "transformer_bias")).lower()
+
+    # Utility for reading optional fields from DictConfig / dict
+    def _get(key: str, default):
+        if hasattr(cfg, key):
+            return getattr(cfg, key)
+        if isinstance(cfg, dict) and key in cfg:
+            return cfg[key]
+        return default
+
+    if name in ("transformer", "transformer_bias"):
+        d_model_inner = _get("d_model", out_dim // 4)
+        n_layers = _get("n_layers", 3)
+        n_heads = _get("n_heads", 4)
+        d_struct = _get("d_struct", 8)
+        num_frequencies = _get("num_frequencies", 10)
+        dropout = _get("dropout", 0.1)
+        ffn_ratio = _get("ffn_ratio", 2)
+
+        return HandPointTokenEncoderTransformerBias(
+            num_fingers=num_fingers,
+            num_joint_types=num_joint_types,
+            num_edge_types=num_edge_types,
+            d_model=d_model_inner,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            d_struct=d_struct,
+            num_frequencies=num_frequencies,
+            out_dim=out_dim,
+            dropout=dropout,
+            ffn_ratio=ffn_ratio,
+        )
+
+    elif name in ("egnn", "egnn_lite"):
+        d_model_inner = _get("d_model", out_dim // 4)
+        n_layers = _get("n_layers", 3)
+        d_edge = _get("d_edge", 64)
+        d_struct = _get("d_struct", 8)
+        num_frequencies = _get("num_frequencies", 10)
+        dropout = _get("dropout", 0.1)
+
+        return HandPointTokenEncoderEGNNLite(
+            num_fingers=num_fingers,
+            num_joint_types=num_joint_types,
+            num_edge_types=num_edge_types,
+            d_model=d_model_inner,
+            n_layers=n_layers,
+            d_edge=d_edge,
+            d_struct=d_struct,
+            num_frequencies=num_frequencies,
+            out_dim=out_dim,
+            dropout=dropout,
+        )
+
+    else:
+        raise ValueError(f"Unknown hand_encoder.name: {name}")
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     B, N = 2, 20
@@ -720,9 +672,9 @@ if __name__ == "__main__":
     joint_type_ids = torch.randint(0, 5, (B, N))
     edge_index = torch.randint(0, N, (2, E))
     edge_type = torch.randint(0, 3, (E,))
-    edge_rest_lengths = torch.rand(E) * 0.1 + 0.03  # some positive lengths
+    edge_rest_lengths = torch.rand(E) * 0.1 + 0.03  # positive lengths
 
-    # 老的 global token encoder（兼容）
+    # Legacy global-token encoders (kept for compatibility)
     enc_a_global = HandEncoderEGNNLiteGlobal(
         num_fingers=5,
         num_joint_types=5,
@@ -734,7 +686,7 @@ if __name__ == "__main__":
         num_edge_types=3,
     )
 
-    # 新的 per-point token encoder（你在 DiT 里主要用这个）
+    # Modern per-point token encoders (used for DiT)
     enc_a_tokens = HandPointTokenEncoderEGNNLite(
         num_fingers=5,
         num_joint_types=5,

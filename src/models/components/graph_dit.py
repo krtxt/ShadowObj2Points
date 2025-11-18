@@ -1,47 +1,105 @@
-# graph_dit.py
-# ------------------------------------------------------------
-# Graph-aware DiT for hand tokens + scene tokens (point cloud)
-# Self-attn: operates on hand tokens with graph attention bias
-# Cross-attn: injects scene tokens (no mask)
-#
-# 参考结构：diffusers 中的 HunyuanDiTBlock（self + cross + FFN + AdaLayerNormShift）
-# ------------------------------------------------------------
-from typing import Optional
+"""Graph-aware DiT (Diffusion Transformer) for hand keypoint generation.
+
+Implements a DiT architecture with graph-structural inductive biases for hand pose
+modeling, combining self-attention on hand tokens (with graph bias) and cross-attention
+with scene context tokens.
+
+Reference: Inspired by HuggingFace Diffusers' DiT implementations.
+"""
+
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# 你需要安装 diffusers，下面路径如果不对，可以根据自己版本调整：
-# 例如：from diffusers.models.attention import FeedForward
-from diffusers.attention import FeedForward
+from .hand_encoder import EdgeBiasBuilder
 
+_SDPA_AVAILABLE = hasattr(F, "scaled_dot_product_attention")
 
-# ------------------------------
-# 基础：FP32 LayerNorm + AdaLN
-# ------------------------------
-class FP32LayerNorm(nn.LayerNorm):
-    """
-    简单版 FP32 LayerNorm：内部用 float32 计算，再 cast 回输入 dtype。
-
+class FeedForward(nn.Module):
+    """Position-wise feed-forward network with flexible activation functions.
+    
+    Supports GEGLU, GELU, SiLU, and ReLU activations. Design follows
+    diffusers.models.attention.FeedForward conventions.
+    
     Args:
-        normalized_shape: int or tuple
-        eps: float
-        elementwise_affine: bool
+        dim: Input and output dimension
+        dropout: Dropout probability
+        activation_fn: Activation type ('geglu', 'gelu', 'silu', 'relu')
+        final_dropout: Whether to apply dropout after output projection
+        inner_dim: Hidden layer dimension (default: dim * 4)
+        bias: Whether to use bias in linear layers
+    """
+    def __init__(
+        self,
+        dim: int,
+        dropout: float = 0.0,
+        activation_fn: str = "geglu",
+        final_dropout: bool = False,
+        inner_dim: Optional[int] = None,
+        bias: bool = True,
+    ):
+        super().__init__()
+        inner_dim = inner_dim or dim * 4
+        act = activation_fn.lower()
+        self.activation_fn = act
+        self.final_dropout = final_dropout
+        self.dropout = nn.Dropout(dropout)
+
+        if act == "geglu":
+            self.proj_in = nn.Linear(dim, inner_dim * 2, bias=bias)
+        else:
+            self.proj_in = nn.Linear(dim, inner_dim, bias=bias)
+
+        self.proj_out = nn.Linear(inner_dim, dim, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        act = self.activation_fn
+        if act == "geglu":
+            x_in, gate = self.proj_in(x).chunk(2, dim=-1)
+            x_in = F.gelu(gate) * x_in
+        elif act == "gelu":
+            x_in = F.gelu(self.proj_in(x))
+        elif act == "silu":
+            x_in = F.silu(self.proj_in(x))
+        elif act == "relu":
+            x_in = F.relu(self.proj_in(x))
+        else:
+            x_in = F.gelu(self.proj_in(x))
+        x_in = self.dropout(x_in)
+        x_out = self.proj_out(x_in)
+        if self.final_dropout:
+            x_out = self.dropout(x_out)
+        return x_out
+
+
+class FP32LayerNorm(nn.LayerNorm):
+    """Layer normalization computed in float32 for numerical stability.
+    
+    Casts input to float32, applies normalization, then casts back to original dtype.
+    Useful for mixed-precision training stability.
+    
+    Args:
+        normalized_shape: Shape for normalization (int or tuple)
+        eps: Small constant for numerical stability
+        elementwise_affine: Whether to learn affine parameters
     """
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_dtype = x.dtype
-        y = super().forward(x.to(torch.float32))
-        return y.to(orig_dtype)
-
+        output = super().forward(x.to(torch.float32))
+        return output.to(orig_dtype)
 
 class AdaLayerNormShift(nn.Module):
-    r"""
-    从 HunyuanDiT 改写的 AdaLayerNormShift:
-    Norm(x) + shift(temb)
-
-    Parameters:
-        embedding_dim (`int`): 嵌入维度（通常等于 hidden_size）
+    """Adaptive layer normalization with timestep-conditioned shift.
+    
+    Applies layer normalization followed by an additive shift computed from
+    timestep embeddings. Adapted from HunyuanDiT.
+    
+    Args:
+        embedding_dim: Embedding dimension (typically matches hidden_size)
+        elementwise_affine: Whether to learn affine normalization parameters
+        eps: Small constant for numerical stability
     """
 
     def __init__(self, embedding_dim: int, elementwise_affine: bool = True, eps: float = 1e-6):
@@ -51,32 +109,31 @@ class AdaLayerNormShift(nn.Module):
         self.norm = FP32LayerNorm(embedding_dim, eps=eps, elementwise_affine=elementwise_affine)
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
-        """
+        """Apply adaptive normalization.
+        
         Args:
-            x:   (B, N, D)
-            emb: (B, D)
+            x: Input features of shape (B, N, D)
+            emb: Timestep embeddings of shape (B, D)
 
         Returns:
-            out: (B, N, D)
+            Normalized and shifted features of shape (B, N, D)
         """
-        shift = self.linear(self.silu(emb.to(torch.float32))).to(emb.dtype)  # (B,D)
-        x = self.norm(x) + shift.unsqueeze(1)  # broadcast 到 N 维
-        return x
+        shift = self.linear(self.silu(emb.to(torch.float32))).to(emb.dtype)
+        return self.norm(x) + shift.unsqueeze(1)
 
-
-# ------------------------------
-# 自定义注意力：支持 graph bias
-# ------------------------------
 class GraphSelfAttention(nn.Module):
-    """
-    多头自注意力（MHSA），支持加性 attention bias，用于注入图结构信息。
-
+    """Multi-head self-attention with additive graph-structural attention bias.
+    
+    Enables incorporation of graph connectivity and geometric features into
+    attention weights via an additive bias term.
+    
     Args:
-        dim:      token 维度 D
-        num_heads:注意力头数
-        dropout:  attention drop 概率
-        qk_norm:  是否对每个 head 的 Q/K 做 LayerNorm
-        eps:      QK LayerNorm 的 eps
+        dim: Token dimension
+        num_heads: Number of attention heads
+        dropout: Attention dropout probability
+        qk_norm: Whether to apply LayerNorm to Q and K per head
+        eps: LayerNorm epsilon for numerical stability
+        use_sdpa: Whether to use scaled_dot_product_attention (if available)
     """
 
     def __init__(
@@ -86,6 +143,7 @@ class GraphSelfAttention(nn.Module):
         dropout: float = 0.0,
         qk_norm: bool = False,
         eps: float = 1e-6,
+        use_sdpa: bool = True,
     ):
         super().__init__()
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
@@ -93,6 +151,7 @@ class GraphSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
 
+        self.use_sdpa = bool(use_sdpa) and _SDPA_AVAILABLE
         self.to_q = nn.Linear(dim, dim, bias=True)
         self.to_k = nn.Linear(dim, dim, bias=True)
         self.to_v = nn.Linear(dim, dim, bias=True)
@@ -113,56 +172,98 @@ class GraphSelfAttention(nn.Module):
         x: torch.Tensor,
         attn_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
+        """Compute self-attention with optional graph-structural bias.
+        
         Args:
-            x: (B, N, D)
-            attn_bias: (B, 1, N, N) 或 (B, N, N)，会加到注意力 logits 上
+            x: Input tokens of shape (B, N, D)
+            attn_bias: Additive attention bias of shape (B, 1, N, N) or (B, N, N)
 
         Returns:
-            y: (B, N, D)
+            Output tokens of shape (B, N, D)
         """
         B, N, D = x.shape
         h = self.num_heads
         dh = self.head_dim
 
-        # (B,N,D) -> (B,h,N,dh)
-        q = self.to_q(x).view(B, N, h, dh).transpose(1, 2)  # (B,h,N,dh)
+        q = self.to_q(x).view(B, N, h, dh).transpose(1, 2)
         k = self.to_k(x).view(B, N, h, dh).transpose(1, 2)
         v = self.to_v(x).view(B, N, h, dh).transpose(1, 2)
-
         if self.qk_norm:
             q = self.q_norm(q)
             k = self.k_norm(k)
+        if self.use_sdpa:
+            return self._sdpa_attention(q, k, v, attn_bias, B, N, D)
+        return self._standard_attention(q, k, v, attn_bias, B, N, D)
 
-        # 注意力 logits: (B,h,N,N)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / (dh ** 0.5)
+    def _format_attn_bias(
+        self, attn_bias: torch.Tensor, batch: int, heads: int, seq_len: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Convert graph bias into SDPA-compatible attn_mask.
 
+        Keeps shape as (B, H, N, N) so it can broadcast to
+        query/key of shape (B, H, N, Dh) expected by SDPA.
+        """
+        if attn_bias.dim() == 3:
+            attn_bias = attn_bias.unsqueeze(1)  # (B,1,N,N)
+        if attn_bias.size(1) == 1:
+            attn_bias = attn_bias.expand(batch, heads, seq_len, seq_len)
+        elif attn_bias.size(1) != heads:
+            raise ValueError(f"attn_bias second dim must be 1 or num_heads, got {attn_bias.size(1)}")
+        return attn_bias.to(dtype=dtype)
+
+    def _sdpa_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_bias: Optional[torch.Tensor],
+        batch: int,
+        seq_len: int,
+        dim: int,
+    ) -> torch.Tensor:
+        dropout_p = self.dropout if self.training else 0.0
+        attn_mask = None
+        if attn_bias is not None:
+            attn_mask = self._format_attn_bias(attn_bias, batch, self.num_heads, seq_len, q.dtype)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False)
+        out = out.transpose(1, 2).contiguous().view(batch, seq_len, dim)
+        return self.to_out(out)
+
+    def _standard_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_bias: Optional[torch.Tensor],
+        batch: int,
+        seq_len: int,
+        dim: int,
+    ) -> torch.Tensor:
+        dh = self.head_dim
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (dh**0.5)
         if attn_bias is not None:
             if attn_bias.dim() == 3:
-                attn_bias = attn_bias.unsqueeze(1)  # (B,1,N,N)
-            # broadcast 到 (B,h,N,N)
+                attn_bias = attn_bias.unsqueeze(1)
             scores = scores + attn_bias
-
         attn = F.softmax(scores, dim=-1)
         attn = F.dropout(attn, p=self.dropout, training=self.training)
-
-        out = torch.matmul(attn, v)                    # (B,h,N,dh)
-        out = out.transpose(1, 2).contiguous().view(B, N, D)  # (B,N,D)
-        out = self.to_out(out)
-        return out
-
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(batch, seq_len, dim)
+        return self.to_out(out)
 
 class CrossAttention(nn.Module):
-    """
-    标准 Cross-Attention：Q 来自 hand_tokens，K/V 来自 scene_tokens。
-
+    """Standard cross-attention: Q from target, K/V from context.
+    
+    Enables hand tokens to attend to scene context tokens.
+    
     Args:
-        dim:        hand token 维度
-        context_dim:scene token 维度（默认为 dim）
-        num_heads:  注意力头数
-        dropout:    attention dropout
-        qk_norm:    是否对每个 head 的 Q/K 做 LayerNorm
-        eps:        QK LayerNorm eps
+        dim: Target (hand token) dimension
+        context_dim: Context (scene token) dimension (default: same as dim)
+        num_heads: Number of attention heads
+        dropout: Attention dropout probability
+        qk_norm: Whether to apply LayerNorm to Q and K per head
+        eps: LayerNorm epsilon
+        use_sdpa: Whether to use scaled_dot_product_attention (if available)
     """
 
     def __init__(
@@ -173,6 +274,7 @@ class CrossAttention(nn.Module):
         dropout: float = 0.0,
         qk_norm: bool = False,
         eps: float = 1e-6,
+        use_sdpa: bool = True,
     ):
         super().__init__()
         context_dim = context_dim or dim
@@ -183,6 +285,7 @@ class CrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
 
+        self.use_sdpa = bool(use_sdpa) and _SDPA_AVAILABLE
         self.to_q = nn.Linear(dim, dim, bias=True)
         self.to_k = nn.Linear(context_dim, dim, bias=True)
         self.to_v = nn.Linear(context_dim, dim, bias=True)
@@ -200,48 +303,72 @@ class CrossAttention(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,              # (B, N, D)  hand tokens
-        context: torch.Tensor,        # (B, K, C)  scene tokens
+        x: torch.Tensor,
+        context: torch.Tensor,
     ) -> torch.Tensor:
+        """Compute cross-attention between target and context tokens.
+        
+        Args:
+            x: Target tokens of shape (B, N, D)
+            context: Context tokens of shape (B, K, C)
+            
+        Returns:
+            Output tokens of shape (B, N, D)
+        """
         B, N, D = x.shape
         h = self.num_heads
         dh = self.head_dim
 
-        # (B,N,D) -> (B,h,N,dh)
-        q = self.to_q(x).view(B, N, h, dh).transpose(1, 2)  # (B,h,N,dh)
-
-        # (B,K,C) -> (B,h,K,dh)
+        q = self.to_q(x).view(B, N, h, dh).transpose(1, 2)
         k = self.to_k(context).view(B, -1, h, dh).transpose(1, 2)
         v = self.to_v(context).view(B, -1, h, dh).transpose(1, 2)
-
         if self.qk_norm:
             q = self.q_norm(q)
             k = self.k_norm(k)
+        if self.use_sdpa:
+            return self._sdpa_attention(q, k, v, B, N, D)
+        return self._standard_attention(q, k, v, dh, B, N, D)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / (dh ** 0.5)  # (B,h,N,K)
+    def _sdpa_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        batch: int,
+        seq_len: int,
+        dim: int,
+    ) -> torch.Tensor:
+        dropout_p = self.dropout if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=False
+        )
+        out = out.transpose(1, 2).contiguous().view(batch, seq_len, dim)
+        return self.to_out(out)
+
+    def _standard_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        head_dim: int,
+        batch: int,
+        seq_len: int,
+        dim: int,
+    ) -> torch.Tensor:
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim**0.5)
         attn = F.softmax(scores, dim=-1)
         attn = F.dropout(attn, p=self.dropout, training=self.training)
 
-        out = torch.matmul(attn, v)                    # (B,h,N,dh)
-        out = out.transpose(1, 2).contiguous().view(B, N, D)
-        out = self.to_out(out)
-        return out
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(batch, seq_len, dim)
+        return self.to_out(out)
 
-
-# ------------------------------
-# Graph 结构 → attention bias
-# ------------------------------
-def _pairwise_edge_geom(
+def _compute_pairwise_edge_geometry(
     xyz: torch.Tensor,              # (B, N, 3)
     edge_index: torch.Tensor,       # (2, E)
     edge_rest_lengths: torch.Tensor # (E,)
 ):
-    """
-    给定当前坐标 xyz 和 rest_lengths，求：
-        dist:  (B,E,1)
-        dist2: (B,E,1)
-        delta: (B,E,1) = (dist - rest) / rest
-    """
+    """Compute per-edge distances relative to their rest length."""
     i, j = edge_index   # (E,)
     diff = xyz[:, i, :] - xyz[:, j, :]           # (B,E,3)
     dist2 = (diff ** 2).sum(-1, keepdim=True)   # (B,E,1)
@@ -252,19 +379,12 @@ def _pairwise_edge_geom(
 
 
 class GraphAttentionBias(nn.Module):
-    """
-    将图结构 (edge_index, edge_type, edge_rest_lengths) + 当前 xyz
-    映射为注意力偏置矩阵 attn_bias: (B,1,N,N)，用于 GraphSelfAttention。
+    """Map graph structure and current coordinates to an attention bias tensor.
 
-    设计思路：
-      - 对每条边 (i,j) 计算特征 [dist^2, delta, struct_emb(edge_type)]
-      - 用一个 MLP -> 标量 bias_ij
-      - 将这些 bias 写入 NxN 矩阵，对非边用一个可学习的 default bias
-
-    使用方式：
-      - 在 DiT 前向中调用：
-            attn_bias = graph_bias(xyz)  # xyz: (B,N,3)
-      - 传入 Block.self-attn 的 attn_bias 参数。
+    Each edge receives geometric and structural features that are scored by a
+    small MLP. Non-edges fall back to a learnable default bias. The resulting
+    matrix is reshaped to (B, 1, N, N) so it can be injected into
+    ``GraphSelfAttention``.
     """
 
     def __init__(
@@ -283,80 +403,34 @@ class GraphAttentionBias(nn.Module):
         self.register_buffer("edge_rest_lengths", edge_rest_lengths.float(), persistent=False)
 
         self.edge_type_emb = nn.Embedding(num_edge_types, d_struct)
-
-        self.edge_mlp = nn.Sequential(
-            nn.Linear(1 + 1 + d_struct, 32),  # [dist2, delta, struct]
-            nn.SiLU(),
-            nn.Linear(32, 1),
-        )
-
-        # non-edge bias（标量），可初始化为 0
-        self.non_edge_bias = nn.Parameter(torch.tensor(0.0))
+        # Shared edge-bias builder (geometry + non-edge fallback) reused from
+        # hand_encoder to keep behavior and learnable parameters consistent.
+        self.edge_bias_builder = EdgeBiasBuilder(d_struct=d_struct)
 
     def forward(self, xyz: torch.Tensor) -> torch.Tensor:
-        """
+        """Compute attention bias from current keypoint positions.
+        
         Args:
-            xyz: (B, N, 3) 当前关键点坐标（局部坐标或世界坐标都可，但与 rest_lengths 对应即可）
+            xyz: Keypoint coordinates of shape (B, N, 3)
 
         Returns:
-            attn_bias: (B, 1, N, N) 加到 self-attention logits 上
+            Attention bias of shape (B, 1, N, N) for GraphSelfAttention
         """
         B, N, _ = xyz.shape
-        assert N == self.num_nodes, f"xyz has {N} nodes, but graph_bias was built for {self.num_nodes}"
+        if N != self.num_nodes:
+            raise ValueError(f"Expected {self.num_nodes} nodes, got {N}")
+        edge_struct = self.edge_type_emb(self.edge_type_idx)  # (E, d_struct)
+        bias = self.edge_bias_builder(
+            xyz=xyz,
+            edge_index=self.edge_index,
+            edge_struct=edge_struct,
+            edge_rest_lengths=self.edge_rest_lengths,
+        )
+        return bias
 
-        edge_index = self.edge_index   # (2,E)
-        edge_type_idx = self.edge_type_idx
-        edge_rest_lengths = self.edge_rest_lengths
-
-        i, j = edge_index
-        dist, dist2, delta = _pairwise_edge_geom(
-            xyz, edge_index, edge_rest_lengths
-        )                               # (B,E,1)...
-        struct = self.edge_type_emb(edge_type_idx)   # (E,d_struct)
-        struct = struct.unsqueeze(0).expand(B, -1, -1)  # (B,E,d_struct)
-
-        edge_feat = torch.cat([dist2, delta, struct], dim=-1)  # (B,E,1+1+d_struct)
-        edge_bias = self.edge_mlp(edge_feat).squeeze(-1)       # (B,E)
-
-        # 初始化 NxN 为可学习的 non_edge_bias
-        bias = torch.ones(
-            (B, N, N),
-            device=xyz.device,
-            dtype=xyz.dtype,
-        ) * self.non_edge_bias
-        # i->j 和 j->i 都加边 bias
-        for b in range(B):
-            bias[b].index_put_((i, j), edge_bias[b])
-            bias[b].index_put_((j, i), edge_bias[b])
-
-        # (B,1,N,N)
-        return bias.unsqueeze(1)
-
-
-# ------------------------------
 # DiT Block: hand + scene + graph
-# ------------------------------
 class HandSceneGraphDiTBlock(nn.Module):
-    """
-    Graph-aware DiT Block:
-
-        1) 手部 token 的自注意力（GraphSelfAttention，带 graph_attn_bias）
-        2) 对 scene tokens 的跨注意力（CrossAttention）
-        3) FeedForward（来自 diffusers.attention.FeedForward）
-        4) 所有子模块都是 pre-LN；自注意力用 AdaLayerNormShift(timestep embedding)
-
-    Args:
-        dim:               hand token 维度 D（也是 scene token 维度）
-        num_attention_heads: 注意力头数
-        cross_attention_dim: scene token 维度（如果和 dim 不同）
-        dropout:           dropout 概率
-        activation_fn:     FeedForward 激活函数
-        norm_eps:          LayerNorm eps
-        ff_inner_dim:      FFN 隐层维度（默认 dim * 4）
-        ff_bias:           FFN 是否带 bias
-        qk_norm:           self-attn 和 cross-attn 的 QK 是否做 LayerNorm
-        skip:              是否启用 long skip（目前一般设 False）
-    """
+    """Graph-aware DiT block with self-attn, cross-attn, and FFN sublayers."""
 
     def __init__(
         self,
@@ -368,13 +442,12 @@ class HandSceneGraphDiTBlock(nn.Module):
         norm_eps: float = 1e-6,
         ff_inner_dim: Optional[int] = None,
         ff_bias: bool = True,
-        qk_norm: bool = True,
+        qk_norm: bool = False,
         skip: bool = False,
     ):
         super().__init__()
         self.dim = dim
 
-        # 1. Self-Attn 部分：AdaLayerNormShift + GraphSelfAttention
         self.norm1 = AdaLayerNormShift(dim, elementwise_affine=True, eps=norm_eps)
         self.self_attn = GraphSelfAttention(
             dim=dim,
@@ -384,7 +457,6 @@ class HandSceneGraphDiTBlock(nn.Module):
             eps=norm_eps,
         )
 
-        # 2. Cross-Attn：标准 LayerNorm + CrossAttention
         self.norm2 = FP32LayerNorm(dim, eps=norm_eps, elementwise_affine=True)
         self.cross_attn = CrossAttention(
             dim=dim,
@@ -395,7 +467,6 @@ class HandSceneGraphDiTBlock(nn.Module):
             eps=norm_eps,
         )
 
-        # 3. FeedForward：LayerNorm + FeedForward
         self.norm3 = FP32LayerNorm(dim, eps=norm_eps, elementwise_affine=True)
         inner_dim = ff_inner_dim or dim * 4
         self.ff = FeedForward(
@@ -407,7 +478,6 @@ class HandSceneGraphDiTBlock(nn.Module):
             bias=ff_bias,
         )
 
-        # 4. 可选 long skip（类似 HunyuanDiT 中 mid-block 之后的 skip）
         if skip:
             self.skip_norm = FP32LayerNorm(2 * dim, eps=norm_eps, elementwise_affine=True)
             self.skip_linear = nn.Linear(2 * dim, dim)
@@ -418,65 +488,31 @@ class HandSceneGraphDiTBlock(nn.Module):
     def forward(
         self,
         hand_tokens: torch.Tensor,            # (B, N, D)
-        scene_tokens: Optional[torch.Tensor], # (B, K, D_scene)，可以为 None
-        temb: torch.Tensor,                   # (B, D) 时间/flow embedding，已映射到 D 维
-        graph_attn_bias: Optional[torch.Tensor] = None,  # (B,1,N,N) 或 (B,N,N)
-        skip: Optional[torch.Tensor] = None,  # (B,N,D)，long skip，用不到就传 None
+        scene_tokens: Optional[torch.Tensor], # (B, K, D_scene); may be None
+        temb: torch.Tensor,                   # (B, D) flow embedding already projected to D
+        graph_attn_bias: Optional[torch.Tensor] = None,  # (B,1,N,N) or (B,N,N)
+        skip: Optional[torch.Tensor] = None,  # (B,N,D) optional long skip
     ) -> torch.Tensor:
         """
         Returns:
             hand_tokens_out: (B, N, D)
         """
-        # 0. Long Skip （可选）
         if self.skip_linear is not None and skip is not None:
-            cat = torch.cat([hand_tokens, skip], dim=-1)     # (B,N,2D)
+            cat = torch.cat([hand_tokens, skip], dim=-1)
             cat = self.skip_norm(cat)
-            hand_tokens = self.skip_linear(cat)              # (B,N,D)
-
-        # 1. Self-Attn on hand tokens
-        h = self.norm1(hand_tokens, temb)                    # (B,N,D)
-        h = self.self_attn(h, attn_bias=graph_attn_bias)     # (B,N,D)
+            hand_tokens = self.skip_linear(cat)
+        h = self.norm1(hand_tokens, temb)
+        h = self.self_attn(h, attn_bias=graph_attn_bias)
         hand_tokens = hand_tokens + h
-
-        # 2. Cross-Attn: hand <- scene
         if scene_tokens is not None:
-            h = self.cross_attn(self.norm2(hand_tokens), scene_tokens)  # (B,N,D)
+            h = self.cross_attn(self.norm2(hand_tokens), scene_tokens)
             hand_tokens = hand_tokens + h
-
-        # 3. FFN
-        h = self.ff(self.norm3(hand_tokens))                 # (B,N,D)
+        h = self.ff(self.norm3(hand_tokens))
         hand_tokens = hand_tokens + h
-
         return hand_tokens
 
-
-# ------------------------------
-# 多层堆叠的 Graph DiT
-# ------------------------------
 class HandSceneGraphDiT(nn.Module):
-    """
-    多层堆叠的 Graph-aware DiT。
-
-    典型使用场景：
-      - 输入 hand_tokens: (B, N, D)，来自 HandPointTokenEncoder（局部关键点）
-      - 输入 scene_tokens: (B, K, D_s)，来自点云 backbone（PCL -> scene tokens）
-      - 输入 temb: (B, D)，flow matching / diffusion timestep embedding，已映射为 D 维
-      - 输入 xyz: (B, N, 3)，当前关键点坐标（和 rest_lengths 对应），用来构造 graph_attn_bias
-
-    forward:
-        hand_out = model(hand_tokens, scene_tokens, temb, xyz)
-
-    Args:
-        dim:               手部 token 维度 D（通常等于 hand encoder out_dim）
-        depth:             DiT Block 层数
-        num_heads:         每层自/交叉注意力头数
-        cross_attention_dim: scene token 维度（不填默认 dim）
-        graph_bias:        GraphAttentionBias 模块（可选）；
-                           如果为 None，则不使用图结构 bias（普通 DiT）
-        dropout:           dropout 概率
-        activation_fn:     FeedForward 激活
-        qk_norm:           是否对 Q/K 归一化
-    """
+    """Stacked DiT blocks that fuse hand tokens, scene context, and graph bias."""
 
     def __init__(
         self,
@@ -488,6 +524,9 @@ class HandSceneGraphDiT(nn.Module):
         dropout: float = 0.0,
         activation_fn: str = "geglu",
         qk_norm: bool = True,
+        ff_inner_dim: Optional[int] = None,
+        ff_bias: bool = True,
+        skip: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -502,10 +541,10 @@ class HandSceneGraphDiT(nn.Module):
                     cross_attention_dim=cross_attention_dim,
                     dropout=dropout,
                     activation_fn=activation_fn,
-                    ff_inner_dim=int(dim * 4),
-                    ff_bias=True,
+                    ff_inner_dim=ff_inner_dim,
+                    ff_bias=ff_bias,
                     qk_norm=qk_norm,
-                    skip=False,  # 目前不做 long skip，有需要可以在上层构造
+                    skip=skip,
                 )
                 for _ in range(depth)
             ]
@@ -514,22 +553,17 @@ class HandSceneGraphDiT(nn.Module):
     def forward(
         self,
         hand_tokens: torch.Tensor,             # (B, N, D)
-        scene_tokens: Optional[torch.Tensor],  # (B, K, D_s) 或 None
+        scene_tokens: Optional[torch.Tensor],  # (B, K, D_s) or None
         temb: torch.Tensor,                    # (B, D)
-        xyz: Optional[torch.Tensor] = None,    # (B, N, 3) 用于 graph bias；如果 None 则不使用 graph bias
+        xyz: Optional[torch.Tensor] = None,    # (B, N, 3) for graph bias; skip if None
     ) -> torch.Tensor:
-        """
-        Returns:
-            hand_tokens_out: (B, N, D)  # 经过多个 DiTBlock 更新后的手部 token，可接 Flow head 输出速度等
-        """
+        """Return updated hand tokens after passing through all DiT blocks."""
         B, N, D = hand_tokens.shape
         assert temb.shape == (B, D), f"temb should be (B,{D}), got {temb.shape}"
-
         if self.graph_bias is not None and xyz is not None:
-            attn_bias = self.graph_bias(xyz)   # (B,1,N,N)
+            attn_bias = self.graph_bias(xyz)
         else:
             attn_bias = None
-
         h = hand_tokens
         for block in self.blocks:
             h = block(
@@ -539,13 +573,91 @@ class HandSceneGraphDiT(nn.Module):
                 graph_attn_bias=attn_bias,
                 skip=None,
             )
-
         return h
 
+# Factory function
+def build_dit(
+    cfg: Any,
+    graph_consts: Dict[str, torch.Tensor],
+    dim: int,
+) -> HandSceneGraphDiT:
+    """Build a HandSceneGraphDiT from a Hydra/OmegaConf config.
 
-# ------------------------------
-# 简单 self-test
-# ------------------------------
+    Args:
+        cfg:          Config node under the `dit` group.
+        graph_consts: Graph constants from the datamodule.
+        dim:          Token dimension D (should match hand encoder out_dim).
+    """
+    finger_ids = graph_consts["finger_ids"].long()
+    edge_index = graph_consts["edge_index"].long()
+    edge_type = graph_consts["edge_type"].long()
+    edge_rest_lengths = graph_consts["edge_rest_lengths"].float()
+
+    num_nodes = int(finger_ids.shape[0])
+    num_edge_types = int(edge_type.max().item()) + 1
+
+    # Utility to read optional fields from DictConfig / dict
+    def _get(key: str, default):
+        if hasattr(cfg, key):
+            return getattr(cfg, key)
+        if isinstance(cfg, dict) and key in cfg:
+            return cfg[key]
+        return default
+
+    d_struct = _get("d_struct", 8)
+    depth = _get("depth", 6)
+    num_heads = _get("num_heads", 8)
+    cross_attention_dim = _get("cross_attention_dim", None)
+    ff_inner_dim = _get("ff_inner_dim", None)
+    ff_bias = _get("ff_bias", True)
+    skip = _get("skip", False)
+    dropout = _get("dropout", 0.0)
+    activation_fn = _get("activation_fn", "geglu")
+    qk_norm = _get("qk_norm", True)
+
+    def _subcfg_value(node: Any, key: str, default):
+        if node is None:
+            return default
+        if hasattr(node, key):
+            return getattr(node, key)
+        if isinstance(node, dict) and key in node:
+            return node[key]
+        return default
+
+    graph_bias_cfg = _get("graph_bias", None)
+    graph_bias_enabled = _subcfg_value(graph_bias_cfg, "enabled", True)
+    d_struct = _subcfg_value(graph_bias_cfg, "d_struct", d_struct)
+
+    graph_bias_module: Optional[GraphAttentionBias]
+    if graph_bias_enabled:
+        graph_bias_module = GraphAttentionBias(
+            num_nodes=num_nodes,
+            num_edge_types=num_edge_types,
+            edge_index=edge_index,
+            edge_type=edge_type,
+            edge_rest_lengths=edge_rest_lengths,
+            d_struct=d_struct,
+        )
+    else:
+        graph_bias_module = None
+
+    if cross_attention_dim is None:
+        cross_attention_dim = dim
+
+    return HandSceneGraphDiT(
+        dim=dim,
+        depth=depth,
+        num_heads=num_heads,
+        cross_attention_dim=cross_attention_dim,
+        graph_bias=graph_bias_module,
+        dropout=dropout,
+        activation_fn=activation_fn,
+        qk_norm=qk_norm,
+        ff_inner_dim=ff_inner_dim,
+        ff_bias=ff_bias,
+        skip=skip,
+    )
+
 if __name__ == "__main__":
     torch.manual_seed(0)
 
@@ -557,7 +669,6 @@ if __name__ == "__main__":
     temb = torch.randn(B, D)
     xyz = torch.randn(B, N, 3)
 
-    # 假设图结构有 E 条边、3 种 edge_type
     E = 40
     edge_index = torch.randint(0, N, (2, E))
     edge_type = torch.randint(0, 3, (E,))

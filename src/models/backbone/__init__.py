@@ -1,7 +1,7 @@
 from .point_transformer_backbone import PointTransformerBackbone
 from .pointnet2 import Pointnet2Backbone
 from .pointnet2_3sa import Pointnet2Backbone_3sa
-from .pointnext_backbone import PointNextBackbone
+# from .pointnext_backbone import PointNextBackbone
 from .point_patch_embedding import PointPatchEmbeddingBackbone
 from .ptv3_backbone import PTV3Backbone
 from .ptv3_sparse_encoder import PTv3SparseEncoder
@@ -16,8 +16,8 @@ def build_backbone(backbone_cfg):
         return Pointnet2Backbone(backbone_cfg)
     elif backbone_cfg.name.lower() == "pointnet2_3sa":
         return Pointnet2Backbone_3sa(backbone_cfg)
-    elif backbone_cfg.name.lower() == "pointnext":
-        return PointNextBackbone(backbone_cfg)
+    # elif backbone_cfg.name.lower() == "pointnext":
+        # return PointNextBackbone(backbone_cfg)
     elif backbone_cfg.name.lower() in ("ptv3", "ptv3_light", "ptv3_no_flash"):
         return PTV3Backbone(backbone_cfg)
     elif backbone_cfg.name.lower() in ("ptv3_sparse", "ptv3_tokens"):

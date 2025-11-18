@@ -13,6 +13,7 @@ accumulate_grad_batches: 1
 # Validation settings
 check_val_every_n_epoch: 1
 val_check_interval: null  # 如果想在epoch内验证，设置为0.5等
+num_sanity_val_steps: 2
 
 # Logging
 log_every_n_steps: 15
@@ -29,9 +30,21 @@ enable_model_summary: true
 # Debugging
 fast_dev_run: false  # 快速测试运行
 overfit_batches: 0   # 过拟合测试
+# limit_train_batches: 1.0
+# limit_val_batches: 1.0
+# limit_test_batches: 1.0
 
 # Deterministic training
 deterministic: false  # 设为true会更慢但可复现
+# benchmark: true  # 输入尺寸固定时开启可提升性能
+# move_metrics_to_cpu: false  # 大模型训练时可设为true 
 
-# Other settings
-num_sanity_val_steps: 0
+# # 异常检测 (开发阶段使用)                                                                        
+# detect_anomaly: false                                                                            
+# track_grad_norm: -1  # 设为2可跟踪梯度L2范数，-1表示关闭                                         
+                                                                                                  
+# # 数据加载器重载                                                                                 
+# reload_dataloaders_every_n_epochs: 0                                                             
+                                                                                                  
+# # 其他实用配置                                                                                   
+# use_distributed_sampler: true  # 多GPU时自动使用分布式采样器

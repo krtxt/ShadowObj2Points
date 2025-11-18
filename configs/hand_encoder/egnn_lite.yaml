@@ -1,0 +1,24 @@
+# Hand encoder configuration: EGNN-lite graph message passing encoder
+# This module encodes hand keypoints into per-point tokens (B, N, D) using
+# edge-conditioned message passing with geometric biases.
+
+name: egnn_lite
+
+# Internal node feature dimension for the EGNN encoder (before projecting to out_dim)
+d_model: 128
+
+# Number of EGNN message-passing layers
+n_layers: 3
+
+# Edge feature dimension (distance + structural encodings)
+d_edge: 64
+
+# Dimension of structural/graph features (edge types, rest lengths)
+d_struct: 8
+
+# Number of Fourier feature frequencies for relative position encoding
+num_frequencies: 10
+
+# Dropout rate applied in the MLPs
+dropout: 0.1
+

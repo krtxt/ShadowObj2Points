@@ -1,0 +1,34 @@
+Metadata-Version: 2.1
+Name: shadowobj2points
+Version: 0.1.0
+Summary: ShadowObj2Points - Shadow Hand Object Point Estimation
+Author-email: Your Name <your.email@example.com>
+License: MIT
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=1.9.0
+Requires-Dist: pytorch3d
+Requires-Dist: pytorch-kinematics
+Requires-Dist: numpy
+Requires-Dist: trimesh
+Requires-Dist: mujoco
+Requires-Dist: transforms3d
+Requires-Dist: torchsdf
+Requires-Dist: plotly
+Requires-Dist: urdf-parser-py
+Requires-Dist: rich>=13.0.0
+Requires-Dist: h5py
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+Requires-Dist: black; extra == "dev"
+Requires-Dist: flake8; extra == "dev"
+Requires-Dist: mypy; extra == "dev"
+Requires-Dist: pyyaml; extra == "dev"

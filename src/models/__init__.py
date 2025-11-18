@@ -1,5 +1,6 @@
 """Models module"""
-from .hand_pose_reconstruction import HandPoseReconstruction
-from .hand_points_reconstruction import HandPointsReconstruction
+# Import actual model classes if needed
+# For now, we're just importing the main model file
+from .flow_matching_hand_dit import *
 
-__all__ = ['HandPoseReconstruction', 'HandPointsReconstruction']
+__all__ = []  # Update with actual exported classes when defined

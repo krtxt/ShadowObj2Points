@@ -6,6 +6,8 @@ mode: dexgraspnet
 batch_size: ${batch_size}
 num_workers: 8
 pin_memory: true
+prefetch_factor: 2
+persistent_workers: true
 rot_type: ${rot_type}           # 'quat' | 'r6d' | 'euler' | 'axis'
 trans_anchor: ${hand_anchor}    # 'base' | 'palm_center' | 'mjcf'
 hand_scale: 1.0
@@ -17,9 +19,9 @@ use_local_pose_only: true
 norm_xyz_stats_path: ${paths.data_dir}/DexGraspNet/norm_xyz_stats_use_local_anchor-${hand_anchor}
 
 # Optional phases for splits
-train_phase: all
-val_phase: all
-test_phase: all
+train_phase: train
+val_phase: test
+test_phase: test
 
 # Graph construction options (follow the notebook defaults)
 use_palm_star: false

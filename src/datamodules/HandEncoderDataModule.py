@@ -474,48 +474,33 @@ class _HandEncoderPreparedDataset(Dataset):
         return world
 
     @torch.no_grad()
-    def _align_scene_pc_to_local(
+    def _scene_pc_world_to_local(
         self,
         scene_pc: torch.Tensor,
-        xyz_world: torch.Tensor,
-        xyz_local: torch.Tensor,
+        R_world: torch.Tensor,
+        t_world: torch.Tensor,
+        t_local: torch.Tensor,
     ) -> torch.Tensor:
         if scene_pc.ndim != 2 or scene_pc.shape[1] < 3:
             return scene_pc
-        if xyz_world.ndim != 2 or xyz_local.ndim != 2:
+        if R_world.ndim != 2 or R_world.shape != (3, 3):
             return scene_pc
-        if xyz_world.shape[0] != xyz_local.shape[0] or xyz_world.shape[0] < 3:
+        if t_world.ndim != 1 or t_world.shape[0] != 3:
             return scene_pc
-        xyz_world_t = xyz_world.to(dtype=torch.float32)
-        xyz_local_t = xyz_local.to(dtype=torch.float32)
-        valid_world = torch.isfinite(xyz_world_t).all(dim=-1) & (xyz_world_t.abs().sum(dim=-1) > 1e-6)
-        valid_local = torch.isfinite(xyz_local_t).all(dim=-1) & (xyz_local_t.abs().sum(dim=-1) > 1e-6)
-        mask = valid_world & valid_local
-        if mask.sum() < 3:
+        if t_local.ndim != 1 or t_local.shape[0] != 3:
             return scene_pc
-        x = xyz_world_t[mask]
-        y = xyz_local_t[mask]
-        x_mean = x.mean(dim=0, keepdim=True)
-        y_mean = y.mean(dim=0, keepdim=True)
-        x_centered = x - x_mean
-        y_centered = y - y_mean
-        h = x_centered.transpose(0, 1) @ y_centered
-        try:
-            u, s, v_t = torch.linalg.svd(h)
-        except RuntimeError:
-            return scene_pc
-        r = v_t.transpose(0, 1) @ u.transpose(0, 1)
-        if torch.det(r) < 0:
-            v_t[-1, :] *= -1.0
-            r = v_t.transpose(0, 1) @ u.transpose(0, 1)
-        t = (y_mean - x_mean @ r).view(1, 3)
         sp = scene_pc.to(dtype=torch.float32)
-        sp_centered = sp[:, :3]
-        aligned = sp_centered @ r + t
+        pts = sp[:, :3]
+        t_w = t_world.view(1, 3).to(dtype=torch.float32)
+        t_l = t_local.view(1, 3).to(dtype=torch.float32)
+        R = R_world.to(dtype=torch.float32)
+        # World (object-centric) -> local anchor frame used by _build_xyz_from_pose_local
+        # x_local = (x_world - t_world) @ R_world + t_local
+        local = (pts - t_w) @ R + t_l
         if scene_pc.shape[1] > 3:
             tail = scene_pc[:, 3:].to(dtype=scene_pc.dtype)
-            return torch.cat([aligned.to(dtype=scene_pc.dtype), tail], dim=1)
-        return aligned.to(dtype=scene_pc.dtype)
+            return torch.cat([local.to(dtype=scene_pc.dtype), tail], dim=1)
+        return local.to(dtype=scene_pc.dtype)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.base[idx]
@@ -545,15 +530,23 @@ class _HandEncoderPreparedDataset(Dataset):
 
         if self.use_local_pose_only:
             q = hand_pose_t.unsqueeze(0).to(self.hand_model.device)
+            # First compute world-frame keypoints to obtain the hand's global SE(3)
+            _ = self._build_xyz_from_pose(q).to(torch.float32)
+            R_world = getattr(self.hand_model, "global_rotation", None)
+            t_world = getattr(self.hand_model, "global_translation", None)
+            # Then build local xyz with rigid pose reset (this call overwrites global_translation to t_local)
             xyz = self._build_xyz_from_pose_local(q).to(torch.float32)
-            if cached_xyz is not None and cached_se3 is not None:
-                xyz_world = self._xyz_from_cache(cached_xyz, cached_se3).to(torch.float32)
-            elif cached_xyz is not None:
-                xyz_world = (cached_xyz if isinstance(cached_xyz, torch.Tensor) else torch.tensor(cached_xyz, dtype=torch.float32)).to(torch.float32)
-            else:
-                xyz_world = self._build_xyz_from_pose(q).to(torch.float32)
-            if scene_pc.numel() > 0 and xyz_world is not None:
-                scene_pc = self._align_scene_pc_to_local(scene_pc, xyz_world, xyz)
+            t_local = getattr(self.hand_model, "global_translation", None)
+            if (
+                scene_pc.numel() > 0
+                and isinstance(R_world, torch.Tensor)
+                and isinstance(t_world, torch.Tensor)
+                and isinstance(t_local, torch.Tensor)
+                and R_world.shape[0] > 0
+                and t_world.shape[0] > 0
+                and t_local.shape[0] > 0
+            ):
+                scene_pc = self._scene_pc_world_to_local(scene_pc, R_world[0], t_world[0], t_local[0])
         else:
             xyz: Optional[torch.Tensor] = None
             if cached_xyz is not None and cached_se3 is not None:
@@ -669,6 +662,7 @@ class HandEncoderDataModule(pl.LightningDataModule if pl is not None else object
         connect_forearm: Optional[bool] = None,
         add_middle_distal: Optional[bool] = None,
         dataset_kwargs: Optional[Dict[str, Any]] = None,
+        use_local_pose_only: Optional[bool] = None,
         # Optional split phases
         train_phase: Optional[str] = None,
         val_phase: Optional[str] = None,
@@ -687,10 +681,29 @@ class HandEncoderDataModule(pl.LightningDataModule if pl is not None else object
         super().__init__()
 
         # Helper to prioritize direct kwargs over DictConfig
+        params = {
+            'name': name,
+            'mode': mode,
+            'batch_size': batch_size,
+            'num_workers': num_workers,
+            'pin_memory': pin_memory,
+            'rot_type': rot_type,
+            'trans_anchor': trans_anchor,
+            'hand_scale': hand_scale,
+            'urdf_assets_meta_path': urdf_assets_meta_path,
+            'use_palm_star': use_palm_star,
+            'connect_forearm': connect_forearm,
+            'add_middle_distal': add_middle_distal,
+            'dataset_kwargs': dataset_kwargs,
+            'use_local_pose_only': use_local_pose_only,
+            'train_phase': train_phase,
+            'val_phase': val_phase,
+            'test_phase': test_phase,
+        }
+
         def _get(key: str, default: Any = None):
-            if key in locals():
-                # Access the closure's locals via nonlocal mapping
-                return locals()[key]
+            if key in params and params[key] is not None:
+                return params[key]
             return getattr(data_cfg, key, default) if data_cfg is not None else default
 
         # Basic settings

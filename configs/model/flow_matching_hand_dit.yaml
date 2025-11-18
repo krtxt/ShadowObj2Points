@@ -4,48 +4,37 @@
 # via HandEncoderDataModule.get_graph_constants().
 
 _target_: src.models.flow_matching_hand_dit.HandFlowMatchingDiT
-_partial_: true  # allow trainer to inject graph_consts and (optionally) backbone_cfg at runtime
+
+# Note: graph_consts will be injected at runtime by train.py
 
 # -----------------------------------------------------------------------------
 # 1. Core architecture hyperparameters
 # -----------------------------------------------------------------------------
-# d_model: token/channel dimension used throughout the hand encoder, scene backbone output,
-#          and DiT blocks. Must match the backbone's out_dim.
+# d_model: token/channel dimension shared across sub-modules.
+#          Must match the backbone out_dim and the hand encoder output dim.
 d_model: 512
 
-# DiT depth: number of stacked HandSceneGraphDiT blocks
-#   - 4: 轻量级，适合快速实验
-#   - 6: 默认推荐，表达能力与计算量平衡
-#   - 8+: 更强但更耗时
-dit_depth: 6
-
-# Number of attention heads in each DiT block
-#   - 要求 d_model 能被 dit_heads 整除
-dit_heads: 8
+# -----------------------------------------------------------------------------
+# 2. Sub-module configuration (hand encoder, backbone, DiT)
+# -----------------------------------------------------------------------------
+# These are configured via separate Hydra config groups:
+#   - backbone: configs/backbone/*.yaml (e.g., ptv3_sparse_perceiver)
+#   - hand_encoder: configs/hand_encoder/*.yaml (e.g., transformer_bias, egnn_lite)
+#   - dit: configs/dit/*.yaml (e.g., graph_dit_default)
+#
+# train.py wires these groups via dedicated builder functions before instantiating
+# HandFlowMatchingDiT:
+#   backbone = build_backbone(cfg.backbone)
+#   hand_encoder = build_hand_encoder(cfg.hand_encoder, graph_consts, out_dim=d_model)
+#   dit = build_dit(cfg.dit, graph_consts, dim=d_model)
+# so each component can be swapped via the defaults list without touching the model code.
 
 # -----------------------------------------------------------------------------
-# 2. Hand encoder configuration
+# 3. Training / loss behaviour
 # -----------------------------------------------------------------------------
-# hand_encoder_type: 选择手部编码器结构
-#   - "transformer": HandPointTokenEncoderTransformerBias（推荐）
-#   - "egnn":        HandPointTokenEncoderEGNNLite
-hand_encoder_type: transformer
-
-# Number of graph encoder layers in the hand encoder
-hand_encoder_layers: 3
-
-# Number of Fourier feature frequencies used to encode relative positions
-num_frequencies: 10
-
-# -----------------------------------------------------------------------------
-# 3. Scene backbone (object point cloud encoder)
-# -----------------------------------------------------------------------------
-# backbone_cfg: 点云编码 backbone 的配置，通常来自 `backbone` 配置组。
-# 典型用法示例（在命令行或实验配置中）：
-#   backbone: ptv3_sparse_perceiver
-# 然后 trainer 侧可以执行：
-#   model = instantiate(cfg.model, graph_consts=dm.get_graph_constants(), backbone_cfg=cfg.backbone)
-backbone_cfg: ${backbone}
+# FlowMatchingLoss is defined in src/models/components/losses.py and receives
+# edge_index + lambda_tangent. That module is created inside
+# HandFlowMatchingDiT, so only the scalar weight needs to be configured here.
 
 # -----------------------------------------------------------------------------
 # 4. Flow Matching loss & regularization
@@ -80,6 +69,11 @@ scheduler_T_max: 100
 #   - 60+: 更细粒度积分，推理更慢
 sample_num_steps: 40
 
+# sample_solver: 采样时使用的数值积分器
+#   - "euler": 显式 Euler（默认）
+#   - "heun": 二阶 Heun / RK2（更精确，每步多一次网络前向）
+sample_solver: euler
+
 # proj_num_iters: 每个采样时间步中 PBD 边长投影的迭代次数
 #   - 0: 不做显式投影，只依赖网络和切向损失
 #   - 1–3: 通常足够（默认 2）
@@ -87,4 +81,3 @@ proj_num_iters: 2
 
 # proj_max_corr: 每次投影的最大相对修正幅度（防止数值不稳定）
 proj_max_corr: 0.2
-

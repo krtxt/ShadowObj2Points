@@ -1,0 +1,27 @@
+# Hand encoder configuration: Transformer with graph-aware attention bias
+# This module encodes hand keypoints into per-point tokens (B, N, D).
+
+name: transformer_bias
+
+# Internal model dimension for the hand encoder (before projecting to out_dim)
+# Typically you can keep this at d_model / 4 when model.d_model=512.
+d_model: 128
+
+# Number of graph-aware Transformer layers
+n_layers: 3
+
+# Number of attention heads per layer
+n_heads: 4
+
+# Dimension of geometric/structural features used for attention bias
+d_struct: 8
+
+# Number of Fourier feature frequencies for relative position encoding
+num_frequencies: 10
+
+# Dropout rate applied in MLP and attention blocks
+dropout: 0.1
+
+# FFN expansion ratio inside Transformer blocks (hidden = ffn_ratio * d_model)
+ffn_ratio: 2
+

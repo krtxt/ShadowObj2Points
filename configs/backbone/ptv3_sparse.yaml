@@ -1,7 +1,7 @@
 name: ptv3_sparse
 use_flash_attention: true  # true | false
 
-grid_size: 0.02
+grid_size: 0.003
 stride: [2, 2, 2, 2]
 target_num_tokens: 128
 token_strategy: multiscale  # last_layer | fps | grid | learned | multiscale

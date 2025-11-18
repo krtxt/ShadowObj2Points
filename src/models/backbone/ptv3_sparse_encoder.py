@@ -44,11 +44,11 @@ class PTv3SparseEncoder(nn.Module):
         self.target_num_tokens = target_num_tokens or getattr(cfg, 'target_num_tokens', 128)
         
         # Token 选择策略
-        valid_strategies = ['last_layer', 'fps', 'grid', 'learned', 'multiscale']
+        valid_strategies = ['last_layer', 'fps', 'grid', 'learned', 'multiscale', 'perceiver']
         self.token_strategy = token_strategy or getattr(cfg, 'token_strategy', 'last_layer')  # 默认使用last_layer策略
         if self.token_strategy not in valid_strategies:
             raise ValueError(f"token_strategy must be one of {valid_strategies}, got {self.token_strategy}")
-        
+
         # 输出维度
         self.output_dim = getattr(cfg, 'out_dim', 256)
         
@@ -148,15 +148,15 @@ class PTv3SparseEncoder(nn.Module):
         else:
             self.out_proj = None
         
-        # 学习式 Tokenizer（方案④）
-        if self.token_strategy == 'learned':
+        # 学习式 Tokenizer（方案④ / Perceiver 风格）
+        if self.token_strategy in ('learned', 'perceiver'):
             self.learned_tokenizer = self._build_learned_tokenizer()
             self.logger.info(
-                f"Built learned tokenizer with {self.target_num_tokens} query tokens"
+                f"Built learned/perceiver tokenizer with {self.target_num_tokens} query tokens"
             )
         else:
             self.learned_tokenizer = None
-        
+
         # 多尺度投影层（方案⑤）
         if self.token_strategy == 'multiscale':
             self.stage_projections = nn.ModuleDict()
@@ -269,7 +269,7 @@ class PTv3SparseEncoder(nn.Module):
             xyz_out, feat_out = self._strategy_fps(xyz_sparse, feat_sparse)
         elif self.token_strategy == 'grid':
             xyz_out, feat_out = self._strategy_grid(xyz_sparse, feat_sparse, coords)
-        elif self.token_strategy == 'learned':
+        elif self.token_strategy in ('learned', 'perceiver'):
             xyz_out, feat_out = self._strategy_learned(xyz_sparse, feat_sparse)
         else:
             raise ValueError(f"Unknown token strategy: {self.token_strategy}")

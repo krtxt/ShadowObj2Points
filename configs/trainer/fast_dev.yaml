@@ -1,0 +1,43 @@
+# Fast Development Configuration - 极速开发验证模式
+# 用于快速验证代码正确性和数据管道，训练效果不重要
+
+# 基础配置 - 最快速设置
+accelerator: gpu
+devices: 1
+precision: 32  # 保持32位精度确保数值稳定性检查
+max_epochs: 1  # 只跑1个epoch
+
+# 极速模式 - 最少数据量验证
+fast_dev_run: true          # Lightning快速模式，只跑1个batch
+limit_train_batches: 1      # 明确限制训练批次
+limit_val_batches: 1        # 明确限制验证批次
+limit_test_batches: 1       # 测试也只用1个batch
+
+# 调试友好设置
+num_sanity_val_steps: 2     # 训练前跑2个验证step，确保数据管道正常
+overfit_batches: 0         # 关闭过拟合测试（fast_dev_run已包含）
+
+# 关闭所有可能拖慢速度的功能
+enable_checkpointing: false # 不需要保存检查点
+enable_progress_bar: true   # 保留进度条，方便观察
+enable_model_summary: true  # 保留模型摘要，验证模型结构
+
+# 日志设置
+log_every_n_steps: 1        # 每一步都记录，便于调试
+
+# 梯度设置
+gradient_clip_val: null     # 关闭梯度裁剪，简化训练流程
+gradient_clip_algorithm: norm
+accumulate_grad_batches: 1  # 关闭梯度累积
+
+# 验证设置
+check_val_every_n_epoch: 1  # 每个epoch都验证
+val_check_interval: null
+
+# 调试辅助
+detect_anomaly: true        # 开启异常检测，捕获梯度异常等
+deterministic: false       # 关闭确定性，提升速度
+
+# 其他优化
+reload_dataloaders_every_n_epochs: 0  # 不重新加载数据加载器
+use_distributed_sampler: false       # 单GPU，不需要分布式采样器

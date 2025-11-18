@@ -3,9 +3,12 @@
 
 # defaults list
 defaults:
-  - datamodule: handencoder_dm_dex
-  - model: 
-  - loss: total_loss
+  - datamodule: handencoder_dm_dex_debug
+  - model: flow_matching_hand_dit
+  - backbone: ptv3_sparse
+  - hand_encoder: transformer_bias
+  - dit: graph_dit_default
+  - loss: flow_matching
   - optimizer: adamw
   - trainer: default
   - logger: null   # tensorboard
@@ -14,11 +17,11 @@ defaults:
   - _self_
 
 # Experiment settings
-experiment_name: 
+experiment_name: test
 seed: 42
 
 # Common hyperparameters (可被其他配置引用)
-batch_size: 5120
+batch_size: 256
 rot_type: r6d  # 'quat' | 'r6d' | 'euler' | 'axis'
 hand_anchor: palm_center  # 'base' | 'palm_center' | 'mjcf'
 

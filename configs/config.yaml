@@ -13,8 +13,8 @@ defaults:
   - trainer: default
   - logger: tensorboard   # tensorboard
   - callbacks: default
-  - experiments: null # Changed from experiment to experiments to match folder structure
   - _self_
+  - experiments: null # Changed from experiment to experiments to match folder structure
 
 # Experiment settings
 experiment_name: exp_grasp16_1120

@@ -25,6 +25,7 @@ from lightning.pytorch.utilities import rank_zero_only
 from omegaconf import DictConfig, OmegaConf
 from rich.logging import RichHandler
 from rich.traceback import install as install_rich_traceback
+from rich.console import Console
 
 from callbacks.grad_norm_logger import GradNormLogger
 from datamodules.HandEncoderDataModule import HandEncoderDataModule
@@ -238,6 +239,7 @@ def run_auto_tuner(trainer: Trainer, model: L.LightningModule, datamodule: L.Lig
 def main(cfg: DictConfig) -> None:
     """Train the Flow Matching Hand DiT model using Hydra configuration."""
     setup_rich_logging()
+    console = Console()
     log = logging.getLogger("train_flow_matching")
     validate_core_config(cfg)
     
@@ -249,12 +251,12 @@ def main(cfg: DictConfig) -> None:
     ensure_output_dir(cfg, log)
     
     # Initialize DataModule
-    log.info(f"{'=' * 80}\n[bold italic #FFD700]Initializing DataModule...[/]\n{'=' * 80}")
+    console.rule("[bold #33FF00]🚀 Initializing DataModule[/]")
     datamodule = instantiate_datamodule(cfg, log)
     graph_consts = extract_graph_constants(datamodule, log)
     
     # Initialize Model
-    log.info(f"{'=' * 80}\n[bold italic #FFD700]Initializing Flow Matching Hand DiT model...[/]\n{'=' * 80}")
+    console.rule("[bold #FF33CC]🔮 Initializing Flow Matching Hand DiT model[/]")
     if not hasattr(cfg.get("model", {}), "_target_"):
         raise ValueError("cfg.model must specify a Hydra '_target_'")
 
@@ -278,7 +280,7 @@ def main(cfg: DictConfig) -> None:
     log.info(f"Trainable parameters: [bold #33AAFF]{trainable_params:,}[/]")
     
     # Callbacks & Logger
-    log.info(f"{'=' * 80}\n[bold italic #FFD700]Setting up Callbacks & Logger...[/]\n{'=' * 80}")
+    console.rule("[bold #9900CC]🛠️  Setting up Callbacks & Logger[/]")
     callbacks = setup_callbacks(cfg)
     for cb in callbacks:
         log.info(f"  - [bold]{cb.__class__.__name__}[/]")
@@ -290,7 +292,7 @@ def main(cfg: DictConfig) -> None:
         log.warning("No logger configured")
     
     # Trainer
-    log.info(f"{'=' * 80}\n[bold italic #FFD700]Initializing Trainer...[/]\n{'=' * 80}")
+    console.rule("[bold #3300FF]🦄  Initializing Trainer[/]")
     trainer_kwargs = OmegaConf.to_container(cfg.trainer, resolve=True)
     track_grad_norm = trainer_kwargs.pop("track_grad_norm", -1)
 
@@ -325,11 +327,11 @@ def main(cfg: DictConfig) -> None:
     if ckpt_path is None:
         ckpt_path = find_last_checkpoint(cfg, log)
 
-    log.info(f"{'=' * 80}\n[bold italic #FF33AA]Starting Training...[/]\n{'=' * 80}")
+    console.rule("[bold #CC9900]✨ Starting Training[/]")
     
     trainer.fit(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
     
-    log.info(f"{'=' * 80}\n[bold italic #33FFAA]Training Completed![/]\n{'=' * 80}")
+    console.rule("[bold rainbow]🎉 Training Completed![/]")
     log_best_checkpoint(trainer, log)
     maybe_save_final_config(cfg, log)
 

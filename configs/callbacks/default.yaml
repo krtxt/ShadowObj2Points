@@ -79,9 +79,13 @@ image_logger:
   log_key: "val/hand_samples"
 
 # Device Stats Monitor (GPU/CPU usage)
-# Set to null to disable
+# Set to null to disable. Use a lightweight version by default.
 device_stats_monitor:
-  _target_: lightning.pytorch.callbacks.DeviceStatsMonitor
+  _target_: callbacks.light_device_stats_monitor.LightDeviceStatsMonitor
+  log_every_n_train_batches: 50
+  log_every_n_val_batches: 50
+  log_every_n_test_batches: 50
+  prefix: "device"
 
 # Stochastic Weight Averaging
 # Set to null to disable. 

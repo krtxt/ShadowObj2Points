@@ -399,50 +399,84 @@ class SerializedAttention(PointModule):
         ):
             offset = point.offset
             bincount = offset2bincount(offset)
-            bincount_pad = (
-                torch.div(
-                    bincount + self.patch_size - 1,
-                    self.patch_size,
-                    rounding_mode="trunc",
-                )
-                * self.patch_size
-            )
-            # only pad point when num of points larger than patch_size
-            mask_pad = bincount > self.patch_size
-            bincount_pad = ~mask_pad * bincount + mask_pad * bincount_pad
+            K = self.patch_size
+            ceil_blocks = torch.div(bincount + K - 1, K, rounding_mode="trunc")
+            bincount_pad_full = ceil_blocks * K
+            mask_pad = bincount > K
+            bincount_pad = torch.where(mask_pad, bincount_pad_full, bincount)
             _offset = nn.functional.pad(offset, (1, 0))
             _offset_pad = nn.functional.pad(torch.cumsum(bincount_pad, dim=0), (1, 0))
-            pad = torch.arange(_offset_pad[-1], device=offset.device)
-            unpad = torch.arange(_offset[-1], device=offset.device)
-            cu_seqlens = []
-            for i in range(len(offset)):
-                unpad[_offset[i] : _offset[i + 1]] += _offset_pad[i] - _offset[i]
-                if bincount[i] != bincount_pad[i]:
-                    pad[
-                        _offset_pad[i + 1]
-                        - self.patch_size
-                        + (bincount[i] % self.patch_size) : _offset_pad[i + 1]
-                    ] = pad[
-                        _offset_pad[i + 1]
-                        - 2 * self.patch_size
-                        + (bincount[i] % self.patch_size) : _offset_pad[i + 1]
-                        - self.patch_size
-                    ]
-                pad[_offset_pad[i] : _offset_pad[i + 1]] -= _offset_pad[i] - _offset[i]
-                cu_seqlens.append(
-                    torch.arange(
-                        _offset_pad[i],
-                        _offset_pad[i + 1],
-                        step=self.patch_size,
-                        dtype=torch.int32,
-                        device=offset.device,
+            total_pad = _offset_pad[-1]
+            total_orig = _offset[-1]
+            pad = torch.arange(total_pad, device=offset.device)
+            unpad = torch.arange(total_orig, device=offset.device)
+            remainders = torch.remainder(bincount, K)
+            need_copy = mask_pad & (remainders != 0)
+            if bool(need_copy.any()):
+                idxs = torch.nonzero(need_copy).squeeze(1).tolist()
+                for i in idxs:
+                    r = int(remainders[i].item())
+                    if r > 0:
+                        dst_start = int(_offset_pad[i + 1].item()) - K + r
+                        src_start = int(_offset_pad[i + 1].item()) - 2 * K + r
+                        length = K - r
+                        pad[dst_start : dst_start + length] = pad[src_start : src_start + length]
+            ends_pad = _offset_pad[1:]
+            batch_idx_pad = torch.bucketize(pad, ends_pad)
+            shift = _offset_pad[:-1] - _offset[:-1]
+            pad = pad - shift[batch_idx_pad]
+            ends_orig = _offset[1:]
+            batch_idx_unpad = torch.bucketize(unpad, ends_orig)
+            unpad = unpad + shift[batch_idx_unpad]
+            num_patches = (bincount_pad + self.patch_size - 1) // self.patch_size
+            total_patches = num_patches.sum()
+            patch_batch_idx = torch.repeat_interleave(
+                torch.arange(len(num_patches), device=offset.device), num_patches
+            )
+            patch_starts_in_list = torch.cat(
+                [torch.zeros(1, dtype=num_patches.dtype, device=offset.device), torch.cumsum(num_patches, 0)[:-1]]
+            )
+            global_patch_idx = torch.arange(total_patches, device=offset.device)
+            local_patch_idx = global_patch_idx - patch_starts_in_list[patch_batch_idx]
+            cu_seqlens_vals = _offset_pad[patch_batch_idx] + local_patch_idx * self.patch_size
+            cu_seqlens = torch.cat([cu_seqlens_vals, _offset_pad[-1].unsqueeze(0)]).int()
+
+            ok = True
+            if pad.numel() > 0:
+                if pad.min() < 0 or pad.max() >= total_orig:
+                    ok = False
+            if cu_seqlens.numel() == 0 or cu_seqlens[-1].item() != int(total_pad.item() if hasattr(total_pad, 'item') else int(total_pad)):
+                ok = False
+            if not ok:
+                _offset = nn.functional.pad(offset, (1, 0))
+                _offset_pad = nn.functional.pad(torch.cumsum(bincount_pad, dim=0), (1, 0))
+                total_pad = _offset_pad[-1]
+                total_orig = _offset[-1]
+                pad = torch.arange(total_pad, device=offset.device)
+                unpad = torch.arange(total_orig, device=offset.device)
+                cu_list = []
+                for i in range(len(offset)):
+                    unpad[_offset[i] : _offset[i + 1]] += _offset_pad[i] - _offset[i]
+                    if bincount[i] != bincount_pad[i]:
+                        r = int((bincount[i] % K).item())
+                        if r != 0:
+                            dst_s = int(_offset_pad[i + 1].item()) - K + r
+                            src_s = int(_offset_pad[i + 1].item()) - 2 * K + r
+                            pad[dst_s : int(_offset_pad[i + 1].item())] = pad[src_s : src_s + (K - r)]
+                    pad[_offset_pad[i] : _offset_pad[i + 1]] -= _offset_pad[i] - _offset[i]
+                    cu_list.append(
+                        torch.arange(
+                            int(_offset_pad[i].item()),
+                            int(_offset_pad[i + 1].item()),
+                            step=K,
+                            dtype=torch.int32,
+                            device=offset.device,
+                        )
                     )
-                )
+                cu_seqlens = nn.functional.pad(torch.cat(cu_list), (0, 1), value=int(_offset_pad[-1].item()))
             point[pad_key] = pad
             point[unpad_key] = unpad
-            point[cu_seqlens_key] = nn.functional.pad(
-                torch.concat(cu_seqlens), (0, 1), value=_offset_pad[-1]
-            )
+            point[cu_seqlens_key] = cu_seqlens
         return point[pad_key], point[unpad_key], point[cu_seqlens_key]
 
     def forward(self, point):
@@ -456,6 +490,9 @@ class SerializedAttention(PointModule):
         C = self.channels
 
         pad, unpad, cu_seqlens = self.get_padding_and_inverse(point)
+        N_order = point.serialized_order[self.order_index].shape[0]
+        if pad.numel() > 0 and N_order > 0:
+            pad = pad.clamp(0, N_order - 1)
 
         order = point.serialized_order[self.order_index][pad]
         inverse = unpad[point.serialized_inverse[self.order_index]]
@@ -658,18 +695,14 @@ class SerializedPooling(PointModule):
         ), "Run point.serialization() point cloud before SerializedPooling"
 
         code = point.serialized_code >> pooling_depth * 3
-        code_, cluster, counts = torch.unique(
-            code[0],
-            sorted=True,
-            return_inverse=True,
-            return_counts=True,
-        )
-        # indices of point sorted by cluster, for torch_scatter.segment_csr
-        _, indices = torch.sort(cluster)
-        # index pointer for sorted point, for torch_scatter.segment_csr
+        vals, indices = torch.sort(code[0])
+        uniq, counts = torch.unique(vals, sorted=True, return_counts=True)
         idx_ptr = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
-        # head_indices of each cluster, for reduce attr e.g. code, batch
         head_indices = indices[idx_ptr[:-1]]
+        num_groups = counts.size(0)
+        group_ids_sorted = torch.arange(num_groups, device=counts.device, dtype=counts.dtype).repeat_interleave(counts)
+        cluster = torch.empty_like(group_ids_sorted)
+        cluster[indices] = group_ids_sorted
         # generate down code, order, inverse
         code = code[:, head_indices]
         order = torch.argsort(code)

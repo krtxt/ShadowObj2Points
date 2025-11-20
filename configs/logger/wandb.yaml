@@ -1,5 +1,5 @@
 # Weights & Biases Logger Configuration
-_target_: pytorch_lightning.loggers.WandbLogger
+_target_: lightning.pytorch.loggers.WandbLogger
 
 project: shadowpoint2pose
 name: ${experiment_name}

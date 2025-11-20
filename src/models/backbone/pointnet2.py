@@ -1,6 +1,15 @@
 import sys
+from pathlib import Path
 
-sys.path.append("./third_party/pointnet2/")
+_repo_root = Path(__file__).resolve().parents[3]
+_pn2_paths = [
+    _repo_root / "3rd_party" / "pointnet2",
+    # _repo_root / "third_party" / "pointnet2",
+]
+for _p in _pn2_paths:
+    _p_str = str(_p)
+    if _p.exists() and _p_str not in sys.path:
+        sys.path.append(_p_str)
 
 import unittest
 

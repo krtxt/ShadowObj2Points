@@ -1,4 +1,4 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.4
 Name: shadowobj2points
 Version: 0.1.0
 Summary: ShadowObj2Points - Shadow Hand Object Point Estimation
@@ -20,7 +20,6 @@ Requires-Dist: numpy
 Requires-Dist: trimesh
 Requires-Dist: mujoco
 Requires-Dist: transforms3d
-Requires-Dist: torchsdf
 Requires-Dist: plotly
 Requires-Dist: urdf-parser-py
 Requires-Dist: rich>=13.0.0

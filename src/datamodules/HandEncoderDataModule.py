@@ -9,10 +9,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-try:
-    import pytorch_lightning as pl
-except Exception:  # pragma: no cover
-    pl = None  # type: ignore
+import lightning.pytorch as L
 
 # Optional omegaconf support for DictConfig-based configuration
 try:  # pragma: no cover
@@ -644,7 +641,7 @@ def _collate_for_hand_encoder(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     return result
 
 
-class HandEncoderDataModule(pl.LightningDataModule if pl is not None else object):
+class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
     def __init__(
         self,
         name: Optional[str] = None,
@@ -1196,6 +1193,7 @@ class HandEncoderDataModule(pl.LightningDataModule if pl is not None else object
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             collate_fn=_collate_for_hand_encoder,
+            drop_last=True,
             persistent_workers=self.persistent_workers if self.num_workers > 0 else False,
         )
         if self.num_workers > 0 and self.prefetch_factor is not None:

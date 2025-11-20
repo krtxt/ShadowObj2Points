@@ -1,4 +1,4 @@
-项目对应的conda环境是DexGrasp
+项目对应的conda环境是cure
 
 # Repository Guidelines
 

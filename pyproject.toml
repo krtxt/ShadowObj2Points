@@ -29,7 +29,6 @@ dependencies = [
     "trimesh",
     "mujoco",
     "transforms3d",
-    "torchsdf",
     "plotly",
     "urdf-parser-py",
     "rich>=13.0.0",

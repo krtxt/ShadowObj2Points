@@ -11,20 +11,26 @@ defaults:
   - loss: flow_matching
   - optimizer: adamw
   - trainer: default
-  - logger: null   # tensorboard
+  - logger: tensorboard   # tensorboard
   - callbacks: default
-  - experiment: null
+  - experiments: null # Changed from experiment to experiments to match folder structure
   - _self_
 
 # Experiment settings
-experiment_name: new_env
+experiment_name: exp_grasp16_1120
 seed: 42
+
+# Advanced Training Controls
+auto_scale_batch_size: false # Set to true to find the largest batch size
+auto_lr_find: false          # Set to true to find the optimal learning rate
+auto_resume: false           # Set to true to resume from the last checkpoint in the experiment folder
 
 # Common hyperparameters (可被其他配置引用)
 batch_size: 128
 rot_type: r6d  # 'quat' | 'r6d' | 'euler' | 'axis'
 hand_anchor: palm_center  # 'base' | 'palm_center' | 'mjcf'
-compile: false
+# PyTorch 2.x 编译（torch.compile），已改为仅编译 DiT 部分以避免 Inductor 错误
+compile: true
 
 # Paths
 paths:

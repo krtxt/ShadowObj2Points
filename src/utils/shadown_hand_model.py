@@ -17,7 +17,10 @@ import urdf_parser_py.urdf as URDF_PARSER
 from plotly import graph_objects as go
 from pytorch3d.ops import knn_points
 from pytorch_kinematics.urdf_parser_py.urdf import URDF, Box, Cylinder, Mesh, Sphere
-from torchsdf import compute_sdf, index_vertices_by_faces
+# from torchsdf import compute_sdf, index_vertices_by_faces
+from kaolin.metrics.trianglemesh import (
+                    compute_sdf, CUSTOM_index_vertices_by_faces as index_vertices_by_faces,
+                )
 
 from .rotation_spec import get_rotation_spec
 from .rot6d import *

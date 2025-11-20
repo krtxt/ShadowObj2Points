@@ -10,7 +10,7 @@ layer1:
   nsample_list:
     - 64
   mlp_list:
-    - 4  # xyz(3) + mask(1) = 4, 如果用 RGB 则改为 6 或 7
+    - 0 # xyz(3) + mask(1) = 4, 如果用 RGB 则改为 6 或 7
     - 64
     - 64
     - 128

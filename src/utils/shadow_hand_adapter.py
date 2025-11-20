@@ -16,7 +16,10 @@ except ImportError:  # pragma: no cover - optional dependency
     knn_points = None
     _PYTORCH3D_AVAILABLE = False
 
-from torchsdf import compute_sdf
+# from torchsdf import compute_sdf
+from kaolin.metrics.trianglemesh import (
+                    compute_sdf,
+                )
 
 from .hand_constants import SELF_PENETRATION_POINT_RADIUS
 from .hand_helper import decompose_hand_pose as _decompose_hand_pose_helper

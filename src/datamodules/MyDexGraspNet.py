@@ -200,7 +200,10 @@ class MyDexGraspNet(Dataset):
         if not os.path.exists(self.pt_folder):
             raise FileNotFoundError(f"Data file not found: {self.pt_folder}")
 
-        grasp_dataset = torch.load(self.pt_folder)
+        try:
+            grasp_dataset = torch.load(self.pt_folder, weights_only=False)
+        except TypeError:
+            grasp_dataset = torch.load(self.pt_folder)
         scene_data_dict = defaultdict(lambda: {
             'object_name': None,
             'scale': None,

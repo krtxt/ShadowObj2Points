@@ -4,11 +4,11 @@ from typing import Any, Dict, List, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
-import pytorch_lightning as pl
+import lightning.pytorch as L
 import torch
-from pytorch_lightning.callbacks import Callback
-from pytorch_lightning.loggers import Logger, TensorBoardLogger, WandbLogger
-from pytorch_lightning.utilities.rank_zero import rank_zero_only
+from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.loggers import Logger, TensorBoardLogger, WandbLogger
+from lightning.pytorch.utilities.rank_zero import rank_zero_only
 
 log = logging.getLogger(__name__)
 
@@ -35,15 +35,15 @@ class ImageLogger(Callback):
         self._val_vis_batches: List[Dict[str, torch.Tensor]] = []
 
     def on_validation_start(
-        self, trainer: "pl.Trainer", pl_module: "pl.LightningModule"
+        self, trainer: "L.Trainer", pl_module: "L.LightningModule"
     ) -> None:
         """Reset the visualization buffer at the start of validation."""
         self._val_vis_batches = []
 
     def on_validation_batch_end(
         self,
-        trainer: "pl.Trainer",
-        pl_module: "pl.LightningModule",
+        trainer: "L.Trainer",
+        pl_module: "L.LightningModule",
         outputs: Any,
         batch: Any,
         batch_idx: int,
@@ -74,7 +74,7 @@ class ImageLogger(Callback):
 
     @rank_zero_only
     def on_validation_epoch_end(
-        self, trainer: "pl.Trainer", pl_module: "pl.LightningModule"
+        self, trainer: "L.Trainer", pl_module: "L.LightningModule"
     ) -> None:
         """Generate samples and log images."""
         if not self._val_vis_batches:
@@ -195,10 +195,11 @@ class ImageLogger(Callback):
         
         plt.tight_layout()
         fig.canvas.draw()
-        
-        # Convert to numpy
+
+        # Convert to numpy (backend-agnostic)
         width, height = fig.canvas.get_width_height()
-        image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(height, width, 3)
+        buffer = fig.canvas.buffer_rgba()
+        image = np.frombuffer(buffer, dtype=np.uint8).reshape(height, width, 4)[..., :3]
         plt.close(fig)
         return image
 

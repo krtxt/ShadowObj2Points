@@ -9,8 +9,56 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import hydra
+import inspect
 
 from .embeddings import FourierPositionalEmbedding
+
+
+class GaussianRBF(nn.Module):
+    """Gaussian radial basis functions for scalar inputs.
+
+    Maps distances to a higher-dimensional feature space using fixed or
+    learnable Gaussian kernels. This is useful for giving MLPs a richer
+    representation of pairwise distances.
+    """
+
+    def __init__(
+        self,
+        num_kernels: int = 16,
+        r_min: float = 0.0,
+        r_max: float = 0.2,
+        learnable: bool = False,
+    ):
+        super().__init__()
+        centers = torch.linspace(r_min, r_max, num_kernels)
+        gammas = 1.0 / (2 * ((centers[1] - centers[0]) ** 2 + 1e-9))
+        if learnable:
+            self.centers = nn.Parameter(centers)
+            self.gammas = nn.Parameter(torch.full_like(centers, gammas))
+        else:
+            self.register_buffer("centers", centers)
+            self.register_buffer("gammas", torch.full_like(centers, gammas))
+
+    @property
+    def output_dim(self) -> int:
+        return int(self.centers.numel())
+
+    def forward(self, r: torch.Tensor) -> torch.Tensor:
+        """Apply Gaussian RBF to input distances.
+
+        Args:
+            r: Tensor of distances with arbitrary leading shape and a final
+               singleton or scalar dimension, e.g. (B, E, 1) or (B, E).
+
+        Returns:
+            RBF features of shape (..., num_kernels).
+        """
+        if r.dim() > 0 and r.size(-1) == 1:
+            r = r[..., 0]
+        diff = r.unsqueeze(-1) - self.centers.view(1, *([1] * (r.dim() - 1)), -1)
+        return torch.exp(-self.gammas.view(1, *([1] * (r.dim() - 1)), -1) * diff ** 2)
+
 
 class HandPointEmbedding(nn.Module):
     """Embeds hand keypoint features combining spatial and structural information.
@@ -147,16 +195,36 @@ class EGNNLiteLayer(nn.Module):
         d_edge: int = 64,
         d_struct: int = 8,
         dropout: float = 0.1,
+        use_rbf: bool = False,
+        rbf_num_kernels: int = 0,
+        rbf_r_min: float = 0.0,
+        rbf_r_max: float = 0.2,
+        rbf_learnable: bool = False,
     ):
         super().__init__()
+        self.use_rbf = use_rbf and rbf_num_kernels > 0
+        geom_feat_dim = 1 + 1  # dist2, delta
+        gate_geom_dim = 1 + 1
+        if self.use_rbf:
+            self.rbf = GaussianRBF(
+                num_kernels=rbf_num_kernels,
+                r_min=rbf_r_min,
+                r_max=rbf_r_max,
+                learnable=rbf_learnable,
+            )
+            geom_feat_dim += self.rbf.output_dim
+            gate_geom_dim += self.rbf.output_dim
+        else:
+            self.rbf = None
+
         self.edge_mlp = nn.Sequential(
-            nn.Linear(2 * d_model + 1 + 1 + d_struct, d_edge),
+            nn.Linear(2 * d_model + geom_feat_dim + d_struct, d_edge),
             nn.SiLU(),
             nn.Linear(d_edge, d_edge),
             nn.SiLU(),
         )
         self.gate_mlp = nn.Sequential(
-            nn.Linear(1 + 1 + d_struct, 32),
+            nn.Linear(gate_geom_dim + d_struct, 32),
             nn.SiLU(),
             nn.Linear(32, 1),
             nn.Sigmoid(),
@@ -184,9 +252,13 @@ class EGNNLiteLayer(nn.Module):
         Hj = H[:, j, :]
         dist, dist2, delta = _pairwise_edge_geom(xyz, edge_index, edge_rest_lengths)
         struct = edge_struct.unsqueeze(0).expand(B, E, -1)
-        e_in = torch.cat([Hi, Hj, dist2, delta, struct], dim=-1)
+        geom_feats = [dist2, delta]
+        if self.use_rbf and self.rbf is not None:
+            geom_feats.append(self.rbf(dist))
+        geom_cat = torch.cat(geom_feats, dim=-1)
+        e_in = torch.cat([Hi, Hj, geom_cat, struct], dim=-1)
         e_msg = self.edge_mlp(e_in)
-        g = self.gate_mlp(torch.cat([dist2, delta, struct], dim=-1))
+        g = self.gate_mlp(torch.cat([geom_cat, struct], dim=-1))
         e_msg = e_msg * g
         agg = torch.zeros(B, N, e_msg.size(-1), device=H.device, dtype=H.dtype)
         idx = i.view(1, E, 1).expand(B, E, e_msg.size(-1))
@@ -210,6 +282,11 @@ class HandEncoderEGNNLiteGlobal(nn.Module):
         n_heads_pma: int = 4,
         out_dim: int = 512,
         dropout: float = 0.1,
+        use_rbf: bool = False,
+        rbf_num_kernels: int = 0,
+        rbf_r_min: float = 0.0,
+        rbf_r_max: float = 0.2,
+        rbf_learnable: bool = False,
     ):
         super().__init__()
         self.point_embed = HandPointEmbedding(
@@ -227,11 +304,16 @@ class HandEncoderEGNNLiteGlobal(nn.Module):
                     d_edge=d_edge,
                     d_struct=d_struct,
                     dropout=dropout,
+                    use_rbf=use_rbf,
+                    rbf_num_kernels=rbf_num_kernels,
+                    rbf_r_min=rbf_r_min,
+                    rbf_r_max=rbf_r_max,
+                    rbf_learnable=rbf_learnable,
                 )
                 for _ in range(n_layers)
             ]
         )
-        self.pma = PMA1(d_model=d_model, n_heads=n_heads_pma, dropout=dropout)
+        self.pma = PooledMultiheadAttention(d_model=d_model, n_heads=n_heads_pma, dropout=dropout)
         self.out = nn.Sequential(
             nn.Linear(d_model, 256),
             nn.SiLU(),
@@ -271,6 +353,11 @@ class HandPointTokenEncoderEGNNLite(nn.Module):
         num_frequencies: int = 10,
         out_dim: int = 512,           # token dimension per point
         dropout: float = 0.1,
+        use_rbf: bool = False,
+        rbf_num_kernels: int = 0,
+        rbf_r_min: float = 0.0,
+        rbf_r_max: float = 0.2,
+        rbf_learnable: bool = False,
     ):
         super().__init__()
         self.point_embed = HandPointEmbedding(
@@ -288,6 +375,11 @@ class HandPointTokenEncoderEGNNLite(nn.Module):
                     d_edge=d_edge,
                     d_struct=d_struct,
                     dropout=dropout,
+                    use_rbf=use_rbf,
+                    rbf_num_kernels=rbf_num_kernels,
+                    rbf_r_min=rbf_r_min,
+                    rbf_r_max=rbf_r_max,
+                    rbf_learnable=rbf_learnable,
                 )
                 for _ in range(n_layers)
             ]
@@ -436,7 +528,11 @@ class EdgeBiasBuilder(nn.Module):
         struct = edge_struct.unsqueeze(0).expand(B, E, -1)
         edge_feat = torch.cat([dist2, delta, struct], dim=-1)
         edge_bias = self.edge_to_bias(edge_feat).squeeze(-1)
-        bias = torch.ones((B, N, N), device=xyz.device, dtype=xyz.dtype) * self.non_edge_bias
+
+        # Ensure bias and edge_bias share the same dtype under mixed precision.
+        bias_dtype = edge_bias.dtype
+        non_edge = self.non_edge_bias.to(device=xyz.device, dtype=bias_dtype)
+        bias = non_edge.expand(B, N, N).clone()
         bias[:, i, j] = edge_bias
         bias[:, j, i] = edge_bias
         return bias.unsqueeze(1)
@@ -482,7 +578,7 @@ class HandEncoderTransformerBiasGlobal(nn.Module):
             ]
         )
 
-        self.pma = PMA1(d_model=d_model, n_heads=n_heads_pma, dropout=dropout)
+        self.pma = PooledMultiheadAttention(d_model=d_model, n_heads=n_heads_pma, dropout=dropout)
         self.out = nn.Sequential(
             nn.Linear(d_model, 256),
             nn.SiLU(),
@@ -606,6 +702,38 @@ def build_hand_encoder(
     num_joint_types = int(joint_type_ids.max().item()) + 1
     num_edge_types = int(edge_type.max().item()) + 1
 
+    # Support Hydra _target_ instantiation with smart argument injection
+    if "_target_" in cfg:
+        # Candidates for injection (derived from graph_consts and context)
+        candidates = {
+            "graph_consts": graph_consts,
+            "out_dim": out_dim,
+            "num_fingers": num_fingers,
+            "num_joint_types": num_joint_types,
+            "num_edge_types": num_edge_types,
+        }
+        
+        # Get the target class to inspect its signature
+        try:
+            target_cls = hydra.utils.get_class(cfg["_target_"])
+            sig = inspect.signature(target_cls)
+            
+            # Filter args: include only those present in the __init__ signature
+            # or if the init accepts **kwargs
+            valid_kwargs = {}
+            accepts_kwargs = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
+            
+            for name, val in candidates.items():
+                if accepts_kwargs or name in sig.parameters:
+                    valid_kwargs[name] = val
+            
+            return hydra.utils.instantiate(cfg, **valid_kwargs)
+        except Exception as e:
+            # Fallback or re-raise if inspection fails (e.g. partial function)
+            # But generally trying to instantiate directly is the best next step
+            pass
+        return hydra.utils.instantiate(cfg)
+
     name = str(getattr(cfg, "name", "transformer_bias")).lower()
 
     # Utility for reading optional fields from DictConfig / dict
@@ -646,6 +774,11 @@ def build_hand_encoder(
         d_struct = _get("d_struct", 8)
         num_frequencies = _get("num_frequencies", 10)
         dropout = _get("dropout", 0.1)
+        use_rbf = _get("use_rbf", False)
+        rbf_num_kernels = _get("rbf_num_kernels", 0)
+        rbf_r_min = _get("rbf_r_min", 0.0)
+        rbf_r_max = _get("rbf_r_max", 0.2)
+        rbf_learnable = _get("rbf_learnable", False)
 
         return HandPointTokenEncoderEGNNLite(
             num_fingers=num_fingers,
@@ -658,6 +791,11 @@ def build_hand_encoder(
             num_frequencies=num_frequencies,
             out_dim=out_dim,
             dropout=dropout,
+            use_rbf=use_rbf,
+            rbf_num_kernels=rbf_num_kernels,
+            rbf_r_min=rbf_r_min,
+            rbf_r_max=rbf_r_max,
+            rbf_learnable=rbf_learnable,
         )
 
     else:

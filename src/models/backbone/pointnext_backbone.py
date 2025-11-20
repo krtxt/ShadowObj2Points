@@ -16,7 +16,7 @@ import torch.nn as nn
 # Add third_party path if needed
 import os
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-openpoints_path = os.path.join(project_root, "third_party")
+openpoints_path = os.path.join(project_root, "3rd_party")
 if openpoints_path not in sys.path:
     sys.path.insert(0, openpoints_path)
 

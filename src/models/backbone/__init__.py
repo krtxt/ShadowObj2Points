@@ -12,8 +12,12 @@ from .ptv3_sparse_encoder import PTv3SparseEncoder
 from .resnet import build_resnet_backbone
 from .sonata_backbone import SonataBackbone
 
+import hydra
 
 def build_backbone(backbone_cfg):
+    if "_target_" in backbone_cfg:
+        return hydra.utils.instantiate(backbone_cfg)
+        
     if backbone_cfg.name.lower() == "resnet":
         return build_resnet_backbone(backbone_cfg)
     elif backbone_cfg.name.lower() == "pointnet2":

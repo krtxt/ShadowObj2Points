@@ -6,7 +6,8 @@ from typing import Any, Dict, Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pytorch_lightning as pl
+import lightning.pytorch as L
+import numpy as np
 from hydra.utils import instantiate as hydra_instantiate
 from omegaconf import DictConfig, OmegaConf
 
@@ -44,7 +45,7 @@ class TimestepEmbedding(nn.Module):
             timesteps = timesteps.unsqueeze(-1)
         return self.net(timesteps)
 
-class HandFlowMatchingDiT(pl.LightningModule):
+class HandFlowMatchingDiT(L.LightningModule):
     """Flow Matching model with Graph-aware DiT for hand keypoint generation.
     
     Generates hand keypoints conditioned on scene point clouds using rectified flow.
@@ -93,6 +94,8 @@ class HandFlowMatchingDiT(pl.LightningModule):
         use_ema: bool = True,
         ema_decay: float = 0.999,
         ema_device: Optional[str] = None,
+        # Validation visualization
+        val_vis_num_samples: int = 0,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["graph_consts", "backbone", "hand_encoder", "dit"])
@@ -113,6 +116,10 @@ class HandFlowMatchingDiT(pl.LightningModule):
         self.num_fingers = num_fingers
         self.num_joint_types = num_joint_types
         self.num_edge_types = num_edge_types
+
+        # Validation visualization config
+        self.val_vis_num_samples = int(val_vis_num_samples)
+        self._val_vis_batches: List[Dict[str, Any]] = []
 
         # Register graph structure as buffers
         self.register_buffer("finger_ids_const", finger_ids)
@@ -399,7 +406,9 @@ class HandFlowMatchingDiT(pl.LightningModule):
                 self.log("val/nan_loss", 1.0, prog_bar=True, on_step=False, on_epoch=True)
                 return
 
+            # 使用无斜杠的别名 `val_loss` 以便 ModelCheckpoint/ EarlyStopping 监控和文件名格式化
             self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+            self.log("val_loss", loss, prog_bar=False, on_step=False, on_epoch=True)
             self.log("val/loss_fm", loss_dict["loss_fm"], prog_bar=False, on_step=False, on_epoch=True)
             self.log("val/loss_tangent", loss_dict["loss_tangent"], prog_bar=False, on_step=False, on_epoch=True)
             with torch.no_grad():
@@ -638,9 +647,10 @@ class HandFlowMatchingDiT(pl.LightningModule):
                 ema_model.to(self.ema_device)
         return _ModelEmaWrapper(ema_model, decay=self.ema_decay)
 
-    def on_train_batch_end(self, outputs, batch, batch_idx, dataloader_idx: int = 0) -> None:
+    def on_train_batch_end(self, outputs, batch, batch_idx: int = 0) -> None:
         if self.ema is not None:
-            self.ema.update(self)
+            if (int(self.global_step) % 4) == 0:
+                self.ema.update(self)
 
     def on_validation_start(self) -> None:
         # Reset visualization buffer
@@ -747,7 +757,8 @@ class HandFlowMatchingDiT(pl.LightningModule):
 
         fig.canvas.draw()
         width, height = fig.canvas.get_width_height()
-        image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(height, width, 3)
+        buffer = fig.canvas.buffer_rgba()
+        image = np.frombuffer(buffer, dtype=np.uint8).reshape(height, width, 4)[..., :3]
         plt.close(fig)
         return image
 

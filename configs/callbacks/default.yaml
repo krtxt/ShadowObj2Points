@@ -2,10 +2,10 @@
 
 # Model Checkpoint - 保存最佳模型
 model_checkpoint:
-  _target_: pytorch_lightning.callbacks.ModelCheckpoint
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.output_dir}/checkpoints
   filename: "epoch={epoch:03d}-val_loss={val_loss:.4f}"
-  monitor: "val/loss"
+  monitor: "val_loss"
   mode: "min"
   save_top_k: 3
   save_last: true
@@ -14,8 +14,8 @@ model_checkpoint:
 
 # Early Stopping
 early_stopping:
-  _target_: pytorch_lightning.callbacks.EarlyStopping
-  monitor: "val/loss"
+  _target_: lightning.pytorch.callbacks.EarlyStopping
+  monitor: "val_loss"
   patience: 50
   mode: "min"
   verbose: true
@@ -23,33 +23,69 @@ early_stopping:
 
 # Learning Rate Monitor
 lr_monitor:
-  _target_: pytorch_lightning.callbacks.LearningRateMonitor
+  _target_: lightning.pytorch.callbacks.LearningRateMonitor
   logging_interval: "epoch"
   log_momentum: false
 
 # Model Summary
 model_summary:
-  _target_: pytorch_lightning.callbacks.RichModelSummary
+  _target_: lightning.pytorch.callbacks.RichModelSummary
   max_depth: 2
+
+# # Progress Bar
+# rich_progress_bar:
+#   _target_: lightning.pytorch.callbacks.RichProgressBar
+#   leave: true
+#   refresh_rate: 1
+#   theme:
+#     _target_: lightning.pytorch.callbacks.progress.rich_progress.RichProgressBarTheme
+#     description: "bold italic #FF33AA"
+#     progress_bar: "#33AAFF"
+#     progress_bar_finished: "#55FF55"
+#     progress_bar_pulse: "#FFAA33"
+#     batch_progress: "bold #FF33AA"
+#     time: "#AAAAAA"
+#     processing_speed: "#FFD700"
+#     metrics: "bold #33FFAA"
 
 # Progress Bar
 rich_progress_bar:
-  _target_: pytorch_lightning.callbacks.RichProgressBar
+  _target_: lightning.pytorch.callbacks.RichProgressBar
   leave: true
-  refresh_rate: 5
+  refresh_rate: 1
   theme:
-    _target_: pytorch_lightning.callbacks.progress.rich_progress.RichProgressBarTheme
-    description: "bold italic #FF33AA"
-    progress_bar: "#33AAFF"
-    progress_bar_finished: "#55FF55"
-    progress_bar_pulse: "#FFAA33"
-    batch_progress: "bold #FF33AA"
-    time: "#AAAAAA"
-    processing_speed: "#FFD700"
-    metrics: "bold #33FFAA"
+    _target_: lightning.pytorch.callbacks.progress.rich_progress.RichProgressBarTheme
+    # 描述 (Description): 深粉/洋红
+    description: "bold italic #FF1493"
+    # 进度条 (Progress Bar): 浅粉/樱花粉 (未完成/正在进行部分)
+    progress_bar: "#FFC0CB"
+    # 进度条完成 (Progress Bar Finished): 艳粉/玫瑰红 (已完成部分)
+    progress_bar_finished: "#FF69B4"
+    # 进度条脉冲 (Progress Bar Pulse): 亮粉/热粉 (用于不确定状态或动画)
+    progress_bar_pulse: "#FF007F"
+    # 批次进度 (Batch Progress): 深粉/洋红
+    batch_progress: "bold #FF1493"
+    # 时间 (Time): 柔和的灰色 (保持中立，但可以考虑更柔和的粉色系)
+    time: "#F0E6F0" # 保持原样，或改为浅灰粉: "#F0E6F0"
+    # 处理速度 (Processing Speed): 金色调 (作为高亮，或者改为金色调的粉色)
+    processing_speed: "#FFD700" # 保持原样，或改为淡粉橘: "#FFB6C1"
+    # 指标 (Metrics): 浅玫瑰红 (用于显示指标数据)
+    metrics: "bold #FFB6C1"
 
 # Image Logger
 image_logger:
   _target_: callbacks.image_logger.ImageLogger
   num_samples: 4
   log_key: "val/hand_samples"
+
+# Device Stats Monitor (GPU/CPU usage)
+# Set to null to disable
+device_stats_monitor:
+  _target_: lightning.pytorch.callbacks.DeviceStatsMonitor
+
+# Stochastic Weight Averaging
+# Set to null to disable. 
+# Enable by providing:
+#   _target_: lightning.pytorch.callbacks.StochasticWeightAveraging
+#   swa_lrs: 1e-2
+stochastic_weight_averaging: null

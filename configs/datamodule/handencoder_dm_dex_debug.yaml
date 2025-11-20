@@ -44,3 +44,5 @@ dataset_kwargs:
   # Explicit debug files (override defaults when debug_mode: true)
   pt_file_name: debug_grasp_data_128.pt
   split_file_name: debug_grasp_128.json
+  # pt_file_name: debug_grasp_data_16.pt
+  # split_file_name: debug_grasp_16.json

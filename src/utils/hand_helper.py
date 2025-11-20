@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from pytorchse3.se3 import se3_log_map, se3_exp_map
 
-from pytorch_lightning.utilities.rank_zero import rank_zero_info
+from lightning.pytorch.utilities.rank_zero import rank_zero_info
 
 from . import hand_pose_config
 from .rotation_spec import get_rotation_spec

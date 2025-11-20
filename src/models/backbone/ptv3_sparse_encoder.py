@@ -13,14 +13,24 @@ PTv3 稀疏 Token 提取器
 """
 
 import logging
+import sys
+from pathlib import Path
 from typing import Tuple, Optional
 from types import SimpleNamespace
+
+# Add 3rd_party/pointnet2 to sys.path to enable importing the CUDA-optimized version
+_repo_root = Path(__file__).resolve().parents[3]
+_pn2_path = _repo_root / "3rd_party" / "pointnet2"
+if _pn2_path.exists() and str(_pn2_path) not in sys.path:
+    sys.path.append(str(_pn2_path))
 
 import torch
 import torch.nn as nn
 
 from .ptv3.ptv3 import PointTransformerV3
 from .ptv3_backbone import convert_to_ptv3_pc_format
+
+from pointnet2_utils import furthest_point_sample as farthest_point_sample
 
 
 class PTv3SparseEncoder(nn.Module):
@@ -316,32 +326,44 @@ class PTv3SparseEncoder(nn.Module):
         """
         C = feat.shape[1]
         
-        # 构建 batch indices
-        batch_idx = torch.zeros(coord.shape[0], dtype=torch.long, device=device)
-        start_idx = 0
-        for b in range(batch_size):
-            end_idx = offset[b].item()
-            batch_idx[start_idx:end_idx] = b
-            start_idx = end_idx
+        # Vectorized construction of batch_idx
+        # offset contains end indices: [N1, N1+N2, ...]
+        # We need counts: [N1, N2, ...]
+        counts = torch.diff(offset, prepend=torch.tensor([0], device=device, dtype=torch.long))
+        
+        # Only use the first batch_size elements of counts if offset has more
+        if len(counts) > batch_size:
+             counts = counts[:batch_size]
+        
+        # batch_idx maps each point to its batch index [0, 0, 0, 1, 1, ...]
+        batch_idx = torch.repeat_interleave(torch.arange(len(counts), device=device), counts)
         
         # 找到最大点数
-        bincount = torch.bincount(batch_idx, minlength=batch_size)
-        K = bincount.max().item()
+        if batch_idx.numel() > 0:
+            bincount = torch.bincount(batch_idx, minlength=batch_size)
+            K = bincount.max().item()
+        else:
+            K = 0
         
         # 初始化输出张量
         xyz_sparse = torch.zeros(batch_size, K, 3, device=device, dtype=coord.dtype)
         feat_sparse = torch.zeros(batch_size, C, K, device=device, dtype=feat.dtype)
         
-        # 填充
-        for b in range(batch_size):
-            mask = batch_idx == b
-            pts = coord[mask]
-            fts = feat[mask]
-            n_pts = pts.shape[0]
+        if K > 0:
+            # Compute intra-batch indices [0, 1, 2, 0, 1, ...]
+            # Global index - start index of corresponding batch
+            starts = torch.cat([torch.tensor([0], device=device, dtype=torch.long), offset[:-1]])
+            if len(starts) > batch_size:
+                starts = starts[:batch_size]
+                
+            intra_batch_idx = torch.arange(coord.shape[0], device=device) - starts[batch_idx]
             
-            if n_pts > 0:
-                xyz_sparse[b, :n_pts] = pts
-                feat_sparse[b, :, :n_pts] = fts.t()
+            # Vectorized assignment
+            xyz_sparse[batch_idx, intra_batch_idx] = coord
+            
+            # feat_sparse (B, C, K) -> (B, K, C) for easy assignment
+            # permute returns a view, so modification affects original tensor
+            feat_sparse.permute(0, 2, 1)[batch_idx, intra_batch_idx] = feat
         
         return xyz_sparse, feat_sparse
     
@@ -610,7 +632,14 @@ class PTv3SparseEncoder(nn.Module):
         """
         使用FPS采样到目标数量的点
         """
-        from .pointnet2_utils import farthest_point_sample
+        # from .pointnet2_utils import farthest_point_sample  # Legacy: Slow Python implementation
+        
+        # Try importing CUDA-optimized version first
+        # try:
+        #     from pointnet2_utils import farthest_point_sample
+        # except ImportError:
+        #     # self.logger.warning("Failed to import CUDA-optimized pointnet2_utils. Falling back to slow Python implementation.")
+        #     from .pointnet2_utils import farthest_point_sample
         
         B, K, _ = xyz.shape
         C = feat.shape[1]

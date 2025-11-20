@@ -1,4 +1,5 @@
 import torch
+import torch._dynamo as dynamo
 
 from .hilbert import decode as hilbert_decode_
 from .hilbert import encode as hilbert_encode_
@@ -6,6 +7,7 @@ from .z_order import key2xyz as z_order_decode_
 from .z_order import xyz2key as z_order_encode_
 
 
+@dynamo.disable()
 @torch.inference_mode()
 def encode(grid_coord, batch=None, depth=16, order="z"):
     assert order in {"z", "z-trans", "hilbert", "hilbert-trans"}
@@ -25,6 +27,7 @@ def encode(grid_coord, batch=None, depth=16, order="z"):
     return code
 
 
+@dynamo.disable()
 @torch.inference_mode()
 def decode(code, depth=16, order="z"):
     assert order in {"z", "hilbert"}
@@ -39,6 +42,7 @@ def decode(code, depth=16, order="z"):
     return grid_coord, batch
 
 
+@dynamo.disable()
 def z_order_encode(grid_coord: torch.Tensor, depth: int = 16):
     x, y, z = grid_coord[:, 0].long(), grid_coord[:, 1].long(), grid_coord[:, 2].long()
     # we block the support to batch, maintain batched code in Point class
@@ -46,15 +50,18 @@ def z_order_encode(grid_coord: torch.Tensor, depth: int = 16):
     return code
 
 
+@dynamo.disable()
 def z_order_decode(code: torch.Tensor, depth):
     x, y, z = z_order_decode_(code, depth=depth)
     grid_coord = torch.stack([x, y, z], dim=-1)  # (N,  3)
     return grid_coord
 
 
+@dynamo.disable()
 def hilbert_encode(grid_coord: torch.Tensor, depth: int = 16):
     return hilbert_encode_(grid_coord, num_dims=3, num_bits=depth)
 
 
+@dynamo.disable()
 def hilbert_decode(code: torch.Tensor, depth: int = 16):
     return hilbert_decode_(code, num_dims=3, num_bits=depth)

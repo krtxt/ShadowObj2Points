@@ -12,6 +12,8 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import hydra
+import inspect
 
 from .hand_encoder import EdgeBiasBuilder
 
@@ -675,6 +677,31 @@ def build_dit(
 
     num_nodes = int(finger_ids.shape[0])
     num_edge_types = int(edge_type.max().item()) + 1
+
+    # Support Hydra _target_ instantiation with smart argument injection
+    if "_target_" in cfg:
+        candidates = {
+            "graph_consts": graph_consts,
+            "dim": dim,
+            "num_nodes": num_nodes,
+            "num_edge_types": num_edge_types,
+        }
+        
+        try:
+            target_cls = hydra.utils.get_class(cfg["_target_"])
+            sig = inspect.signature(target_cls)
+            
+            valid_kwargs = {}
+            accepts_kwargs = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
+            
+            for name, val in candidates.items():
+                if accepts_kwargs or name in sig.parameters:
+                    valid_kwargs[name] = val
+            
+            return hydra.utils.instantiate(cfg, **valid_kwargs)
+        except Exception:
+            pass
+        return hydra.utils.instantiate(cfg)
 
     def _get(key: str, default):
         if hasattr(cfg, key): return getattr(cfg, key)

@@ -1,6 +1,6 @@
 import sys
 
-sys.path.append("./third_party/pointnet2/")
+sys.path.append("../3rd_party/pointnet2/")
 
 import unittest
 

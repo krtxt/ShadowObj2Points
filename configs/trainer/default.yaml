@@ -1,7 +1,7 @@
 # PyTorch Lightning Trainer Configuration
 accelerator: gpu
 devices: 1
-precision: 32  # 16-mixed | 32 | 64
+precision: 32  # 16-mixed | 32 | 64 | bf16-mixed
 max_epochs: 500
 # strategy: ddp_find_unused_parameters_true
 
@@ -9,14 +9,19 @@ max_epochs: 500
 gradient_clip_val: 1.0
 gradient_clip_algorithm: norm
 accumulate_grad_batches: 1
+benchmark: true  # cuDNN benchmark for speed
 
 # Validation settings
 check_val_every_n_epoch: 1
 val_check_interval: null  # 如果想在epoch内验证，设置为0.5等
-num_sanity_val_steps: 2
+num_sanity_val_steps: 0
 
 # Logging
 log_every_n_steps: 15
+track_grad_norm: -1  # set to 2 to track L2 norm of gradients (helpful for debugging)
+
+# Profiling
+profiler: null  # "simple" | "advanced" | "pytorch"
 
 # Checkpointing (通过callbacks配置)
 enable_checkpointing: true
@@ -48,3 +53,5 @@ deterministic: false  # 设为true会更慢但可复现
                                                                                                   
 # # 其他实用配置                                                                                   
 # use_distributed_sampler: true  # 多GPU时自动使用分布式采样器
+
+# strategy='ddp_find_unused_parameters_true

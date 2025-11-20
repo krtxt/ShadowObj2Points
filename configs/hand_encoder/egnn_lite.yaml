@@ -22,3 +22,12 @@ num_frequencies: 10
 # Dropout rate applied in the MLPs
 dropout: 0.1
 
+# Optional Gaussian RBF expansion of pairwise distances.
+# When disabled (use_rbf: false) the encoder uses only
+# {dist2, delta} as geometric scalars, matching the legacy
+# implementation exactly.
+use_rbf: false
+rbf_num_kernels: 16
+rbf_r_min: 0.0
+rbf_r_max: 0.2
+rbf_learnable: false

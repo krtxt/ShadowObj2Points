@@ -4,6 +4,7 @@ Provides multiple architectures with strong inductive biases for dexterous
 hand modeling, including EGNN-lite and Transformer-based variants.
 """
 
+import logging
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -13,6 +14,9 @@ import hydra
 import inspect
 
 from .embeddings import FourierPositionalEmbedding
+
+
+logger = logging.getLogger(__name__)
 
 
 class GaussianRBF(nn.Module):
@@ -31,8 +35,16 @@ class GaussianRBF(nn.Module):
         learnable: bool = False,
     ):
         super().__init__()
+        if num_kernels < 1:
+            raise ValueError("num_kernels must be >= 1")
+
         centers = torch.linspace(r_min, r_max, num_kernels)
-        gammas = 1.0 / (2 * ((centers[1] - centers[0]) ** 2 + 1e-9))
+        if num_kernels > 1:
+            step = (r_max - r_min) / (num_kernels - 1)
+        else:
+            # Degenerate case: single kernel sits at midpoint, pick a reasonable span
+            step = max(r_max - r_min, 1e-3)
+        gammas = 1.0 / (2 * (step ** 2 + 1e-9))
         if learnable:
             self.centers = nn.Parameter(centers)
             self.gammas = nn.Parameter(torch.full_like(centers, gammas))
@@ -56,8 +68,9 @@ class GaussianRBF(nn.Module):
         """
         if r.dim() > 0 and r.size(-1) == 1:
             r = r[..., 0]
-        diff = r.unsqueeze(-1) - self.centers.view(1, *([1] * (r.dim() - 1)), -1)
-        return torch.exp(-self.gammas.view(1, *([1] * (r.dim() - 1)), -1) * diff ** 2)
+        r = r.to(self.centers.dtype)
+        diff = r.unsqueeze(-1) - self.centers
+        return torch.exp(-self.gammas * diff.pow(2))
 
 
 class HandPointEmbedding(nn.Module):
@@ -240,25 +253,26 @@ class EGNNLiteLayer(nn.Module):
     def forward(
         self,
         H: torch.Tensor,              # (B, N, d)
-        xyz: torch.Tensor,            # (B, N, 3)
         edge_index: torch.Tensor,     # (2, E)
-        edge_struct: torch.Tensor,    # (E, d_struct)
-        edge_rest_lengths: torch.Tensor,
+        geom_feats: Tuple[torch.Tensor, torch.Tensor],  # (dist2, delta)
+        edge_struct: torch.Tensor,    # (B, E, d_struct)
+        rbf_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        B, N, d = H.shape
+        B, N, _ = H.shape
         E = edge_index.size(1)
         i, j = edge_index
         Hi = H[:, i, :]
         Hj = H[:, j, :]
-        dist, dist2, delta = _pairwise_edge_geom(xyz, edge_index, edge_rest_lengths)
-        struct = edge_struct.unsqueeze(0).expand(B, E, -1)
-        geom_feats = [dist2, delta]
-        if self.use_rbf and self.rbf is not None:
-            geom_feats.append(self.rbf(dist))
-        geom_cat = torch.cat(geom_feats, dim=-1)
-        e_in = torch.cat([Hi, Hj, geom_cat, struct], dim=-1)
+        dist2, delta = geom_feats
+        geom_cat_parts = [dist2, delta]
+        if self.use_rbf:
+            if rbf_feat is None:
+                raise ValueError("rbf_feat must be provided when use_rbf=True")
+            geom_cat_parts.append(rbf_feat)
+        geom_cat = torch.cat(geom_cat_parts, dim=-1)
+        e_in = torch.cat([Hi, Hj, geom_cat, edge_struct], dim=-1)
         e_msg = self.edge_mlp(e_in)
-        g = self.gate_mlp(torch.cat([geom_cat, struct], dim=-1))
+        g = self.gate_mlp(torch.cat([geom_cat, edge_struct], dim=-1))
         e_msg = e_msg * g
         agg = torch.zeros(B, N, e_msg.size(-1), device=H.device, dtype=H.dtype)
         idx = i.view(1, E, 1).expand(B, E, e_msg.size(-1))
@@ -267,8 +281,112 @@ class EGNNLiteLayer(nn.Module):
         return H_new
 
 
-class HandEncoderEGNNLiteGlobal(nn.Module):
+class HandEncoderEGNNLiteBase(nn.Module):
+    """Shared wiring for EGNN-lite encoders with configurable heads."""
+
+    def __init__(
+        self,
+        *,
+        num_fingers: int,
+        num_joint_types: int,
+        num_edge_types: int,
+        d_model: int = 128,
+        n_layers: int = 3,
+        d_edge: int = 64,
+        d_struct: int = 8,
+        num_frequencies: int = 10,
+        out_dim: int = 512,
+        dropout: float = 0.1,
+        use_rbf: bool = False,
+        rbf_num_kernels: int = 0,
+        rbf_r_min: float = 0.0,
+        rbf_r_max: float = 0.2,
+        rbf_learnable: bool = False,
+        global_pool: bool = False,
+        n_heads_pma: int = 4,
+    ):
+        super().__init__()
+        self.global_pool = global_pool
+        self.point_embed = HandPointEmbedding(
+            num_fingers=num_fingers,
+            num_joint_types=num_joint_types,
+            d_model=d_model,
+            num_frequencies=num_frequencies,
+            dropout=dropout,
+        )
+        self.edge_struct_emb = EdgeStructEmbedding(num_edge_types, d_struct=d_struct)
+        self.layers = nn.ModuleList(
+            [
+                EGNNLiteLayer(
+                    d_model=d_model,
+                    d_edge=d_edge,
+                    d_struct=d_struct,
+                    dropout=dropout,
+                    use_rbf=use_rbf,
+                    rbf_num_kernels=rbf_num_kernels,
+                    rbf_r_min=rbf_r_min,
+                    rbf_r_max=rbf_r_max,
+                    rbf_learnable=rbf_learnable,
+                )
+                for _ in range(n_layers)
+            ]
+        )
+
+        if self.global_pool:
+            self.pma = PooledMultiheadAttention(
+                d_model=d_model,
+                n_heads=n_heads_pma,
+                dropout=dropout,
+            )
+            self.out = nn.Sequential(
+                nn.Linear(d_model, 256),
+                nn.SiLU(),
+                nn.Linear(256, out_dim),
+            )
+        else:
+            self.pma = None
+            self.out = nn.Sequential(
+                nn.Linear(d_model, 2 * d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(2 * d_model, out_dim),
+                nn.LayerNorm(out_dim),
+            )
+
+    def _edge_struct(self, edge_type: torch.Tensor) -> torch.Tensor:
+        return self.edge_struct_emb(edge_type)
+
+    def forward(
+        self,
+        xyz: torch.Tensor,
+        finger_ids: torch.Tensor,
+        joint_type_ids: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_type: torch.Tensor,
+        edge_rest_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        H = self.point_embed(xyz, finger_ids, joint_type_ids)
+        B = xyz.size(0)
+        edge_struct = self._edge_struct(edge_type).to(H.dtype)
+        edge_struct = edge_struct.unsqueeze(0).expand(B, -1, -1)
+        dist, dist2, delta = _pairwise_edge_geom(xyz, edge_index, edge_rest_lengths)
+        dist2 = dist2.to(H.dtype)
+        delta = delta.to(H.dtype)
+        geom_feats = (dist2, delta)
+        for layer in self.layers:
+            rbf_feat = None
+            if layer.use_rbf and layer.rbf is not None:
+                rbf_feat = layer.rbf(dist.to(H.dtype)).to(H.dtype)
+            H = layer(H, edge_index, geom_feats, edge_struct, rbf_feat)
+        if self.global_pool:
+            H = self.pma(H)
+            return self.out(H)
+        return self.out(H)
+
+
+class HandEncoderEGNNLiteGlobal(HandEncoderEGNNLiteBase):
     """Legacy EGNN-lite encoder pooling all points into a single global token."""
+
     def __init__(
         self,
         num_fingers: int,
@@ -288,70 +406,41 @@ class HandEncoderEGNNLiteGlobal(nn.Module):
         rbf_r_max: float = 0.2,
         rbf_learnable: bool = False,
     ):
-        super().__init__()
-        self.point_embed = HandPointEmbedding(
+        super().__init__(
             num_fingers=num_fingers,
             num_joint_types=num_joint_types,
+            num_edge_types=num_edge_types,
             d_model=d_model,
+            n_layers=n_layers,
+            d_edge=d_edge,
+            d_struct=d_struct,
             num_frequencies=num_frequencies,
+            out_dim=out_dim,
             dropout=dropout,
-        )
-        self.edge_struct_emb = EdgeStructEmbedding(num_edge_types, d_struct=d_struct)
-        self.layers = nn.ModuleList(
-            [
-                EGNNLiteLayer(
-                    d_model=d_model,
-                    d_edge=d_edge,
-                    d_struct=d_struct,
-                    dropout=dropout,
-                    use_rbf=use_rbf,
-                    rbf_num_kernels=rbf_num_kernels,
-                    rbf_r_min=rbf_r_min,
-                    rbf_r_max=rbf_r_max,
-                    rbf_learnable=rbf_learnable,
-                )
-                for _ in range(n_layers)
-            ]
-        )
-        self.pma = PooledMultiheadAttention(d_model=d_model, n_heads=n_heads_pma, dropout=dropout)
-        self.out = nn.Sequential(
-            nn.Linear(d_model, 256),
-            nn.SiLU(),
-            nn.Linear(256, out_dim),
+            use_rbf=use_rbf,
+            rbf_num_kernels=rbf_num_kernels,
+            rbf_r_min=rbf_r_min,
+            rbf_r_max=rbf_r_max,
+            rbf_learnable=rbf_learnable,
+            global_pool=True,
+            n_heads_pma=n_heads_pma,
         )
 
-    def _edge_struct(self, edge_type: torch.Tensor) -> torch.Tensor:
-        return self.edge_struct_emb(edge_type)  # (E, d_struct)
 
-    def forward(
-        self,
-        xyz: torch.Tensor,                 # (B, N, 3)
-        finger_ids: torch.Tensor,          # (B, N)
-        joint_type_ids: torch.Tensor,      # (B, N)
-        edge_index: torch.Tensor,          # (2, E)
-        edge_type: torch.Tensor,           # (E,)
-        edge_rest_lengths: torch.Tensor,   # (E,)
-    ) -> torch.Tensor:
-        H = self.point_embed(xyz, finger_ids, joint_type_ids)     # (B, N, d)
-        edge_struct = self._edge_struct(edge_type)                # (E, d_struct)
-        for layer in self.layers:
-            H = layer(H, xyz, edge_index, edge_struct, edge_rest_lengths)
-        z = self.pma(H)
-        return self.out(z)
-
-class HandPointTokenEncoderEGNNLite(nn.Module):
+class HandPointTokenEncoderEGNNLite(HandEncoderEGNNLiteBase):
     """Per-point EGNN-lite encoder producing tokens for downstream DiT blocks."""
+
     def __init__(
         self,
         num_fingers: int,
         num_joint_types: int,
         num_edge_types: int,
-        d_model: int = 128,            # hidden width inside EGNN
+        d_model: int = 128,
         n_layers: int = 3,
         d_edge: int = 64,
         d_struct: int = 8,
         num_frequencies: int = 10,
-        out_dim: int = 512,           # token dimension per point
+        out_dim: int = 512,
         dropout: float = 0.1,
         use_rbf: bool = False,
         rbf_num_kernels: int = 0,
@@ -359,63 +448,24 @@ class HandPointTokenEncoderEGNNLite(nn.Module):
         rbf_r_max: float = 0.2,
         rbf_learnable: bool = False,
     ):
-        super().__init__()
-        self.point_embed = HandPointEmbedding(
+        super().__init__(
             num_fingers=num_fingers,
             num_joint_types=num_joint_types,
+            num_edge_types=num_edge_types,
             d_model=d_model,
+            n_layers=n_layers,
+            d_edge=d_edge,
+            d_struct=d_struct,
             num_frequencies=num_frequencies,
+            out_dim=out_dim,
             dropout=dropout,
+            use_rbf=use_rbf,
+            rbf_num_kernels=rbf_num_kernels,
+            rbf_r_min=rbf_r_min,
+            rbf_r_max=rbf_r_max,
+            rbf_learnable=rbf_learnable,
+            global_pool=False,
         )
-        self.edge_struct_emb = EdgeStructEmbedding(num_edge_types, d_struct=d_struct)
-        self.layers = nn.ModuleList(
-            [
-                EGNNLiteLayer(
-                    d_model=d_model,
-                    d_edge=d_edge,
-                    d_struct=d_struct,
-                    dropout=dropout,
-                    use_rbf=use_rbf,
-                    rbf_num_kernels=rbf_num_kernels,
-                    rbf_r_min=rbf_r_min,
-                    rbf_r_max=rbf_r_max,
-                    rbf_learnable=rbf_learnable,
-                )
-                for _ in range(n_layers)
-            ]
-        )
-
-        # Final projection from d_model to out_dim per point
-        self.out = nn.Sequential(
-            nn.Linear(d_model, 2 * d_model),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(2 * d_model, out_dim),
-            nn.LayerNorm(out_dim),
-        )
-
-    def _edge_struct(self, edge_type: torch.Tensor) -> torch.Tensor:
-        return self.edge_struct_emb(edge_type)  # (E, d_struct)
-
-    def forward(
-        self,
-        xyz: torch.Tensor,                 # (B, N, 3)
-        finger_ids: torch.Tensor,          # (B, N)
-        joint_type_ids: torch.Tensor,      # (B, N)
-        edge_index: torch.Tensor,          # (2, E)
-        edge_type: torch.Tensor,           # (E,)
-        edge_rest_lengths: torch.Tensor,   # (E,)
-    ) -> torch.Tensor:
-        """
-        Returns:
-            tokens: (B, N, out_dim)
-        """
-        H = self.point_embed(xyz, finger_ids, joint_type_ids)
-        edge_struct = self._edge_struct(edge_type)
-        for layer in self.layers:
-            H = layer(H, xyz, edge_index, edge_struct, edge_rest_lengths)
-        tokens = self.out(H)
-        return tokens
 
 # Transformer with structural attention bias
 class BiasedMHSA(nn.Module):
@@ -525,7 +575,7 @@ class EdgeBiasBuilder(nn.Module):
         dist, dist2, delta = _pairwise_edge_geom(
             xyz, edge_index, edge_rest_lengths
         )                               # (B,E,1)...
-        struct = edge_struct.unsqueeze(0).expand(B, E, -1)
+        struct = edge_struct.to(dist2.dtype).unsqueeze(0).expand(B, E, -1)
         edge_feat = torch.cat([dist2, delta, struct], dim=-1)
         edge_bias = self.edge_to_bias(edge_feat).squeeze(-1)
 
@@ -538,8 +588,97 @@ class EdgeBiasBuilder(nn.Module):
         return bias.unsqueeze(1)
 
 
-class HandEncoderTransformerBiasGlobal(nn.Module):
+class HandEncoderTransformerBiasBase(nn.Module):
+    """Shared Transformer encoder body supporting pooled or per-point heads."""
+
+    def __init__(
+        self,
+        *,
+        num_fingers: int,
+        num_joint_types: int,
+        num_edge_types: int,
+        d_model: int = 128,
+        n_layers: int = 3,
+        n_heads: int = 4,
+        d_struct: int = 8,
+        num_frequencies: int = 10,
+        out_dim: int = 512,
+        dropout: float = 0.1,
+        ffn_ratio: int = 2,
+        global_pool: bool = False,
+        n_heads_pma: int = 4,
+    ):
+        super().__init__()
+        self.global_pool = global_pool
+        self.point_embed = HandPointEmbedding(
+            num_fingers=num_fingers,
+            num_joint_types=num_joint_types,
+            d_model=d_model,
+            num_frequencies=num_frequencies,
+            dropout=dropout,
+        )
+        self.edge_struct_emb = EdgeStructEmbedding(num_edge_types, d_struct=d_struct)
+        self.bias_builder = EdgeBiasBuilder(d_struct=d_struct)
+
+        self.blocks = nn.ModuleList(
+            [
+                TransformerEncoderLayerBias(
+                    d_model,
+                    n_heads=n_heads,
+                    dropout=dropout,
+                    ffn_ratio=ffn_ratio,
+                )
+                for _ in range(n_layers)
+            ]
+        )
+
+        if self.global_pool:
+            self.pma = PooledMultiheadAttention(
+                d_model=d_model,
+                n_heads=n_heads_pma,
+                dropout=dropout,
+            )
+            self.out = nn.Sequential(
+                nn.Linear(d_model, 256),
+                nn.SiLU(),
+                nn.Linear(256, out_dim),
+            )
+        else:
+            self.pma = None
+            self.out = nn.Sequential(
+                nn.Linear(d_model, 2 * d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(2 * d_model, out_dim),
+                nn.LayerNorm(out_dim),
+            )
+
+    def _edge_struct(self, edge_type: torch.Tensor) -> torch.Tensor:
+        return self.edge_struct_emb(edge_type)
+
+    def forward(
+        self,
+        xyz: torch.Tensor,
+        finger_ids: torch.Tensor,
+        joint_type_ids: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_type: torch.Tensor,
+        edge_rest_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        H = self.point_embed(xyz, finger_ids, joint_type_ids)
+        edge_struct = self._edge_struct(edge_type).to(H.dtype)
+        attn_bias = self.bias_builder(xyz, edge_index, edge_struct, edge_rest_lengths)
+        for blk in self.blocks:
+            H = blk(H, attn_bias)
+        if self.global_pool:
+            H = self.pma(H)
+            return self.out(H)
+        return self.out(H)
+
+
+class HandEncoderTransformerBiasGlobal(HandEncoderTransformerBiasBase):
     """Legacy Transformer encoder with structural bias pooled into one token."""
+
     def __init__(
         self,
         num_fingers: int,
@@ -555,130 +694,54 @@ class HandEncoderTransformerBiasGlobal(nn.Module):
         dropout: float = 0.1,
         ffn_ratio: int = 2,
     ):
-        super().__init__()
-        self.point_embed = HandPointEmbedding(
+        super().__init__(
             num_fingers=num_fingers,
             num_joint_types=num_joint_types,
+            num_edge_types=num_edge_types,
             d_model=d_model,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            d_struct=d_struct,
             num_frequencies=num_frequencies,
+            out_dim=out_dim,
             dropout=dropout,
-        )
-        self.edge_struct_emb = EdgeStructEmbedding(num_edge_types, d_struct=d_struct)
-        self.bias_builder = EdgeBiasBuilder(d_struct=d_struct)
-
-        self.blocks = nn.ModuleList(
-            [
-                TransformerEncoderLayerBias(
-                    d_model,
-                    n_heads=n_heads,
-                    dropout=dropout,
-                    ffn_ratio=ffn_ratio,
-                )
-                for _ in range(n_layers)
-            ]
+            ffn_ratio=ffn_ratio,
+            global_pool=True,
+            n_heads_pma=n_heads_pma,
         )
 
-        self.pma = PooledMultiheadAttention(d_model=d_model, n_heads=n_heads_pma, dropout=dropout)
-        self.out = nn.Sequential(
-            nn.Linear(d_model, 256),
-            nn.SiLU(),
-            nn.Linear(256, out_dim),
-        )
 
-    def _edge_struct(self, edge_type: torch.Tensor) -> torch.Tensor:
-        return self.edge_struct_emb(edge_type)  # (E, d_struct)
-
-    def forward(
-        self,
-        xyz: torch.Tensor,                 # (B, N, 3)
-        finger_ids: torch.Tensor,          # (B, N)
-        joint_type_ids: torch.Tensor,      # (B, N)
-        edge_index: torch.Tensor,          # (2, E)
-        edge_type: torch.Tensor,           # (E,)
-        edge_rest_lengths: torch.Tensor,   # (E,)
-    ) -> torch.Tensor:
-        H = self.point_embed(xyz, finger_ids, joint_type_ids)      # (B, N, d)
-        edge_struct = self._edge_struct(edge_type)                 # (E, d_struct)
-        attn_bias = self.bias_builder(
-            xyz, edge_index, edge_struct, edge_rest_lengths
-        )                                                           # (B,1,N,N)
-
-        for blk in self.blocks:
-            H = blk(H, attn_bias)
-
-        z = self.pma(H)
-        return self.out(z)
-
-class HandPointTokenEncoderTransformerBias(nn.Module):
+class HandPointTokenEncoderTransformerBias(HandEncoderTransformerBiasBase):
     """Transformer encoder with structural bias that outputs per-point tokens."""
+
     def __init__(
         self,
         num_fingers: int,
         num_joint_types: int,
         num_edge_types: int,
-        d_model: int = 128,          # hidden width inside Transformer
+        d_model: int = 128,
         n_layers: int = 3,
         n_heads: int = 4,
         d_struct: int = 8,
         num_frequencies: int = 10,
-        out_dim: int = 512,          # token dimension per point
+        out_dim: int = 512,
         dropout: float = 0.1,
         ffn_ratio: int = 2,
     ):
-        super().__init__()
-        self.point_embed = HandPointEmbedding(
+        super().__init__(
             num_fingers=num_fingers,
             num_joint_types=num_joint_types,
+            num_edge_types=num_edge_types,
             d_model=d_model,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            d_struct=d_struct,
             num_frequencies=num_frequencies,
+            out_dim=out_dim,
             dropout=dropout,
+            ffn_ratio=ffn_ratio,
+            global_pool=False,
         )
-        self.edge_struct_emb = EdgeStructEmbedding(num_edge_types, d_struct=d_struct)
-        self.bias_builder = EdgeBiasBuilder(d_struct=d_struct)
-
-        self.blocks = nn.ModuleList(
-            [
-                TransformerEncoderLayerBias(
-                    d_model,
-                    n_heads=n_heads,
-                    dropout=dropout,
-                    ffn_ratio=ffn_ratio,
-                )
-                for _ in range(n_layers)
-            ]
-        )
-
-        self.out = nn.Sequential(
-            nn.Linear(d_model, 2 * d_model),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(2 * d_model, out_dim),
-            nn.LayerNorm(out_dim),
-        )
-
-    def _edge_struct(self, edge_type: torch.Tensor) -> torch.Tensor:
-        return self.edge_struct_emb(edge_type)  # (E, d_struct)
-
-    def forward(
-        self,
-        xyz: torch.Tensor,                 # (B, N, 3)
-        finger_ids: torch.Tensor,          # (B, N)
-        joint_type_ids: torch.Tensor,      # (B, N)
-        edge_index: torch.Tensor,          # (2, E)
-        edge_type: torch.Tensor,           # (E,)
-        edge_rest_lengths: torch.Tensor,   # (E,)
-    ) -> torch.Tensor:
-        """
-        Returns:
-            tokens: (B, N, out_dim)
-        """
-        H = self.point_embed(xyz, finger_ids, joint_type_ids)
-        edge_struct = self._edge_struct(edge_type)
-        attn_bias = self.bias_builder(xyz, edge_index, edge_struct, edge_rest_lengths)
-        for blk in self.blocks:
-            H = blk(H, attn_bias)
-        tokens = self.out(H)
-        return tokens
 
 # Factory function
 def build_hand_encoder(
@@ -712,26 +775,39 @@ def build_hand_encoder(
             "num_joint_types": num_joint_types,
             "num_edge_types": num_edge_types,
         }
-        
+
+        valid_kwargs: Dict[str, Any] = {}
+
         # Get the target class to inspect its signature
         try:
             target_cls = hydra.utils.get_class(cfg["_target_"])
             sig = inspect.signature(target_cls)
-            
+
             # Filter args: include only those present in the __init__ signature
             # or if the init accepts **kwargs
-            valid_kwargs = {}
             accepts_kwargs = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
-            
+
             for name, val in candidates.items():
                 if accepts_kwargs or name in sig.parameters:
                     valid_kwargs[name] = val
-            
+
             return hydra.utils.instantiate(cfg, **valid_kwargs)
         except Exception as e:
-            # Fallback or re-raise if inspection fails (e.g. partial function)
-            # But generally trying to instantiate directly is the best next step
-            pass
+            target_name = None
+            if isinstance(cfg, dict):
+                target_name = cfg.get("_target_")
+            else:
+                target_name = getattr(cfg, "_target_", None)
+                if target_name is None and hasattr(cfg, "get"):
+                    target_name = cfg.get("_target_", None)
+            target_name = target_name or "<unknown>"
+            arg_list = ", ".join(sorted(valid_kwargs)) if valid_kwargs else "none"
+            logger.exception(
+                "Failed to instantiate hand encoder target '%s' with auto-injected "
+                "arguments (%s). Falling back to direct hydra.instantiate.",
+                target_name,
+                arg_list,
+            )
         return hydra.utils.instantiate(cfg)
 
     name = str(getattr(cfg, "name", "transformer_bias")).lower()

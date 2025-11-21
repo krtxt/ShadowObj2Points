@@ -1,12 +1,16 @@
 import sys
+from pathlib import Path
 
-sys.path.append("../3rd_party/pointnet2/")
+# _repo_root = Path(__file__).resolve().parents[3]
+# _pn2_path = _repo_root / "3rd_party" / "pointnet2"
+# if _pn2_path.exists() and str(_pn2_path) not in sys.path:
+#     sys.path.append(str(_pn2_path))
 
 import unittest
 
 import torch
 import torch.nn as nn
-from pointnet2_modules import PointnetSAModuleVotes
+from pointnet2.pointnet2_modules import PointnetSAModuleVotes
 from torch.functional import Tensor
 
 
@@ -88,4 +92,3 @@ class Pointnet2Backbone_3sa(nn.Module):
         if self.use_pooling:
             features = self.gap(features)
         return xyz, features
-

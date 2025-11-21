@@ -18,7 +18,6 @@ num_sanity_val_steps: 0
 
 # Logging
 log_every_n_steps: 15
-track_grad_norm: -1  # set to 2 to track L2 norm of gradients (helpful for debugging)
 
 # Profiling
 profiler: null  # "simple" | "advanced" | "pytorch"
@@ -46,7 +45,6 @@ deterministic: false  # 设为true会更慢但可复现
 
 # # 异常检测 (开发阶段使用)                                                                        
 # detect_anomaly: false                                                                            
-# track_grad_norm: -1  # 设为2可跟踪梯度L2范数，-1表示关闭                                         
                                                                                                   
 # # 数据加载器重载                                                                                 
 # reload_dataloaders_every_n_epochs: 0                                                             

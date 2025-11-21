@@ -1,0 +1,13 @@
+# PBD-corrected velocity strategy
+mode: "pbd_corrected"
+kwargs:
+  iters: 4
+  compliance: 0.0
+  tau_min: 0.001
+  use_tangent: false
+# PBD projection matches this strategy
+projection_mode: "pbd"
+projection_kwargs:
+  iters: 4
+  compliance: 0.0
+  max_corr: 0.15

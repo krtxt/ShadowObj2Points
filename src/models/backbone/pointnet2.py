@@ -1,21 +1,21 @@
 import sys
 from pathlib import Path
 
-_repo_root = Path(__file__).resolve().parents[3]
-_pn2_paths = [
-    _repo_root / "3rd_party" / "pointnet2",
-    # _repo_root / "third_party" / "pointnet2",
-]
-for _p in _pn2_paths:
-    _p_str = str(_p)
-    if _p.exists() and _p_str not in sys.path:
-        sys.path.append(_p_str)
+# _repo_root = Path(__file__).resolve().parents[3]
+# _pn2_paths = [
+#     _repo_root / "3rd_party" / "pointnet2",
+#     # _repo_root / "third_party" / "pointnet2",
+# ]
+# for _p in _pn2_paths:
+#     _p_str = str(_p)
+#     if _p.exists() and _p_str not in sys.path:
+#         sys.path.append(_p_str)
 
 import unittest
 
 import torch
 import torch.nn as nn
-from pointnet2_modules import PointnetFPModule, PointnetSAModuleVotes
+from pointnet2.pointnet2_modules import PointnetFPModule, PointnetSAModuleVotes
 from torch.functional import Tensor
 
 
@@ -150,4 +150,3 @@ class Pointnet2Backbone(nn.Module):
         if self.use_pooling:
             features = self.gap(features).squeeze(-1)  # 移除最后一个维度，从[B, 512, 1]变为[B, 512]
         return xyz, features
-

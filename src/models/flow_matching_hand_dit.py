@@ -1,7 +1,7 @@
 """Flow Matching model with Graph-aware DiT for dexterous hand keypoint generation."""
 
 from copy import deepcopy
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -15,6 +15,12 @@ from .components.losses import FlowMatchingLoss
 from .components.hand_encoder import build_hand_encoder
 from .components.graph_dit import build_dit
 from .backbone import build_backbone
+from .components.velocity_strategies import (
+    build_rigid_groups,
+    build_velocity_strategy,
+    build_state_projector,
+)
+from .components.solvers import build_solver
 
 
 class TimestepEmbedding(nn.Module):
@@ -70,9 +76,6 @@ class HandFlowMatchingDiT(L.LightningModule):
         schedule_shift: Shift factor for shift schedule (default 1.0)
         proj_num_iters: Number of edge length projection iterations
         proj_max_corr: Maximum correction per projection step
-        use_ema: Whether to use EMA
-        ema_decay: EMA decay rate
-        val_vis_num_samples: Number of samples to visualize during validation
     """
     def __init__(
         self,
@@ -86,16 +89,15 @@ class HandFlowMatchingDiT(L.LightningModule):
         # Sampling configuration
         sample_num_steps: int = 40,
         sample_solver: str = "euler",
-        sample_schedule: str = "shift",  # [New] Time schedule type
-        schedule_shift: float = 1.0,     # [New] Shift factor (SD3 uses 3.0)
+        sample_schedule: str = "shift",
+        schedule_shift: float = 1.0,
         proj_num_iters: int = 2,
         proj_max_corr: float = 0.2,
-        # EMA configuration
-        use_ema: bool = True,
-        ema_decay: float = 0.999,
-        ema_device: Optional[str] = None,
-        # Validation visualization
-        val_vis_num_samples: int = 0,
+        # ===== added =====
+        velocity_mode: str = "direct",     # ['direct','direct_tangent','goal_kabsch','group_rigid','pbd_corrected','phys_guided']
+        velocity_kwargs: Optional[Dict] = None,
+        state_projection_mode: str = "pbd",# ['none','pbd','rigid','hybrid']
+        state_projection_kwargs: Optional[Dict] = None,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["graph_consts", "backbone", "hand_encoder", "dit"])
@@ -116,10 +118,6 @@ class HandFlowMatchingDiT(L.LightningModule):
         self.num_fingers = num_fingers
         self.num_joint_types = num_joint_types
         self.num_edge_types = num_edge_types
-
-        # Validation visualization config
-        self.val_vis_num_samples = int(val_vis_num_samples)
-        self._val_vis_batches: List[Dict[str, Any]] = []
 
         # Register graph structure as buffers
         self.register_buffer("finger_ids_const", finger_ids)
@@ -161,9 +159,55 @@ class HandFlowMatchingDiT(L.LightningModule):
                 dim=d_model,
             )
 
-        # Timestep embedding and velocity prediction head
+        # Timestep embedding
         self.timestep_embed = TimestepEmbedding(dim=d_model)
-        self.velocity_head = nn.Linear(d_model, 3)
+
+        # ====== rigid groups: prefer provided graph consts, otherwise fallback ======
+        rigid_groups = graph_consts.get("rigid_groups", None)
+        if rigid_groups is not None and len(rigid_groups) > 0:
+            self.rigid_groups = [g.clone().detach().long() for g in rigid_groups]
+        else:
+            self.rigid_groups = build_rigid_groups(self.edge_index, self.N)
+
+        # ====== velocity strategy: use registry/factory ======
+        self.velocity_mode = str(velocity_mode).lower()
+        self.velocity_strategy = build_velocity_strategy(
+            mode=self.velocity_mode,
+            d_model=d_model,
+            edge_index=self.edge_index,
+            rest_lengths=self.edge_rest_lengths,
+            template_xyz=self.template_xyz,
+            groups=self.rigid_groups,
+            kwargs=velocity_kwargs,
+        )
+
+        # ====== state projection for sampling: use registry/factory ======
+        self.state_projection_mode = str(state_projection_mode).lower()
+        self.state_projection_kwargs = dict(state_projection_kwargs or {})
+        
+        # Merge legacy proj_num_iters and proj_max_corr into kwargs if not already set
+        proj_kwargs = dict(self.state_projection_kwargs)
+        if self.state_projection_mode == "pbd":
+            proj_kwargs.setdefault("iters", max(2, proj_num_iters))
+            proj_kwargs.setdefault("max_corr", proj_max_corr)
+        
+        projector_result = build_state_projector(
+            mode=self.state_projection_mode,
+            edge_index=self.edge_index,
+            rest_lengths=self.edge_rest_lengths,
+            template_xyz=self.template_xyz,
+            groups=self.rigid_groups,
+            kwargs=proj_kwargs,
+        )
+        
+        # Handle hybrid mode specially (returns tuple)
+        if isinstance(projector_result, tuple) and projector_result[0] == "hybrid":
+            _, self.sample_rigid, self.sample_xpbd = projector_result
+            self.sample_state_projector = None
+        else:
+            self.sample_state_projector = projector_result
+            self.sample_rigid = None
+            self.sample_xpbd = None
 
         # Loss function
         self.loss_cfg = self._prepare_loss_config(loss_cfg)
@@ -176,17 +220,12 @@ class HandFlowMatchingDiT(L.LightningModule):
 
         # Sampling configuration
         self.sample_num_steps = sample_num_steps
-        self.sample_solver = str(sample_solver).lower()
+        self.sample_solver_name = str(sample_solver).lower()
+        self.solver = build_solver(self.sample_solver_name)
         self.sample_schedule = str(sample_schedule).lower()
         self.schedule_shift = float(schedule_shift)
         self.proj_num_iters = proj_num_iters
         self.proj_max_corr = proj_max_corr
-
-        # EMA & validation visualization
-        self.use_ema = bool(use_ema)
-        self.ema_decay = float(ema_decay)
-        self.ema_device = ema_device
-        self.ema = self._build_ema() if self.use_ema else None
 
     def encode_scene_tokens(self, scene_pc: torch.Tensor) -> torch.Tensor:
         """Encode scene point cloud into tokens.
@@ -276,15 +315,9 @@ class HandFlowMatchingDiT(L.LightningModule):
         scene_pc: torch.Tensor,
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
-        """Predict velocity field conditioned on keypoints, scene, and timestep.
-        
-        Args:
-            keypoints: Hand keypoints of shape (B, N, 3)
-            scene_pc: Scene point cloud of shape (B, P, 3)
-            timesteps: Timestep values of shape (B,) in [0, 1]
-            
-        Returns:
-            Predicted velocity of shape (B, N, 3)
+        """Predict velocity by the selected strategy.
+
+        Keeps the original encoding pathway, but delegates velocity logic to strategy.
         """
         scene_tokens = self.encode_scene_tokens(scene_pc)
         hand_tokens = self.encode_hand_tokens(keypoints)
@@ -295,7 +328,13 @@ class HandFlowMatchingDiT(L.LightningModule):
             temb=time_emb,
             xyz=keypoints,
         )
-        velocity = self.velocity_head(hand_tokens_out)
+        # Delegate:
+        velocity = self.velocity_strategy.predict(
+            model=self,
+            keypoints=keypoints,
+            timesteps=timesteps,
+            hand_tokens_out=hand_tokens_out,
+        )
         return velocity
 
     def _construct_flow_path(
@@ -361,7 +400,7 @@ class HandFlowMatchingDiT(L.LightningModule):
                 self.log("train/nan_loss", 1.0, prog_bar=True, on_step=True, on_epoch=True)
                 return None
 
-            self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+            self.log("train/loss", loss, prog_bar=False, on_step=True, on_epoch=True)
             self.log("train/loss_fm", loss_dict["loss_fm"], prog_bar=False, on_step=True, on_epoch=True)
             self.log("train/loss_tangent", loss_dict["loss_tangent"], prog_bar=False, on_step=True, on_epoch=True)
             return loss
@@ -414,12 +453,25 @@ class HandFlowMatchingDiT(L.LightningModule):
             with torch.no_grad():
                 edge_len_err = self._compute_edge_length_error(target)
             self.log("val/edge_len_err", edge_len_err, prog_bar=False, on_step=False, on_epoch=True)
-            # Collect a few batches for qualitative visualization at epoch end
-            self._maybe_collect_val_vis_batch(batch)
         except Exception as e:
             self.log("val/error_flag", 1.0, prog_bar=True, on_step=False, on_epoch=True)
             self.print(f"Validation step error at batch {batch_idx}: {e}")
             raise
+
+    def _apply_state_projection(self, keypoints: torch.Tensor) -> torch.Tensor:
+        """Apply the configured state projection during sampling."""
+        # Hybrid mode: rigid first, then PBD smoothing
+        if self.sample_rigid is not None and self.sample_xpbd is not None:
+            x = self.sample_rigid(keypoints)
+            x = self.sample_xpbd(x)
+            return x
+        
+        # Other modes (pbd, rigid, none)
+        if self.sample_state_projector is not None:
+            return self.sample_state_projector(keypoints)
+        
+        # None mode or no projector
+        return keypoints
 
     def _project_edge_lengths(self, keypoints: torch.Tensor) -> torch.Tensor:
         """Apply PBD-style edge length projection to satisfy kinematic constraints.
@@ -494,16 +546,24 @@ class HandFlowMatchingDiT(L.LightningModule):
         scene_pc: torch.Tensor,
         num_steps: Optional[int] = None,
         initial_noise: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_trajectory: bool = False,
+        trajectory_indices: Optional[Sequence[int]] = None,
+        trajectory_stride: Optional[int] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[Dict[str, Any]]]]:
         """Generate hand keypoints by integrating the learned flow.
         
         Args:
             scene_pc: Scene point cloud of shape (B, P, 3)
             num_steps: Number of ODE steps (default: self.sample_num_steps)
             initial_noise: Initial keypoints (B, N, 3), sampled from N(0, I) if None
+            return_trajectory: If True, also return snapshots along the flow trajectory
+            trajectory_indices: Optional explicit list of step indices (0..num_steps) to capture
+            trajectory_stride: If provided, capture every N steps in addition to explicit indices
             
         Returns:
-            Generated keypoints of shape (B, N, 3)
+            Generated keypoints of shape (B, N, 3). If ``return_trajectory`` is True,
+            also returns a list of dictionaries ``{\"step\": idx, \"t\": float, \"xyz\": Tensor}``
+            describing captured intermediate states on CPU.
         """
         self.eval()
         device = scene_pc.device
@@ -521,55 +581,72 @@ class HandFlowMatchingDiT(L.LightningModule):
         timesteps = self._generate_timesteps(num_steps, device)
         time_dtype = timesteps.dtype
         
-        solver = str(getattr(self, "sample_solver", "euler")).lower()
+        capture_steps: List[int] = []
+        trajectory_records: List[Dict[str, Any]] = []
+
+        def _record_state(step_idx: int, t_scalar: torch.Tensor, state: torch.Tensor) -> None:
+            trajectory_records.append(
+                {
+                    "step": int(step_idx),
+                    "t": float(t_scalar.item()),
+                    "xyz": state.detach().cpu(),
+                }
+            )
+
+        if return_trajectory:
+            capture_steps = self._build_trajectory_capture_steps(
+                num_steps=num_steps,
+                explicit_indices=trajectory_indices,
+                stride=trajectory_stride,
+            )
+            if 0 in capture_steps:
+                _record_state(0, timesteps[0], keypoints)
         
         for k in range(num_steps):
             t_curr = timesteps[k]
             t_next = timesteps[k + 1]
-            dt = t_next - t_curr  # delta t is now variable
             
-            if solver in ("heun", "rk2"):
-                # Heun's method (RK2): predictor-corrector
-                t_batch_curr = torch.full((B,), t_curr.item(), device=device, dtype=time_dtype)
-                v1 = self.predict_velocity(keypoints, scene_pc, t_batch_curr)
+            # Use solver strategy to take one integration step
+            keypoints = self.solver.step(
+                keypoints=keypoints,
+                velocity_fn=self.predict_velocity,
+                t_curr=t_curr.item(),
+                t_next=t_next.item(),
+                scene_pc=scene_pc,
+            )
                 
-                # Predictor step
-                keypoints_pred = keypoints + dt * v1
-                
-                # Corrector step
-                t_batch_next = torch.full((B,), t_next.item(), device=device, dtype=time_dtype)
-                v2 = self.predict_velocity(keypoints_pred, scene_pc, t_batch_next)
-                
-                keypoints = keypoints + 0.5 * dt * (v1 + v2)
-                
-            elif solver in ("rk4", "runge_kutta4"):
-                # Standard RK4
-                t_batch_curr = torch.full((B,), t_curr.item(), device=device, dtype=time_dtype)
-                v1 = self.predict_velocity(keypoints, scene_pc, t_batch_curr)
+            # Apply kinematic constraints (configurable)
+            keypoints = self._apply_state_projection(keypoints)
 
-                # Half step point logic for RK4 with variable time steps:
-                # t_mid = t_curr + 0.5 * dt
-                half_step_time = (t_curr + 0.5 * dt).item()
-                t_batch_half = torch.full((B,), half_step_time, device=device, dtype=time_dtype)
-                
-                v2 = self.predict_velocity(keypoints + 0.5 * dt * v1, scene_pc, t_batch_half)
-                v3 = self.predict_velocity(keypoints + 0.5 * dt * v2, scene_pc, t_batch_half)
-
-                t_batch_next = torch.full((B,), t_next.item(), device=device, dtype=time_dtype)
-                v4 = self.predict_velocity(keypoints + dt * v3, scene_pc, t_batch_next)
-
-                keypoints = keypoints + (dt / 6.0) * (v1 + 2.0 * v2 + 2.0 * v3 + v4)
-                
-            else:
-                # Default: explicit Euler
-                t_batch = torch.full((B,), t_curr.item(), device=device, dtype=time_dtype)
-                velocity = self.predict_velocity(keypoints, scene_pc, t_batch)
-                keypoints = keypoints + dt * velocity
-                
-            # Apply kinematic constraints (PBD)
-            keypoints = self._project_edge_lengths(keypoints)
+            if return_trajectory:
+                step_idx = k + 1
+                if step_idx in capture_steps:
+                    _record_state(step_idx, t_next, keypoints)
             
+        if return_trajectory:
+            return keypoints, trajectory_records
         return keypoints
+
+    def _build_trajectory_capture_steps(
+        self,
+        num_steps: int,
+        explicit_indices: Optional[Sequence[int]],
+        stride: Optional[int],
+    ) -> List[int]:
+        """Resolve which integration steps to capture for trajectory visualization."""
+        steps: List[int] = []
+        if explicit_indices is not None:
+            steps.extend(int(idx) for idx in explicit_indices)
+        if stride is not None and stride > 0:
+            steps.extend(range(0, num_steps + 1, int(stride)))
+        if not steps:
+            quarter = max(num_steps // 4, 1)
+            steps = [0, min(quarter, num_steps), min(2 * quarter, num_steps), min(3 * quarter, num_steps), num_steps]
+        # Always ensure final step is captured
+        steps.append(num_steps)
+
+        deduped = sorted({int(max(0, min(num_steps, idx))) for idx in steps})
+        return deduped
 
     def configure_optimizers(self):
         """Configure optimizer and learning rate scheduler via Hydra."""
@@ -631,171 +708,3 @@ class HandFlowMatchingDiT(L.LightningModule):
             lambda_val = float(cfg.get("lambda_tangent", lambda_tangent))
             return FlowMatchingLoss(edge_index=self.edge_index, lambda_tangent=lambda_val)
         return FlowMatchingLoss(edge_index=self.edge_index, lambda_tangent=lambda_tangent)
-
-    # -------------------------------------------------------------------------
-    # EMA utilities and validation visualization
-    # -------------------------------------------------------------------------
-    def _build_ema(self):
-        """Create an EMA copy of the model (parameters only)."""
-        with torch.no_grad():
-            ema_model = deepcopy(self)
-            # Drop EMA on the copy to avoid recursion
-            ema_model.ema = None
-            for p in ema_model.parameters():
-                p.requires_grad_(False)
-            if self.ema_device is not None:
-                ema_model.to(self.ema_device)
-        return _ModelEmaWrapper(ema_model, decay=self.ema_decay)
-
-    def on_train_batch_end(self, outputs, batch, batch_idx: int = 0) -> None:
-        if self.ema is not None:
-            if (int(self.global_step) % 4) == 0:
-                self.ema.update(self)
-
-    def on_validation_start(self) -> None:
-        # Reset visualization buffer
-        self._val_vis_batches = []
-        # Swap to EMA weights for evaluation, if enabled
-        if self.ema is not None:
-            self.ema.store(self)
-            self.ema.copy_to(self)
-
-    def on_validation_end(self) -> None:
-        # Restore original weights after evaluation
-        if self.ema is not None:
-            self.ema.restore(self)
-
-    def on_test_start(self) -> None:
-        if self.ema is not None:
-            self.ema.store(self)
-            self.ema.copy_to(self)
-
-    def on_test_end(self) -> None:
-        if self.ema is not None:
-            self.ema.restore(self)
-
-    def _maybe_collect_val_vis_batch(self, batch: Dict[str, Any]) -> None:
-        """Collect a few validation batches for qualitative visualization."""
-        if len(self._val_vis_batches) >= self.val_vis_num_samples:
-            return
-        if "xyz" not in batch:
-            return
-        with torch.no_grad():
-            xyz = batch["xyz"].detach().cpu()
-            scene_pc = batch.get("scene_pc", None)
-            if scene_pc is not None:
-                scene_pc = scene_pc.detach().cpu()
-            self._val_vis_batches.append({"xyz": xyz, "scene_pc": scene_pc})
-
-    def on_validation_epoch_end(self) -> None:
-        if not self._val_vis_batches:
-            return
-        logger: Optional[Logger] = getattr(self, "logger", None)
-        if logger is None:
-            return
-
-        # Use at most val_vis_num_samples samples for visualization
-        num_samples = min(self.val_vis_num_samples, len(self._val_vis_batches))
-        images: List[np.ndarray] = []
-        captions: List[str] = []
-
-        device = self.device
-        for idx in range(num_samples):
-            entry = self._val_vis_batches[idx]
-            gt_xyz = entry["xyz"].to(device)
-            scene_pc = entry["scene_pc"]
-            if scene_pc is None:
-                B = gt_xyz.size(0)
-                scene_pc = torch.zeros(B, 0, 3, device=device, dtype=gt_xyz.dtype)
-            else:
-                scene_pc = scene_pc.to(device)
-
-            with torch.no_grad():
-                pred_xyz = self.sample(scene_pc, num_steps=self.sample_num_steps).detach().cpu()
-                gt_xyz_cpu = gt_xyz.detach().cpu()
-
-            # Only visualize the first element in the batch for this entry
-            img = self._render_hand_pair_image(gt_xyz_cpu[0], pred_xyz[0])
-            images.append(img)
-            captions.append(f"epoch={self.current_epoch}, sample={idx}")
-
-        # Try logger.log_image if available (e.g., WandbLogger), otherwise fall back to TensorBoard
-        if hasattr(logger, "log_image"):
-            logger.log_image(key="val/hand_samples", images=images, caption=captions, step=self.current_epoch)
-        elif isinstance(logger, TensorBoardLogger):
-            for i, img in enumerate(images):
-                logger.experiment.add_image(
-                    f"val/hand_samples/{i}",
-                    img,
-                    global_step=self.current_epoch,
-                    dataformats="HWC",
-                )
-
-    def _render_hand_pair_image(self, gt_xyz: torch.Tensor, pred_xyz: torch.Tensor) -> np.ndarray:
-        """Render a side-by-side image of GT vs predicted hand keypoints."""
-        gt = gt_xyz.detach().cpu().numpy()
-        pred = pred_xyz.detach().cpu().numpy()
-        edges = self.edge_index.detach().cpu().numpy()
-
-        fig = plt.figure(figsize=(6, 3))
-
-        def _plot(subplot_idx: int, pts: np.ndarray, title: str, color_points: str, color_edges: str):
-            ax = fig.add_subplot(1, 2, subplot_idx, projection="3d")
-            ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=color_points, s=10)
-            for e in edges.T:
-                i, j = int(e[0]), int(e[1])
-                xs = [pts[i, 0], pts[j, 0]]
-                ys = [pts[i, 1], pts[j, 1]]
-                zs = [pts[i, 2], pts[j, 2]]
-                ax.plot(xs, ys, zs, color=color_edges, linewidth=0.5)
-            ax.set_title(title)
-            ax.set_axis_off()
-
-        _plot(1, gt, "GT", "#1f77b4", "#1f77b4")
-        _plot(2, pred, "Pred", "#d62728", "#d62728")
-        plt.tight_layout()
-
-        fig.canvas.draw()
-        width, height = fig.canvas.get_width_height()
-        buffer = fig.canvas.buffer_rgba()
-        image = np.frombuffer(buffer, dtype=np.uint8).reshape(height, width, 4)[..., :3]
-        plt.close(fig)
-        return image
-
-
-class _ModelEmaWrapper:
-    """Lightweight EMA wrapper storing a non-trainable copy of the model."""
-
-    def __init__(self, ema_model: nn.Module, decay: float = 0.999):
-        self.ema_model = ema_model
-        self.decay = float(decay)
-        self._backup: Optional[Dict[str, torch.Tensor]] = None
-
-    @torch.no_grad()
-    def update(self, model: nn.Module) -> None:
-        ema_state = self.ema_model.state_dict()
-        model_state = model.state_dict()
-        for k, ema_v in ema_state.items():
-            if k not in model_state:
-                continue
-            model_v = model_state[k].detach()
-            if not torch.is_floating_point(ema_v):
-                ema_v.copy_(model_v.to(ema_v.device))
-                continue
-            model_v = model_v.to(ema_v.device)
-            ema_v.copy_(ema_v * self.decay + (1.0 - self.decay) * model_v)
-
-    @torch.no_grad()
-    def store(self, model: nn.Module) -> None:
-        self._backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
-
-    @torch.no_grad()
-    def copy_to(self, model: nn.Module) -> None:
-        model.load_state_dict(self.ema_model.state_dict(), strict=False)
-
-    @torch.no_grad()
-    def restore(self, model: nn.Module) -> None:
-        if self._backup is None:
-            return
-        model.load_state_dict(self._backup, strict=False)
-        self._backup = None

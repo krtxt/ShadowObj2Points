@@ -141,9 +141,7 @@ class GraphSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
 
         self.use_sdpa = bool(use_sdpa) and _SDPA_AVAILABLE
-        self.to_q = nn.Linear(dim, dim, bias=True)
-        self.to_k = nn.Linear(dim, dim, bias=True)
-        self.to_v = nn.Linear(dim, dim, bias=True)
+        self.to_qkv = nn.Linear(dim, dim * 3, bias=True)
         self.to_out = nn.Linear(dim, dim, bias=True)
 
         self.dropout = dropout
@@ -178,9 +176,11 @@ class GraphSelfAttention(nn.Module):
         h = self.num_heads
         dh = self.head_dim
 
-        q = self.to_q(x).view(B, N, h, dh).transpose(1, 2)
-        k = self.to_k(x).view(B, N, h, dh).transpose(1, 2)
-        v = self.to_v(x).view(B, N, h, dh).transpose(1, 2)
+        qkv = self.to_qkv(x).view(B, N, 3, h, dh)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
         
         if self.qk_norm:
             q = self.q_norm(q)
@@ -202,11 +202,7 @@ class GraphSelfAttention(nn.Module):
             attn_bias = attn_bias.unsqueeze(1)  # (B,1,N,N)
             
         # Ensure broadcasting capability
-        if attn_bias.size(1) == 1:
-            # SDPA usually handles (B, 1, N, N) broadcasting automatically,
-            # but explicit expand ensures safety.
-            attn_bias = attn_bias.expand(batch, heads, seq_len, seq_len)
-        
+        # Let SDPA handle broadcasting from (B,1,N,N) -> (B,H,N,N) to save memory.
         return attn_bias.to(dtype=dtype)
 
     def _sdpa_attention(
@@ -352,21 +348,6 @@ class CrossAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, N, D)
         return self.to_out(out)
 
-def _compute_pairwise_edge_geometry(
-    xyz: torch.Tensor,              # (B, N, 3)
-    edge_index: torch.Tensor,       # (2, E)
-    edge_rest_lengths: torch.Tensor # (E,)
-):
-    """Compute per-edge distances relative to their rest length."""
-    i, j = edge_index   # (E,)
-    diff = xyz[:, i, :] - xyz[:, j, :]           # (B,E,3)
-    dist2 = (diff ** 2).sum(-1, keepdim=True)   # (B,E,1)
-    dist = torch.sqrt(dist2 + 1e-9)             # (B,E,1)
-    rest = edge_rest_lengths.view(1, -1, 1).to(xyz)  # (1,E,1)
-    delta = (dist - rest) / (rest + 1e-9)       # (B,E,1)
-    return dist, dist2, delta
-
-
 class GraphAttentionBias(nn.Module):
     """Map graph structure and current coordinates to an attention bias tensor.
 
@@ -436,7 +417,7 @@ class HandSceneGraphDiTBlock(nn.Module):
         ff_bias: bool = True,
         qk_norm: bool = False,
         qk_norm_type: str = "layer",
-        skip: bool = False,
+        norm_type: str = "layer",
     ):
         super().__init__()
         self.dim = dim
@@ -471,11 +452,17 @@ class HandSceneGraphDiTBlock(nn.Module):
         )
 
         # 2. Norms (elementwise_affine=False because AdaLN handles parameters)
-        # Using RMSNorm is preferred if qk_norm_type is RMS, but standard DiT often uses LayerNorm for the block structure
-        # even if QK uses RMS. To be safe/standard, LayerNorm is the default for AdaLN blocks.
-        self.norm1 = FP32LayerNorm(dim, elementwise_affine=False, eps=norm_eps)
-        self.norm2 = FP32LayerNorm(dim, elementwise_affine=False, eps=norm_eps)
-        self.norm3 = FP32LayerNorm(dim, elementwise_affine=False, eps=norm_eps)
+        if norm_type == "rms":
+            # RMSNorm generally works well with elementwise_affine=True, but AdaLN modulates it.
+            # Standard DiT uses LayerNorm(affine=False). If using RMSNorm, we usually keep it affine=False
+            # and let AdaLN handle scaling/shifting.
+            norm_cls = RMSNorm
+        else:
+            norm_cls = FP32LayerNorm
+
+        self.norm1 = norm_cls(dim, elementwise_affine=False, eps=norm_eps)
+        self.norm2 = norm_cls(dim, elementwise_affine=False, eps=norm_eps)
+        self.norm3 = norm_cls(dim, elementwise_affine=False, eps=norm_eps)
 
         # 3. AdaLN-Zero Modulation Projection
         # 9 params: (shift, scale, gate) for SelfAttn, CrossAttn, FFN
@@ -488,32 +475,17 @@ class HandSceneGraphDiTBlock(nn.Module):
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-        # Optional long skip connection
-        if skip:
-            self.skip_norm = FP32LayerNorm(2 * dim, eps=norm_eps, elementwise_affine=True)
-            self.skip_linear = nn.Linear(2 * dim, dim)
-        else:
-            self.skip_norm = None
-            self.skip_linear = None
-
     def forward(
         self,
         hand_tokens: torch.Tensor,            # (B, N, D)
         scene_tokens: Optional[torch.Tensor], # (B, K, D_scene); may be None
         temb: torch.Tensor,                   # (B, D) flow embedding already projected to D
         graph_attn_bias: Optional[torch.Tensor] = None,  # (B,1,N,N) or (B,N,N)
-        skip: Optional[torch.Tensor] = None,  # (B,N,D) optional long skip
     ) -> torch.Tensor:
         """
         Returns:
             hand_tokens_out: (B, N, D)
         """
-        # Optional long skip injection at the beginning
-        if self.skip_linear is not None and skip is not None:
-            cat = torch.cat([hand_tokens, skip], dim=-1)
-            cat = self.skip_norm(cat)
-            hand_tokens = self.skip_linear(cat)
-
         # 1. Generate Modulation Parameters
         # chunk(9, dim=1) -> 9 tensors of shape (B, D)
         shift_msa, scale_msa, gate_msa, \
@@ -585,11 +557,11 @@ class HandSceneGraphDiT(nn.Module):
         graph_bias: Optional[GraphAttentionBias] = None,
         dropout: float = 0.0,
         activation_fn: str = "geglu",
-        qk_norm: bool = True,
+        qk_norm: bool = False,
         qk_norm_type: str = "layer", # 'layer' or 'rms'
+        norm_type: str = "layer",    # 'layer' or 'rms'
         ff_inner_dim: Optional[int] = None,
         ff_bias: bool = True,
-        skip: bool = False,
         norm_eps: float = 1e-6,
     ):
         super().__init__()
@@ -609,7 +581,7 @@ class HandSceneGraphDiT(nn.Module):
                     ff_bias=ff_bias,
                     qk_norm=qk_norm,
                     qk_norm_type=qk_norm_type,
-                    skip=skip,
+                    norm_type=norm_type,
                     norm_eps=norm_eps,
                 )
                 for _ in range(depth)
@@ -651,7 +623,6 @@ class HandSceneGraphDiT(nn.Module):
                 scene_tokens=scene_tokens,
                 temb=temb,
                 graph_attn_bias=attn_bias,
-                skip=None,
             )
             
         h = self.final_layer(h, temb)
@@ -714,11 +685,11 @@ def build_dit(
     cross_attention_dim = _get("cross_attention_dim", None)
     ff_inner_dim = _get("ff_inner_dim", None)
     ff_bias = _get("ff_bias", True)
-    skip = _get("skip", False)
     dropout = _get("dropout", 0.0)
     activation_fn = _get("activation_fn", "geglu")
     qk_norm = _get("qk_norm", True)
     qk_norm_type = _get("qk_norm_type", "layer")
+    norm_type = _get("norm_type", "layer")
 
     def _subcfg_value(node: Any, key: str, default):
         if node is None: return default
@@ -757,9 +728,9 @@ def build_dit(
         activation_fn=activation_fn,
         qk_norm=qk_norm,
         qk_norm_type=qk_norm_type,
+        norm_type=norm_type,
         ff_inner_dim=ff_inner_dim,
         ff_bias=ff_bias,
-        skip=skip,
     )
 
 if __name__ == "__main__":

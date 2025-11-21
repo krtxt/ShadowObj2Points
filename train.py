@@ -9,7 +9,7 @@ Example usage:
 """
 
 import logging
-import inspect
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -26,59 +26,14 @@ from omegaconf import DictConfig, OmegaConf
 from rich.logging import RichHandler
 from rich.traceback import install as install_rich_traceback
 from rich.console import Console
+from utils.logging_utils import setup_rich_logging
 
-from callbacks.grad_norm_logger import GradNormLogger
-from datamodules.HandEncoderDataModule import HandEncoderDataModule
-
+# Ensure src is in path for module resolution
 PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT / "src") not in sys.path:
+    sys.path.append(str(PROJECT_ROOT / "src"))
+
 torch.set_float32_matmul_precision("high")
-
-
-def setup_rich_logging(level: int = logging.INFO) -> None:
-    """Configure rich logging for cleaner console output."""
-    # Suppress logging on non-zero ranks by default
-    logging.getLogger().setLevel(logging.ERROR)
-
-    @rank_zero_only
-    def _setup_on_rank_zero():
-        log_format = (
-            "[%(asctime)s] {%(filename)s:%(lineno)d} "
-            "[%(funcName)s] <%(levelname)s> - %(message)s"
-        )
-        date_format = "%Y-%m-%d %H:%M:%S"
-
-        install_rich_traceback(show_locals=False)
-        handler = RichHandler(
-            rich_tracebacks=True,
-            markup=True,
-            show_time=False,
-            show_level=False,
-            show_path=False,
-        )
-        handler.setFormatter(logging.Formatter(log_format, datefmt=date_format))
-        
-        # Get current root logger handlers (typically includes Hydra's FileHandler)
-        root_logger = logging.getLogger()
-        existing_handlers = root_logger.handlers
-        
-        # Filter out existing stream handlers to prevent duplicates/conflict with RichHandler
-        # but PRESERVE FileHandlers (which write to train.log)
-        handlers_to_keep = [
-            h for h in existing_handlers 
-            if not isinstance(h, logging.StreamHandler) or isinstance(h, logging.FileHandler)
-        ]
-        
-        # Configure logging with both the new RichHandler and preserved handlers
-        logging.basicConfig(
-            level=level, 
-            handlers=[handler] + handlers_to_keep, 
-            force=True
-        )
-        
-        for noisy in ["matplotlib", "numba", "PIL", "urllib3", "asyncio", "botocore"]:
-            logging.getLogger(noisy).setLevel(logging.WARNING)
-    
-    _setup_on_rank_zero()
 
 
 def setup_callbacks(cfg: DictConfig) -> List[Callback]:
@@ -115,21 +70,12 @@ def instantiate_datamodule(cfg: DictConfig, log: logging.Logger) -> L.LightningD
     if not hasattr(cfg, "datamodule"):
         raise ValueError("Config must define a 'datamodule' group")
 
-    if "_target_" in cfg.datamodule:
-        datamodule = hydra_instantiate(cfg.datamodule, _recursive_=False)
-    else:
-        # Fallback: Manual instantiation for HandEncoderDataModule
-        dm_cfg = cfg.datamodule
-        dm_cfg_dict = OmegaConf.to_container(dm_cfg, resolve=True) if isinstance(dm_cfg, DictConfig) else dict(dm_cfg)
-        
-        # Dynamically filter arguments based on __init__ signature
-        sig = inspect.signature(HandEncoderDataModule)
-        allowed_keys = set(sig.parameters.keys())
-        dm_kwargs = {k: v for k, v in dm_cfg_dict.items() if k in allowed_keys}
-        
-        datamodule = HandEncoderDataModule(**dm_kwargs)
+    # Use Hydra instantiation directly
+    # This requires the config to have a _target_ field and correct parameters
+    datamodule = hydra_instantiate(cfg.datamodule, _recursive_=False)
 
     log.info(f"Datamodule: [bold]{datamodule.__class__.__name__}[/]")
+
     datamodule.setup(stage="fit")
     
     if not hasattr(datamodule, "get_graph_constants"):
@@ -243,20 +189,26 @@ def main(cfg: DictConfig) -> None:
     log = logging.getLogger("train_flow_matching")
     validate_core_config(cfg)
     
-    log.info(f"{'=' * 80}\n[bold italic #FF33AA]Training Configuration:[/]\n{'=' * 80}")
+    # log.info(f"{'=' * 80}\n[bold italic #FF33AA]Training Configuration:[/]\n{'=' * 80}")
+    console.print("")
+    console.rule("🌑 [bold italic #FF33AA] Training Configuration:[/]")
+    console.print("")
     log.info(OmegaConf.to_yaml(cfg))
-    log.info("=" * 80)
     
     apply_seed(cfg, log)
     ensure_output_dir(cfg, log)
     
     # Initialize DataModule
-    console.rule("[bold #33FF00]🚀 Initializing DataModule[/]")
+    console.print("")
+    console.rule("😈 [bold italic #33FF00] Initializing DataModule[/]")
+    console.print("")
     datamodule = instantiate_datamodule(cfg, log)
     graph_consts = extract_graph_constants(datamodule, log)
     
     # Initialize Model
-    console.rule("[bold #FF33CC]🔮 Initializing Flow Matching Hand DiT model[/]")
+    console.print("")
+    console.rule("🔮 [bold italic #FF33CC] Initializing Flow Matching Hand DiT model[/]")
+    console.print("")
     if not hasattr(cfg.get("model", {}), "_target_"):
         raise ValueError("cfg.model must specify a Hydra '_target_'")
 
@@ -280,21 +232,25 @@ def main(cfg: DictConfig) -> None:
     log.info(f"Trainable parameters: [bold #33AAFF]{trainable_params:,}[/]")
     
     # Callbacks & Logger
-    console.rule("[bold #9900CC]🛠️  Setting up Callbacks & Logger[/]")
+    console.print("")
+    console.rule("🕸️ [bold italic #9900CC] Setting up Callbacks & Logger[/]")
+    # console.print("")
     callbacks = setup_callbacks(cfg)
     for cb in callbacks:
         log.info(f"  - [bold]{cb.__class__.__name__}[/]")
         
     logger = setup_logger(cfg)
     if logger:
-        log.info(f"Logger: [bold]{logger.__class__.__name__}[/]")
+        log.info(f"  - [bold]{logger.__class__.__name__}[/]")
     else:
         log.warning("No logger configured")
     
     # Trainer
-    console.rule("[bold #3300FF]🦄  Initializing Trainer[/]")
+    console.print("")
+    console.rule("🦄 [bold italic #3300FF] Initializing Trainer[/]")
+    console.print("")
     trainer_kwargs = OmegaConf.to_container(cfg.trainer, resolve=True)
-    track_grad_norm = trainer_kwargs.pop("track_grad_norm", -1)
+    # track_grad_norm logic removed as it is now handled via callbacks config
 
     # Configure Profiler
     if trainer_kwargs.get("profiler") == "advanced":
@@ -305,13 +261,8 @@ def main(cfg: DictConfig) -> None:
             filename="profile_report"
         )
 
-    # Attach GradNormLogger
-    try:
-        if (gn_value := float(track_grad_norm)) > 0:
-            callbacks.append(GradNormLogger(norm_type=gn_value))
-            log.info(f"  - [bold]GradNormLogger[/] (p={gn_value})")
-    except (ValueError, TypeError):
-        pass
+    # Manual GradNormLogger attachment removed. 
+    # Use 'callbacks: grad_norm' in config if needed.
 
     trainer = Trainer(**trainer_kwargs, callbacks=callbacks, logger=logger)
     log_trainer_summary(trainer, cfg, log)
@@ -326,12 +277,14 @@ def main(cfg: DictConfig) -> None:
     
     if ckpt_path is None:
         ckpt_path = find_last_checkpoint(cfg, log)
-
-    console.rule("[bold #CC9900]✨ Starting Training[/]")
+    console.print("")
+    console.rule("🖤 [bold italic #CC9900] Starting Training[/]")
+    console.print("")
     
     trainer.fit(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
-    
-    console.rule("[bold rainbow]🎉 Training Completed![/]")
+    console.print("")
+    console.rule("🗡️ [bold italic #EEDD00] Training Completed![/]")
+    console.print("")
     log_best_checkpoint(trainer, log)
     maybe_save_final_config(cfg, log)
 

@@ -36,6 +36,16 @@ hand_encoder: ${hand_encoder}
 dit: ${dit}
 
 # -----------------------------------------------------------------------------
+# 2.1 Velocity Strategy & State Projection
+# -----------------------------------------------------------------------------
+# Controlled by configs/velocity_strategy/*.yaml
+velocity_mode: ${velocity_strategy.mode}
+velocity_kwargs: ${velocity_strategy.kwargs}
+state_projection_mode: ${velocity_strategy.projection_mode}
+state_projection_kwargs: ${velocity_strategy.projection_kwargs}
+
+
+# -----------------------------------------------------------------------------
 # 3. Flow Matching loss
 # -----------------------------------------------------------------------------
 # FlowMatchingLoss is defined in src/models/components/losses.py and receives
@@ -87,17 +97,4 @@ proj_num_iters: 2
 # proj_max_corr: 每次投影的最大相对修正幅度（防止数值不稳定）
 proj_max_corr: 0.2
 
-# -----------------------------------------------------------------------------
-# 6. EMA & validation visualization (implemented in module)
-# -----------------------------------------------------------------------------
-# use_ema: 是否在训练过程中维护 EMA 模型（推荐开启）
-use_ema: true
-
-# ema_decay: EMA 衰减系数，越接近 1.0 越平滑
-ema_decay: 0.999
-
-# ema_device: 可选，将 EMA 权重放在特定设备上（如 "cpu"）
-ema_device: cpu
-
-# val_vis_num_samples: 每个 validation epoch 可视化的样本数量
-val_vis_num_samples: 0
+# EMA & Visualization moved to callbacks

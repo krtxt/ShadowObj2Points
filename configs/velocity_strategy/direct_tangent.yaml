@@ -1,0 +1,7 @@
+# Direct prediction with tangent space projection
+mode: "direct_tangent"
+kwargs:
+  use_tangent: true
+# Default projection
+projection_mode: "pbd"
+projection_kwargs: {}

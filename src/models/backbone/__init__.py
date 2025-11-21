@@ -23,14 +23,14 @@ def build_backbone(backbone_cfg):
     elif backbone_cfg.name.lower() == "pointnet2":
         if Pointnet2Backbone is None:
             raise ImportError(
-                "Backbone 'pointnet2' requires the 'pointnet2_modules' package. "
+                "Backbone 'pointnet2' requires the 'pointnet2' package. "
                 "Install it or choose a different backbone."
             )
         return Pointnet2Backbone(backbone_cfg)
     elif backbone_cfg.name.lower() == "pointnet2_3sa":
         if Pointnet2Backbone_3sa is None:
             raise ImportError(
-                "Backbone 'pointnet2_3sa' requires the 'pointnet2_modules' package. "
+                "Backbone 'pointnet2_3sa' requires the 'pointnet2' package. "
                 "Install it or choose a different backbone."
             )
         return Pointnet2Backbone_3sa(backbone_cfg)

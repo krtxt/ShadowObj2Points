@@ -14,9 +14,6 @@ cross_attention_dim: null
 ff_inner_dim: null   # Defaults to 4 * d_model when null
 ff_bias: true
 
-# Enable long-skip concatenation inside each DiT block (default: false)
-skip: false
-
 # Dropout applied in attention and FFN blocks
 dropout: 0.0
 
@@ -26,6 +23,10 @@ activation_fn: geglu
 
 # Whether to apply qk normalization in attention
 qk_norm: false
+qk_norm_type: layer
+
+# Normalization type for the main blocks: 'layer' | 'rms'
+norm_type: layer
 
 # Structural bias configuration used by GraphAttentionBias
 graph_bias:

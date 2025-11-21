@@ -32,22 +32,6 @@ model_summary:
   _target_: lightning.pytorch.callbacks.RichModelSummary
   max_depth: 2
 
-# # Progress Bar
-# rich_progress_bar:
-#   _target_: lightning.pytorch.callbacks.RichProgressBar
-#   leave: true
-#   refresh_rate: 1
-#   theme:
-#     _target_: lightning.pytorch.callbacks.progress.rich_progress.RichProgressBarTheme
-#     description: "bold italic #FF33AA"
-#     progress_bar: "#33AAFF"
-#     progress_bar_finished: "#55FF55"
-#     progress_bar_pulse: "#FFAA33"
-#     batch_progress: "bold #FF33AA"
-#     time: "#AAAAAA"
-#     processing_speed: "#FFD700"
-#     metrics: "bold #33FFAA"
-
 # Progress Bar
 rich_progress_bar:
   _target_: lightning.pytorch.callbacks.RichProgressBar
@@ -55,41 +39,47 @@ rich_progress_bar:
   refresh_rate: 1
   theme:
     _target_: lightning.pytorch.callbacks.progress.rich_progress.RichProgressBarTheme
-    # 描述 (Description): 深粉/洋红
-    description: "bold italic #FF1493"
-    # 进度条 (Progress Bar): 浅粉/樱花粉 (未完成/正在进行部分)
-    progress_bar: "#FFC0CB"
-    # 进度条完成 (Progress Bar Finished): 艳粉/玫瑰红 (已完成部分)
-    progress_bar_finished: "#FF69B4"
-    # 进度条脉冲 (Progress Bar Pulse): 亮粉/热粉 (用于不确定状态或动画)
-    progress_bar_pulse: "#FF007F"
-    # 批次进度 (Batch Progress): 深粉/洋红
-    batch_progress: "bold #FF1493"
-    # 时间 (Time): 柔和的灰色 (保持中立，但可以考虑更柔和的粉色系)
-    time: "#F0E6F0" # 保持原样，或改为浅灰粉: "#F0E6F0"
-    # 处理速度 (Processing Speed): 金色调 (作为高亮，或者改为金色调的粉色)
-    processing_speed: "#FFD700" # 保持原样，或改为淡粉橘: "#FFB6C1"
-    # 指标 (Metrics): 浅玫瑰红 (用于显示指标数据)
-    metrics: "bold #FFB6C1"
+    description: "bold italic #FF00FF"
+    progress_bar: "#6A0DAD"
+    progress_bar_finished: "#FF0000"
+    progress_bar_pulse: "#00FF00"
+    batch_progress: "bold #FF00FF"
+    time: "#9370DB"
+    processing_speed: "#00FFFF"
+    metrics: "bold #FFA500"
 
 # Image Logger
-image_logger:
-  _target_: callbacks.image_logger.ImageLogger
-  num_samples: 4
-  log_key: "val/hand_samples"
+# image_logger:
+#   _target_: callbacks.image_logger.ImageLogger
+#   num_samples: 4
+#   log_key: "val/hand_samples"
+image_logger: null
 
 # Device Stats Monitor (GPU/CPU usage)
-# Set to null to disable. Use a lightweight version by default.
-device_stats_monitor:
-  _target_: callbacks.light_device_stats_monitor.LightDeviceStatsMonitor
-  log_every_n_train_batches: 50
-  log_every_n_val_batches: 50
-  log_every_n_test_batches: 50
-  prefix: "device"
+device_stats_monitor: null
+# device_stats_monitor:
+#   _target_: callbacks.light_device_stats_monitor.LightDeviceStatsMonitor
+#   log_every_n_train_batches: 50
+#   log_every_n_val_batches: 50
+#   log_every_n_test_batches: 50
+#   prefix: "device"
 
 # Stochastic Weight Averaging
-# Set to null to disable. 
-# Enable by providing:
-#   _target_: lightning.pytorch.callbacks.StochasticWeightAveraging
-#   swa_lrs: 1e-2
 stochastic_weight_averaging: null
+
+# New Callbacks
+ema:
+  _target_: callbacks.ema.ModelEma
+  decay: 0.999
+  ema_device: null
+  update_every_n_steps: 20
+
+# hand_vis:
+#   _target_: callbacks.visualization.HandVisCallback
+#   num_samples: 4
+#   sample_num_steps: 20
+
+# Gradient Norm Logger (Uncomment to enable)
+# grad_norm:
+#   _target_: callbacks.grad_norm_logger.GradNormLogger
+#   norm_type: 2.0

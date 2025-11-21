@@ -18,11 +18,11 @@ from pathlib import Path
 from typing import Tuple, Optional
 from types import SimpleNamespace
 
-# Add 3rd_party/pointnet2 to sys.path to enable importing the CUDA-optimized version
-_repo_root = Path(__file__).resolve().parents[3]
-_pn2_path = _repo_root / "3rd_party" / "pointnet2"
-if _pn2_path.exists() and str(_pn2_path) not in sys.path:
-    sys.path.append(str(_pn2_path))
+# # Add 3rd_party/pointnet2 to sys.path to enable importing the CUDA-optimized version
+# _repo_root = Path(__file__).resolve().parents[3]
+# _pn2_path = _repo_root / "3rd_party" / "pointnet2"
+# if _pn2_path.exists() and str(_pn2_path) not in sys.path:
+#     sys.path.append(str(_pn2_path))
 
 import torch
 import torch.nn as nn
@@ -30,7 +30,7 @@ import torch.nn as nn
 from .ptv3.ptv3 import PointTransformerV3
 from .ptv3_backbone import convert_to_ptv3_pc_format
 
-from pointnet2_utils import furthest_point_sample as farthest_point_sample
+from pointnet2.pointnet2_utils import furthest_point_sample as farthest_point_sample
 
 
 class PTv3SparseEncoder(nn.Module):
@@ -771,4 +771,3 @@ class PTv3SparseEncoder(nn.Module):
             token_dim=self.output_dim,
             num_heads=8
         )
-

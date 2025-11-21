@@ -1,0 +1,6 @@
+mode: "phys_guided"
+kwargs:
+  eta: 0.5
+  use_tangent: true
+projection_mode: "pbd"
+projection_kwargs: {}

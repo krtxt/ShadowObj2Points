@@ -8,6 +8,7 @@ defaults:
   - backbone: ptv3_sparse
   - hand_encoder: transformer_bias
   - dit: graph_dit_default
+  - velocity_strategy: group_rigid
   - loss: flow_matching
   - optimizer: adamw
   - trainer: default
@@ -50,4 +51,13 @@ hydra:
   job:
     chdir: true  # Change working directory to output directory
     env_set:
-      PYTHONPATH: ${hydra:runtime.cwd}/src:${oc.env:PYTHONPATH,}
+      PYTHONPATH: ${hydra:runtime.cwd}/src:${oc.env:PYTHONPATH,""}
+
+
+
+# python train.py experiments=profiler batch_size=256 experiment_name=exp_1121_group_rigid  velocity_strategy=group_rigid 
+# python train.py experiments=profiler batch_size=256 experiment_name=exp_1121_pbd_corrected   velocity_strategy=pbd_corrected  
+# python train.py experiments=profiler batch_size=256 experiment_name=exp_1121_phys_guided   velocity_strategy=phys_guided  
+# python train.py experiments=profiler batch_size=256 experiment_name=exp_1121_direct  velocity_strategy=direct 
+# python train.py experiments=profiler batch_size=256 experiment_name=exp_1121_direct_tangent  velocity_strategy=direct_tangent 
+# python train.py experiments=profiler batch_size=256 experiment_name=exp_1121_goal_kabsch  velocity_strategy=goal_kabsch 

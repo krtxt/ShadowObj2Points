@@ -2,13 +2,13 @@
 # train.py.instantiate_datamodule() construct HandEncoderDataModule
 # with this config as data_cfg. This sidesteps occasional target
 # resolution/import issues while keeping all parameters here.
-# _target_: datamodules.HandEncoderDataModule.HandEncoderDataModule
+_target_: datamodules.HandEncoderDataModule
 name: handencoder_dm_dex_debug
 mode: dexgraspnet
 
 # HandEncoderDataModule constructor args
 batch_size: ${batch_size}
-num_workers: 8
+num_workers: 16
 pin_memory: true
 prefetch_factor: 2
 persistent_workers: true

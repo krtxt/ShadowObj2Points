@@ -1,0 +1,64 @@
+# configs/experiments/exp_1123_deterministic_regression.yaml
+# @package _global_
+
+# defaults:
+#   # 用新的 deterministic 模型替换 flow 模型
+#   - override / model: deterministic_hand_dit
+#   # loss 仍然用同一个 group (loss: flow_matching)，但我们在下面覆盖里面的字段
+#   # 如果你之后单独做一个 loss 组，也可以在这里写 override / loss: xxx
+
+# 实验名可以改一下，方便区分
+experiment_name: exp_1123_deterministic_regression
+
+# 模型这边只要确认 use_norm_data = true（其实在 model/deterministic_hand_dit.yaml 里已经设了）
+model:
+  use_norm_data: true
+  d_model: 512
+
+# 覆盖 loss 配置：
+# - 不再使用 lambda_tangent
+# - 新增 lambda_pos / lambda_bone / lambda_collision
+# - 设定 collision 的 margin & subsample 数
+# - 禁用 flow metrics，只保留 recon metrics
+loss:
+  # === 新的回归 + 结构正则项 ===
+  lambda_pos: 1.0           # xyz L1 主 loss 权重
+  lambda_bone: 0.1          # 骨长 regularization 权重（edge_len_err^2）
+  lambda_collision: 0.05    # 碰撞 / 穿透 penalty 权重
+
+  # 碰撞相关超参（单位和你的世界坐标一致，DexGraspNet 大概是米）
+  collision_margin: 0.002        # 手点到物体 < 2mm 时开始罚
+  collision_max_scene_points: 2048  # 计算 cdist 时的场景点数上限
+
+  # === 验证指标：只用 recon，不再算 flow ===
+  val_metrics:
+    flow:
+      enabled: false        # 关闭 flow 相关 metric
+    recon:
+      enabled: true         # 保持原有重建指标
+      smooth_l1:
+        enabled: true
+        weight: 1.0
+        beta: 0.01
+      chamfer:
+        enabled: true
+        weight: 1.0
+        use_pytorch3d: true
+      direction:
+        enabled: true
+        weight: 1.0
+        mode: cos
+        eps: 1.0e-06
+      edge_len:
+        enabled: true
+        weight: 1.0
+        eps: 1.0e-06
+
+# 训练器一般可以直接复用，如果你想收敛快一点可以把 epoch 数先缩短试试
+trainer:
+  max_epochs: 300           # 先训短一点试水，觉得 ok 再拉到 500 也行
+  check_val_every_n_epoch: 5
+  num_sanity_val_steps: 0
+
+# 可选：刚开始 debug 建议先关掉 compile，稳定后再打开
+# compile: false

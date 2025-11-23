@@ -1,4 +1,4 @@
-_target_: datamodules.HandEncoderDataModule.HandEncoderDataModule
+_target_: datamodules.HandEncoderDataModule
 name: handencoder_dm_bodex_debug
 mode: bodexhshadow
 

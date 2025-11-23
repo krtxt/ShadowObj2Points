@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any, Union, Callable
 
-# Try importing pytorch3d
+# Optional Import: PyTorch3D
+# Handle missing dependency gracefully to ensure portability across environments.
 try:
     from pytorch3d.transforms import rotation_6d_to_matrix
 except ImportError:
@@ -11,241 +12,293 @@ except ImportError:
 
 
 # =============================================================================
-# Geometric & Graph Utilities
+# Section 1: Geometric & Graph Primitives
+# Core mathematical transformations and topological utilities.
 # =============================================================================
 
 def r6d_to_rotation(r6d: torch.Tensor) -> torch.Tensor:
     """
-    Convert 6D continuous rotation representation to 3x3 rotation matrix.
-    Uses pytorch3d if available, otherwise falls back to local implementation of Zhou et al.
+    Converts 6D continuous rotation representation to a 3x3 orthogonal rotation matrix.
+    Based on 'On the Continuity of Rotation Representations in Neural Networks' (Zhou et al.).
+    
+    Args:
+        r6d: (..., 6) Input tensor containing the first two columns of the rotation matrix.
+    
+    Returns:
+        R: (..., 3, 3) Orthonormal rotation matrices.
     """
     if rotation_6d_to_matrix is not None:
         return rotation_6d_to_matrix(r6d)
     
-    # Local implementation fallback
-    a1 = r6d[..., 0:3]
-    a2 = r6d[..., 3:6]
-    b1 = F.normalize(a1, dim=-1, eps=1e-9)
-    b2 = F.normalize(a2 - (b1 * a2).sum(-1, keepdim=True) * b1, dim=-1, eps=1e-9)
-    b3 = torch.cross(b1, b2, dim=-1)
-    R = torch.stack([b1, b2, b3], dim=-1)
-    return R
+    # Gram-Schmidt orthogonalization fallback
+    x_raw = r6d[..., 0:3]
+    y_raw = r6d[..., 3:6]
+    
+    x = F.normalize(x_raw, dim=-1, eps=1e-8)
+    z = torch.cross(x, y_raw, dim=-1)
+    z = F.normalize(z, dim=-1, eps=1e-8)
+    y = torch.cross(z, x, dim=-1)
+    
+    return torch.stack([x, y, z], dim=-1)
+
 
 def build_rigid_groups(edge_index: torch.Tensor, num_points: int) -> List[torch.Tensor]:
     """
-    Identify undirected connected components as rigid groups.
+    Decomposes a graph into rigid sub-structures by identifying connected components.
     
     Args:
-        edge_index: (2, E) edge list
-        num_points: Total number of points
+        edge_index: (2, E) tensor of source and target node indices.
+        num_points: Total number of nodes in the graph.
         
     Returns:
-        List of tensors, each containing indices of a connected component.
+        List[torch.Tensor]: A list where each tensor contains indices of a rigid cluster.
     """
-    i, j = edge_index
-    adj = [[] for _ in range(num_points)]
-    for u, v in zip(i.tolist(), j.tolist()):
+    # Convert edge list to adjacency list for efficient traversal
+    adj: List[List[int]] = [[] for _ in range(num_points)]
+    src, dst = edge_index.cpu().tolist()
+    for u, v in zip(src, dst):
         adj[u].append(v)
         adj[v].append(u)
         
-    seen = [False] * num_points
+    # Iterative DFS to find connected components
+    visited = [False] * num_points
     groups = []
-    for s in range(num_points):
-        if seen[s]:
+    
+    for i in range(num_points):
+        if visited[i]:
             continue
-        stack = [s]
-        comp = []
-        seen[s] = True
+            
+        stack = [i]
+        component = []
+        visited[i] = True
+        
         while stack:
             u = stack.pop()
-            comp.append(u)
+            component.append(u)
             for v in adj[u]:
-                if not seen[v]:
-                    seen[v] = True
+                if not visited[v]:
+                    visited[v] = True
                     stack.append(v)
-        groups.append(torch.tensor(sorted(set(comp)), dtype=torch.long))
+                    
+        # Sort indices for deterministic behavior across runs
+        groups.append(torch.tensor(sorted(component), dtype=torch.long))
+        
     return groups
+
+
+# =============================================================================
+# Section 2: Differentiable Constraints & Physics
+# Modules handling tangent space projection, rigid alignment, and PBD.
+# =============================================================================
 
 class TangentProjector(nn.Module):
     """
-    Orthogonally project velocity to the tangent space of distance constraints (rigid edges).
-    Solves for minimal correction to satisfy J*v = 0 where J is constraint Jacobian.
+    Projects velocity fields onto the tangent space of distance manifolds.
+    Mathematically solves J*v = 0 via the KKT system, minimizing kinetic energy change
+    while satisfying holonomic distance constraints.
     
-    Optimized with pre-computed topological structure and Cholesky decomposition.
+    Features:
+        - Pre-computed topological sign matrices for O(1) Jacobian construction.
+        - Robust linear solver with Cholesky -> Least Squares -> Zero fallback.
+        - Mixed-precision safe (internal logic runs in FP32).
     """
     def __init__(self, edge_index: torch.Tensor, eps: float = 1e-6):
         super().__init__()
-        self.eps = float(eps)
-        # Ensure indices are in long dtype for safe tensor indexing
-        edge_index = edge_index.long()
-        self.register_buffer("edge_index", edge_index.clone().detach())
+        self.eps = eps
         
-        # Pre-compute sign matrix for A = J J^T construction
-        # This depends only on graph topology
-        i, j = self.edge_index
+        # Ensure topology is stored as long integers
+        edge_index = edge_index.long()
+        self.register_buffer("edge_index", edge_index.clone())
+        
+        # Pre-compute the topological structure of the Jacobian Gram matrix (J @ J.T)
+        # This block constructs a sparse interaction pattern between edges.
+        src, dst = edge_index
         E = edge_index.shape[1]
         
-        i1 = i.view(-1, 1)
-        i2 = i.view(1, -1)
-        j1 = j.view(-1, 1)
-        j2 = j.view(1, -1)
-
-        # 1.0 if indices match
-        eq_i_i = (i1 == i2).float()
-        eq_i_j = (i1 == j2).float()
-        eq_j_i = (j1 == i2).float()
-        eq_j_j = (j1 == j2).float()
-
-        # sign[e1, e2] selects the correct sign for the dot product
-        sign = eq_i_i - eq_i_j - eq_j_i + eq_j_j
+        # Broadcasting to compare all edges against all edges
+        s1, s2 = src.unsqueeze(1), src.unsqueeze(0)
+        d1, d2 = dst.unsqueeze(1), dst.unsqueeze(0)
+        
+        # sign[a, b] determines if edges 'a' and 'b' share a node and the directionality
+        # +1 if flow aligns, -1 if opposing, 0 if disjoint.
+        sign = (s1 == s2).float() - (s1 == d2).float() - (d1 == s2).float() + (d1 == d2).float()
+        
         self.register_buffer("sign", sign)
-
-        # We always build A in float32 for numerical stability, even if x is float16/64.
-        # The result is cast back to the original v.dtype in forward().
         self.register_buffer("eye", torch.eye(E, dtype=torch.float32))
-
-        # Base edge indices for scatter_add in forward; expanded per batch on the fly
-        self.register_buffer("edge_index_i_base", i.view(1, -1, 1))
-        self.register_buffer("edge_index_j_base", j.view(1, -1, 1))
+        
+        # Pre-allocate index buffers for scatter operations to avoid runtime creation
+        self.register_buffer("idx_src_base", src.view(1, -1, 1))
+        self.register_buffer("idx_dst_base", dst.view(1, -1, 1))
 
     def forward(self, x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, N, 3) Current positions.
+            v: (B, N, 3) Proposed velocities.
+        Returns:
+            v_projected: (B, N, 3) Velocity satisfying distance constraints.
+        """
         B, N, _ = x.shape
-        i, j = self.edge_index
+        src, dst = self.edge_index
         orig_dtype = v.dtype
 
-        # Work in float32 for stable linear algebra; results are cast back to orig_dtype.
-        diff_x = (x[:, i, :] - x[:, j, :]).to(torch.float32)  # (B, E, 3)
-        v32 = v.to(torch.float32)
-
-        # 1. RHS = J * v
-        # (J v)_e = 2 * (x_i - x_j) * (v_i - v_j)
-        v_diff = v32[:, i, :] - v32[:, j, :]
-        rhs = 2.0 * (diff_x * v_diff).sum(dim=-1, keepdim=True)  # (B, E, 1)
-
-        # 2. A = J J^T
-        # dot[b, e1, e2] = diff_x[b, e1] . diff_x[b, e2]
-        # Using matmul: (B, E, 3) @ (B, 3, E) -> (B, E, E)
-        dot = torch.matmul(diff_x, diff_x.transpose(1, 2))
-        A = 4.0 * dot * self.sign + self.eps * self.eye
-
-        # 3. Solve A * lambda = rhs using Cholesky (A is SPD) with robust lstsq fallback
-        try:
-            # cholesky_ex gives per-batch status; we fall back to lstsq only for failing batches
-            L, info = torch.linalg.cholesky_ex(A)
-            lam = torch.empty_like(rhs)
-            good = info == 0
-            if good.any():
-                lam[good] = torch.cholesky_solve(rhs[good], L[good])
-            bad = ~good
-            if bad.any():
-                # For ill-conditioned / non-SPD batches, fall back to least-squares
-                lam[bad] = torch.linalg.lstsq(A[bad], rhs[bad]).solution
-        except RuntimeError:
-            # Global fallback if Cholesky itself fails: use least-squares on the whole batch
-            lam = torch.linalg.lstsq(A, rhs).solution
-
-        # 4. Correction = J^T * lambda
-        # For each edge e, coeff is 2 * lambda_e
-        coeff = 2.0 * lam.squeeze(-1).unsqueeze(-1)  # (B, E, 1)
-        corr_edge = coeff * diff_x  # (B, E, 3)
-
-        corr = torch.zeros(B, N, 3, device=x.device, dtype=torch.float32)
-        idx_i = self.edge_index_i_base.expand(B, -1, 3)
-        idx_j = self.edge_index_j_base.expand(B, -1, 3)
+        # Lift to FP32 for numerical stability in linear algebra
+        x_f32 = x.float()
+        v_f32 = v.float()
         
-        corr.scatter_add_(1, idx_i, corr_edge)
-        corr.scatter_add_(1, idx_j, -corr_edge)
+        # Edge vectors and velocity differences
+        dx = x_f32[:, src] - x_f32[:, dst]  # (B, E, 3)
+        dv = v_f32[:, src] - v_f32[:, dst]  # (B, E, 3)
+        
+        # 1. Construct RHS: -J * v (constraint violation magnitude)
+        # Note: Factor 2.0 comes from derivative of x^2
+        rhs = 2.0 * (dx * dv).sum(dim=-1, keepdim=True) # (B, E, 1)
+        
+        # 2. Construct System Matrix: A = J * M^{-1} * J^T
+        # Dot product between all pairs of edge vectors weighted by topological sign
+        # (B, E, 3) @ (B, 3, E) -> (B, E, E)
+        edge_dot = torch.matmul(dx, dx.transpose(1, 2))
+        A = 4.0 * edge_dot * self.sign + self.eps * self.eye
+        
+        # 3. Solve for Lagrange Multipliers: A * lambda = rhs
+        # Strategy: Cholesky (Fast) -> LU/Lstsq (Robust) -> Zero (Safe Fallback)
+        try:
+            L, info = torch.linalg.cholesky_ex(A)
+            lam = torch.zeros_like(rhs)
+            
+            # Mask for successful decompositions
+            is_spd = (info == 0)
+            if is_spd.any():
+                lam[is_spd] = torch.cholesky_solve(rhs[is_spd], L[is_spd])
+            
+            # Fallback for ill-conditioned matrices (e.g., collinear points)
+            if (~is_spd).any():
+                # Use lstsq for non-SPD cases (more expensive but robust)
+                mask_bad = ~is_spd
+                sol = torch.linalg.lstsq(A[mask_bad], rhs[mask_bad]).solution
+                lam[mask_bad] = sol
+                
+        except RuntimeError:
+            # Catastrophic failure (e.g., NaN in input), return original v to prevent crash
+            return v
+            
+        # 4. Apply Correction: v_new = v - J^T * lambda
+        # Gradient of constraint w.r.t position is parallel to edge vector
+        coeff = 2.0 * lam      # (B, E, 1)
+        correction_force = coeff * dx  # (B, E, 3)
+        
+        v_correction = torch.zeros_like(v_f32)
+        
+        # Scatter add forces back to particles
+        # Expand indices to (B, E, 3)
+        idx_src = self.idx_src_base.expand(B, -1, 3)
+        idx_dst = self.idx_dst_base.expand(B, -1, 3)
+        
+        v_correction.scatter_add_(1, idx_src,  correction_force)
+        v_correction.scatter_add_(1, idx_dst, -correction_force)
+        
+        return (v_f32 - v_correction).to(orig_dtype)
 
-        return (v32 - corr).to(orig_dtype)
-
-
-# =============================================================================
-# Projectors
-# =============================================================================
 
 class RigidGroupProjector(nn.Module):
     """
-    Per-group Kabsch/Umeyama rigid projection with overlap-friendly averaging.
-    Projects points to the nearest configuration consistent with rigid groups derived from template.
+    Enforces rigid body constraints by optimally aligning input points to a template
+    using the Kabsch algorithm (SVD). Handles multiple disjoint rigid groups.
     """
     def __init__(self, template_xyz: torch.Tensor, groups: List[torch.Tensor]):
         super().__init__()
-        self.register_buffer("template_xyz", template_xyz.clone().detach())  # (N,3)
+        self.register_buffer("template_xyz", template_xyz.clone())
+        # Cloning groups ensures we own the tensor data
         self.groups = [g.clone().detach() for g in groups]
 
     @staticmethod
-    def _kabsch_batch(Y: torch.Tensor, X: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _kabsch_align(source: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Find rigid transform (R, t) that aligns X to Y (X -> Y).
-        Y, X: (B, N, 3)
-        Returns: R (B,3,3), t (B,3) such that X @ R.T + t ~ Y
-        Note: The implementation below returns R, t such that (R @ Y.T).T + t matches X? 
-        Wait, let's check the math in the original code.
-        Original: R, t = _kabsch_batch(Yg, Xg)
-                  Xg_proj = (R @ Yg.transpose(1,2)).transpose(1,2) + t
-        This implies we are aligning Y (template) TO X (current state).
-        So we find R, t s.t. R*Y + t ~ X.
+        Finds (R, t) minimizing || (source @ R^T + t) - target ||^2.
+        Args:
+            source: (B, N, 3) Template points.
+            target: (B, N, 3) Current deformed points.
+        Returns:
+            R: (B, 3, 3) Rotation matrix.
+            t: (B, 3) Translation vector.
         """
-        muY = Y.mean(dim=1, keepdim=True)
-        muX = X.mean(dim=1, keepdim=True)
-        Yc = Y - muY
-        Xc = X - muX
+        mu_s = source.mean(dim=1, keepdim=True)
+        mu_t = target.mean(dim=1, keepdim=True)
         
-        # Covariance matrix H
-        H = Yc.transpose(1,2) @ Xc  # (B, 3, 3)
-        U, S, Vh = torch.linalg.svd(H)
+        # Center the point clouds
+        src_c = source - mu_s
+        tgt_c = target - mu_t
+        
+        # Covariance matrix H = src^T * tgt
+        H = src_c.transpose(1, 2) @ tgt_c
+        
+        # SVD: H = U S V^T
+        U, _, Vh = torch.linalg.svd(H)
         V = Vh.transpose(-2, -1)
         
-        # R = V @ U.T
+        # Compute Rotation R = V U^T
         R = V @ U.transpose(-2, -1)
         
-        # Reflection correction
+        # Correction for reflection (ensure determinant is +1)
         det = torch.det(R)
-        neg = (det < 0).view(-1, 1, 1)
-        if neg.any():
-            V_adj = V.clone()
-            V_adj[neg.squeeze(-1).squeeze(-1), :, -1] *= -1
-            R = V_adj @ U.transpose(-2, -1)
+        mask_reflection = (det < 0).view(-1, 1, 1)
+        
+        if mask_reflection.any():
+            V_fixed = V.clone()
+            # Negate the last column of V where reflection occurred
+            V_fixed[mask_reflection.squeeze(), :, -1] *= -1
+            R = torch.where(mask_reflection, V_fixed @ U.transpose(-2, -1), R)
             
-        # t = muX - R @ muY
-        t = (muX.squeeze(1) - (R @ muY.transpose(1,2)).squeeze(2))
+        # Compute Translation
+        # t = centroid_target - (R @ centroid_source.T).T
+        t = mu_t.squeeze(1) - (R @ mu_s.transpose(1, 2)).squeeze(2)
+        
         return R, t
 
     def forward(self, x_proto: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x_proto: (B, N, 3) Input configuration (potentially distorted).
+        Returns:
+            out: (B, N, 3) Configuration projected onto the rigid manifold.
+        """
         B, N, _ = x_proto.shape
         device = x_proto.device
         template = self.template_xyz.to(device)
-        out = torch.zeros_like(x_proto)
-        counts = torch.zeros(B, N, 1, device=device, dtype=x_proto.dtype)
         
-        for g in self.groups:
-            idx = g.to(device)
-            # Yg: template points (target shape)
-            Yg = template[idx].unsqueeze(0).expand(B, -1, -1)
-            # Xg: input points (source shape)
-            Xg = x_proto[:, idx, :]
+        out = torch.zeros_like(x_proto)
+        weights = torch.zeros(B, N, 1, device=device, dtype=x_proto.dtype)
+        
+        for group_idx in self.groups:
+            group_idx = group_idx.to(device)
             
-            if Yg.shape[1] < 3:
-                # Not enough points for rotation, just translation
-                muY = Yg.mean(dim=1, keepdim=True)
-                muX = Xg.mean(dim=1, keepdim=True)
-                Xg_proj = Yg - muY + muX
+            # Template (Source) -> Current Prediction (Target)
+            src = template[group_idx].unsqueeze(0).expand(B, -1, -1)
+            tgt = x_proto[:, group_idx, :]
+            
+            if src.shape[1] < 3:
+                # Degenerate case: Translation only
+                mu_s = src.mean(dim=1, keepdim=True)
+                mu_t = tgt.mean(dim=1, keepdim=True)
+                projected = src - mu_s + mu_t
             else:
-                # Rigid align template (Y) to input (X)
-                R, t = self._kabsch_batch(Yg, Xg)
-                Xg_proj = (R @ Yg.transpose(1,2)).transpose(1,2) + t.unsqueeze(1)
-                
-            out[:, idx, :] += Xg_proj
-            counts[:, idx, :] += 1.0
+                # Full Rigid Alignment
+                R, t = self._kabsch_align(src, tgt)
+                # Apply transform: (R @ src.T).T + t
+                projected = (R @ src.transpose(1, 2)).transpose(1, 2) + t.unsqueeze(1)
             
-        counts = counts.clamp_min(1.0)
-        return out / counts
+            # Accumulate results (handles overlapping groups if any)
+            out[:, group_idx, :] += projected
+            weights[:, group_idx, :] += 1.0
+            
+        # Normalize by overlap count
+        return out / weights.clamp(min=1.0)
 
 
 class XPBDProjector(nn.Module):
     """
-    XPBD/Sequential Gauss–Seidel projection on edge-length constraints.
-    Enforces rest lengths between connected particles.
+    Extended Position Based Dynamics (XPBD) constraint solver.
+    Iteratively satisfies edge length constraints.
     """
     def __init__(
         self,
@@ -257,554 +310,408 @@ class XPBDProjector(nn.Module):
         max_corr: float = 0.2,
     ):
         super().__init__()
-        self.register_buffer("edge_index", edge_index.clone().detach())
-        self.register_buffer("rest_lengths", rest_lengths.clone().detach())
-        self.iters = int(iters)
-        self.compliance = float(compliance)
-        self.max_corr = float(max_corr)
+        self.register_buffer("edge_index", edge_index.clone())
+        self.register_buffer("rest_lengths", rest_lengths.clone())
+        
         if inv_mass is not None:
-            self.register_buffer("inv_mass", inv_mass.clone().detach())
+            self.register_buffer("inv_mass", inv_mass.clone())
         else:
             self.inv_mass = None
+            
+        self.iters = iters
+        self.compliance = compliance
+        self.max_corr = max_corr
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, _ = x.shape
-        i, j = self.edge_index
-        rl = self.rest_lengths.view(1, -1, 1).to(x)
+        src, dst = self.edge_index
+        L0 = self.rest_lengths.view(1, -1, 1)
         
+        # Initialize inverse mass
         if self.inv_mass is not None:
-            im = self.inv_mass.to(x)
+            w = self.inv_mass.view(-1, 1, 1)
         else:
-            im = torch.ones(N, device=x.device, dtype=x.dtype)
+            w = torch.ones(N, 1, 1, device=x.device, dtype=x.dtype)
             
-        im_i = im[i].view(1, -1, 1)
-        im_j = im[j].view(1, -1, 1)
+        w_i = w[src].transpose(1, 2) # (1, 1, E) -> View adjustment needed based on dim
+        w_i = w[src].view(1, -1, 1)
+        w_j = w[dst].view(1, -1, 1)
         
-        x_proj = x.clone()
-        alpha = self.compliance
+        x_curr = x.clone()
+        alpha = self.compliance / (float(self.iters) + 1e-8)
+        
+        # Pre-expand indices for scatter operations
+        idx_src = src.view(1, -1, 1).expand(B, -1, 3)
+        idx_dst = dst.view(1, -1, 1).expand(B, -1, 3)
         
         for _ in range(self.iters):
-            diff = x_proj[:, i, :] - x_proj[:, j, :]
-            dist = (diff.pow(2).sum(-1, keepdim=True) + 1e-9).sqrt()
+            # 1. Calculate Constraint Violation
+            # x_i - x_j
+            diff = x_curr[:, src] - x_curr[:, dst]
+            dist = torch.norm(diff, dim=-1, keepdim=True)
             
-            C = dist - rl
+            # C(x) = |x_ij| - L0
+            C = dist - L0
+            # Gradient direction n = (x_i - x_j) / |x_ij|
             n = diff / (dist + 1e-9)
             
-            w = im_i + im_j + alpha
-            lam = -C / (w + 1e-9)
-            corr = lam * n
+            # 2. Calculate Lagrange Multiplier (Lambda)
+            # lambda = -C / (w_i + w_j + alpha)
+            denom = w_i + w_j + alpha
+            d_lambda = -C / (denom + 1e-9)
             
-            # Clamp per-edge correction magnitude
-            corr = corr.clamp(min=-self.max_corr, max=self.max_corr)
+            # 3. Calculate Correction Vectors
+            correction = d_lambda * n
             
-            delta_i = -im_i * corr
-            delta_j =  im_j * corr
+            # Stability: Limit maximum correction per step
+            correction = torch.clamp(correction, -self.max_corr, self.max_corr)
             
-            zeros = torch.zeros_like(x_proj)
-            idx_i = i.view(1, -1, 1).expand(B, -1, 3)
-            idx_j = j.view(1, -1, 1).expand(B, -1, 3)
+            dx_i = w_i * correction
+            dx_j = -w_j * correction # Newton's 3rd law
             
-            zeros.scatter_add_(1, idx_i, delta_i)
-            zeros.scatter_add_(1, idx_j, delta_j)
+            # 4. Apply Deltas
+            # Use scatter_add to handle particles connected to multiple edges simultaneously
+            delta_accum = torch.zeros_like(x_curr)
+            delta_accum.scatter_add_(1, idx_src, dx_i)
+            delta_accum.scatter_add_(1, idx_dst, dx_j)
             
-            x_proj = x_proj + zeros
+            # Note: In strict PBD, we update immediately. 
+            # With scatter_add (Jacobi-style update), we average corrections or just sum.
+            # Summing is standard for parallel GPU implementation.
+            x_curr = x_curr + delta_accum
             
-        return x_proj
+        return x_curr
 
 
 # =============================================================================
-# Velocity Strategies
+# Section 3: Velocity Strategies
+# Logic to determine particle velocities from latent embeddings.
 # =============================================================================
 
 class VelocityStrategyBase(nn.Module):
-    """Abstract base class for velocity strategies."""
+    """Abstract base class for all velocity prediction strategies."""
     
     def __init__(self, tau_min: float = 1e-3):
         super().__init__()
-        self.tau_min = float(tau_min)
+        self.tau_min = tau_min
+        self.tangent_projector: Optional[TangentProjector] = None
 
-    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> torch.Tensor:
+    def predict(self, model, keypoints: torch.Tensor, timesteps: torch.Tensor, hand_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Main interface for velocity prediction.
+        Args:
+            model: The calling parent model (context).
+            keypoints: (B, N, 3) Current positions.
+            timesteps: (B,) or (B, 1) Time embedding/value.
+            hand_tokens: (B, N, D) Latent features from the transformer.
+        """
         raise NotImplementedError
 
-    def _tau(self, t: torch.Tensor) -> torch.Tensor:
-        """Compute time scaling factor tau from timestep t (0 to 1)."""
+    def _get_tau(self, t: torch.Tensor) -> torch.Tensor:
+        """Computes time scaling factor. t goes from 0 -> 1."""
         if t.dim() == 1:
             t = t.view(-1, 1, 1)
+        # Prevent division by zero near t=1
         return torch.clamp(1.0 - t, min=self.tau_min)
 
-    def apply_tangent_projection(self, v: torch.Tensor, keypoints: torch.Tensor) -> torch.Tensor:
-        """Apply tangent projection if enabled."""
-        if hasattr(self, 'tangent_projector') and self.tangent_projector is not None:
-            return self.tangent_projector(keypoints, v)
+    def _apply_constraints(self, v: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if self.tangent_projector is not None:
+            return self.tangent_projector(x, v)
         return v
 
 
 class DirectVelocityStrategy(VelocityStrategyBase):
-    """
-    Predicts velocity directly from tokens.
-    v = head(tokens)
-    """
-    def __init__(self, d_model: int, use_tangent: bool, edge_index: torch.Tensor):
+    """Directly projects latent features to 3D velocity vectors."""
+    
+    def __init__(self, d_model: int, edge_index: torch.Tensor, use_tangent: bool):
         super().__init__()
         self.head = nn.Linear(d_model, 3)
-        self.register_buffer("edge_index", edge_index.clone().detach())
-        self.tangent_projector = TangentProjector(edge_index) if use_tangent else None
+        if use_tangent:
+            self.tangent_projector = TangentProjector(edge_index)
 
-    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> torch.Tensor:
-        v = self.head(hand_tokens_out)
-        v = self.apply_tangent_projection(v, keypoints)
-        return v
+    def predict(self, model, keypoints, timesteps, hand_tokens) -> torch.Tensor:
+        v = self.head(hand_tokens)
+        return self._apply_constraints(v, keypoints)
 
 
 class PhysGuidedVelocityStrategy(VelocityStrategyBase):
-    """
-    Direct velocity + gradient correction towards satisfying lengths.
-    v = v_pred - eta * grad(ConstraintEnergy)
-    """
-    def __init__(
-        self,
-        d_model: int,
-        edge_index: torch.Tensor,
-        rest_lengths: torch.Tensor,
-        eta: float = 0.5,
-        use_tangent: bool = True,
-    ):
+    """Adds a gradient descent term on edge-length energy to the predicted velocity."""
+    
+    def __init__(self, d_model: int, edge_index: torch.Tensor, rest_lengths: torch.Tensor, 
+                 eta: float = 0.5, use_tangent: bool = True):
         super().__init__()
         self.head = nn.Linear(d_model, 3)
-        self.register_buffer("edge_index", edge_index.clone().detach())
-        self.register_buffer("rest_lengths", rest_lengths.clone().detach())
-        self.eta = float(eta)
-        self.tangent_projector = TangentProjector(edge_index) if use_tangent else None
+        self.register_buffer("edge_index", edge_index)
+        self.register_buffer("rest_lengths", rest_lengths)
+        self.eta = eta
+        if use_tangent:
+            self.tangent_projector = TangentProjector(edge_index)
 
-    def _length_grad(self, x: torch.Tensor) -> torch.Tensor:
-        """Calculate gradient of edge length energy potential."""
-        B, N, _ = x.shape
-        i, j = self.edge_index
-        rl = self.rest_lengths.view(1, -1, 1).to(x)
+    def _compute_energy_grad(self, x: torch.Tensor) -> torch.Tensor:
+        # Gradient of E = 0.5 * sum( (|x_i - x_j| - L0)^2 )
+        src, dst = self.edge_index
+        diff = x[:, src] - x[:, dst]
+        dist = torch.norm(diff, dim=-1, keepdim=True) + 1e-9
+        L0 = self.rest_lengths.view(1, -1, 1)
         
-        diff = x[:, i, :] - x[:, j, :]
-        dist = (diff.pow(2).sum(-1, keepdim=True) + 1e-9).sqrt()
+        # grad_E w.r.t x_i = (|x_ij| - L0) * (x_ij / |x_ij|)
+        grad_mag = (dist - L0) / dist
+        grad_vec = grad_mag * diff
         
-        # Energy = 0.5 * (dist - rl)^2
-        # Grad = (dist - rl) * grad(dist)
-        # grad(dist) = diff / dist
-        coeff = (1.0 - rl / dist)  # (B, E, 1)
+        grad = torch.zeros_like(x)
+        idx_src = src.view(1, -1, 1).expand(x.shape[0], -1, 3)
+        idx_dst = dst.view(1, -1, 1).expand(x.shape[0], -1, 3)
         
-        grad_i =  coeff * diff
-        grad_j = -coeff * diff
-        
-        out = torch.zeros_like(x)
-        idx_i = i.view(1, -1, 1).expand(B, -1, 3)
-        idx_j = j.view(1, -1, 1).expand(B, -1, 3)
-        
-        out.scatter_add_(1, idx_i, grad_i)
-        out.scatter_add_(1, idx_j, grad_j)
-        return out
+        grad.scatter_add_(1, idx_src, grad_vec)
+        grad.scatter_add_(1, idx_dst, -grad_vec)
+        return grad
 
-    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> torch.Tensor:
-        v_raw = self.head(hand_tokens_out)
-        grad = self._length_grad(keypoints)
-        v = v_raw - self.eta * grad
-        v = self.apply_tangent_projection(v, keypoints)
-        return v
+    def predict(self, model, keypoints, timesteps, hand_tokens) -> torch.Tensor:
+        v_pred = self.head(hand_tokens)
+        v_phys = -self.eta * self._compute_energy_grad(keypoints)
+        return self._apply_constraints(v_pred + v_phys, keypoints)
 
 
 class GoalKabschVelocityStrategy(VelocityStrategyBase):
     """
-    Predicts a deformation delta, projects to a valid rigid assembly, then computes velocity to reach that goal.
-    x_proto = template + delta(tokens)
-    x_goal = RigidProject(x_proto)
-    v = (x_goal - x_curr) / tau
+    Predicts a deformation, projects it to a valid rigid goal, and steers towards it.
+    v = (Rigid(x + delta) - x) / (1 - t)
     """
-    def __init__(
-        self,
-        d_model: int,
-        template_xyz: torch.Tensor,
-        groups: List[torch.Tensor],
-        edge_index: torch.Tensor,
-        tau_min: float = 1e-3,
-        use_tangent: bool = True,
-    ):
-        super().__init__(tau_min=tau_min)
+    def __init__(self, d_model: int, template_xyz: torch.Tensor, groups: List[torch.Tensor],
+                 edge_index: torch.Tensor, tau_min: float = 1e-3, use_tangent: bool = True):
+        super().__init__(tau_min)
         self.decode = nn.Sequential(
-            nn.Linear(d_model, 256), nn.SiLU(),
-            nn.Linear(256, 3)
+            nn.Linear(d_model, 256), nn.SiLU(), nn.Linear(256, 3)
         )
         self.projector = RigidGroupProjector(template_xyz, groups)
-        self.register_buffer("edge_index", edge_index.clone().detach())
-        self.tangent_projector = TangentProjector(edge_index) if use_tangent else None
+        if use_tangent:
+            self.tangent_projector = TangentProjector(edge_index)
 
-    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> torch.Tensor:
-        delta = self.decode(hand_tokens_out)  # (B, N, 3)
-        # Note: We use model.template_xyz to ensure we use the same device/dtype as the main model
-        # if self.projector.template_xyz is not enough. 
-        # Assuming model has template_xyz.
-        ref_template = getattr(model, 'template_xyz', None)
-        if ref_template is None:
-            ref_template = self.projector.template_xyz.to(keypoints.device)
-            
+    def predict(self, model, keypoints, timesteps, hand_tokens) -> torch.Tensor:
+        delta = self.decode(hand_tokens)
+        
+        # Access template from model if available (handles device/type sync), else fallback
+        ref_template = getattr(model, 'template_xyz', self.projector.template_xyz)
+        
         x_proto = ref_template.unsqueeze(0) + delta
         x_goal = self.projector(x_proto)
         
-        tau = self._tau(timesteps)
+        tau = self._get_tau(timesteps)
         v = (x_goal - keypoints) / tau
-        v = self.apply_tangent_projection(v, keypoints)
-        return v
+        return self._apply_constraints(v, keypoints)
 
 
 class GroupRigidParamVelocityStrategy(VelocityStrategyBase):
     """
-    Predicts Rigid Transforms (R, t) per group from pooled tokens, applies to template to get goal.
-    v = (x_goal - x_curr) / tau
+    Predicts explicit 6D Rotation and Translation per rigid group.
     """
-    def __init__(
-        self,
-        d_model: int,
-        template_xyz: torch.Tensor,
-        groups: List[torch.Tensor],
-        edge_index: torch.Tensor,
-        use_tangent: bool = True,
-        tau_min: float = 1e-3,
-    ):
-        super().__init__(tau_min=tau_min)
-        self.groups = [g.clone().detach() for g in groups]
-        self.template = template_xyz.clone().detach()
-        self.register_buffer("edge_index", edge_index.clone().detach())
-        self.tangent_projector = TangentProjector(edge_index) if use_tangent else None
+    def __init__(self, d_model: int, template_xyz: torch.Tensor, groups: List[torch.Tensor],
+                 edge_index: torch.Tensor, use_tangent: bool = True, tau_min: float = 1e-3):
+        super().__init__(tau_min)
+        self.groups = [g.clone() for g in groups]
+        self.register_buffer("template_xyz", template_xyz.clone())
         
-        # group head: 6D rot + 3 t per group
+        # Head outputs 9 params per group: 6 (Rot6D) + 3 (Trans)
         self.group_head = nn.Sequential(
-            nn.Linear(d_model, 256), nn.SiLU(),
-            nn.Linear(256, 9)
+            nn.Linear(d_model, 256), nn.SiLU(), nn.Linear(256, 9)
         )
+        if use_tangent:
+            self.tangent_projector = TangentProjector(edge_index)
 
-    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> torch.Tensor:
-        B, N, D = hand_tokens_out.shape
-        device = hand_tokens_out.device
+    def predict(self, model, keypoints, timesteps, hand_tokens) -> torch.Tensor:
+        B, N, D = hand_tokens.shape
+        device = hand_tokens.device
         
-        # per-group pooling -> (B, G, d_model)
-        g_tokens_list = []
+        # 1. Pooling: Aggregate tokens per group
+        group_embeddings = []
         for g in self.groups:
-            # Gather tokens for this group and mean pool
-            g_tokens_list.append(hand_tokens_out[:, g.to(device), :].mean(dim=1))
+            # Mean pool tokens belonging to group g
+            g_tokens = hand_tokens[:, g.to(device), :].mean(dim=1)
+            group_embeddings.append(g_tokens)
             
-        g_tokens = torch.stack(g_tokens_list, dim=1)  # (B, G, D)
-        params = self.group_head(g_tokens)            # (B, G, 9)
+        # (B, NumGroups, D)
+        group_in = torch.stack(group_embeddings, dim=1)
         
+        # 2. Predict SE(3) params
+        params = self.group_head(group_in) # (B, G, 9)
         r6d = params[..., :6]
-        t = params[..., 6:]      # (B, G, 3)
-        R = r6d_to_rotation(r6d) # (B, G, 3, 3)
-
-        template = self.template.to(device)
-        out = torch.zeros(B, N, 3, device=device, dtype=hand_tokens_out.dtype)
-        counts = torch.zeros(B, N, 1, device=device, dtype=hand_tokens_out.dtype)
+        t = params[..., 6:]
         
-        for gi, g in enumerate(self.groups):
+        # (B, G, 3, 3)
+        R = r6d_to_rotation(r6d)
+        
+        # 3. Apply Transforms to Template
+        template = self.template_xyz.to(device)
+        x_goal_accum = torch.zeros(B, N, 3, device=device, dtype=hand_tokens.dtype)
+        weights = torch.zeros(B, N, 1, device=device, dtype=hand_tokens.dtype)
+        
+        for i, g in enumerate(self.groups):
             idx = g.to(device)
-            Yg = template[idx].unsqueeze(0).expand(B, -1, -1)
+            src = template[idx].unsqueeze(0) # (1, M, 3)
             
-            # Apply predicted transform: R * Y + t
-            # Yg is (B, M, 3), R is (B, 3, 3) (slice for this group)
-            # (R @ Yg.T).T + t
-            Xg = (R[:, gi] @ Yg.transpose(1,2)).transpose(1,2) + t[:, gi].unsqueeze(1)
+            # X_new = (R @ X_old.T).T + t
+            # Using matmul with broadcasting: R is (B, 3, 3), src is (1, M, 3)
+            # We need (B, M, 3)
+            src_centered = src.expand(B, -1, -1)
             
-            out[:, idx, :] += Xg
-            counts[:, idx, :] += 1.0
+            # Rotation: (B, 3, 3) x (B, 3, M) -> (B, 3, M) -> (B, M, 3)
+            rotated = torch.matmul(R[:, i], src_centered.transpose(1, 2)).transpose(1, 2)
+            transformed = rotated + t[:, i].unsqueeze(1)
             
-        x_goal = out / counts.clamp_min(1.0)
+            x_goal_accum[:, idx, :] += transformed
+            weights[:, idx, :] += 1.0
+            
+        x_goal = x_goal_accum / weights.clamp(min=1.0)
         
-        tau = self._tau(timesteps)
+        # 4. Compute Velocity
+        tau = self._get_tau(timesteps)
         v = (x_goal - keypoints) / tau
-        v = self.apply_tangent_projection(v, keypoints)
-        return v
+        return self._apply_constraints(v, keypoints)
 
 
 class PBDCorrectedVelocityStrategy(VelocityStrategyBase):
     """
-    Predicts velocity, takes a step, then corrects position with XPBD, then re-computes velocity.
-    v = (XPBD(x + tau*v_pred) - x) / tau
+    Predicts velocity, simulates a step, corrects with XPBD, and computes effective velocity.
+    This ensures the velocity field inherently respects the physics manifold.
     """
-    def __init__(
-        self,
+    def __init__(self, d_model: int, edge_index: torch.Tensor, rest_lengths: torch.Tensor,
+                 xpbd_iters: int = 4, xpbd_compliance: float = 0.0, xpbd_max_corr: float = 0.15,
+                 use_tangent: bool = False, tau_min: float = 1e-3):
+        super().__init__(tau_min)
+        self.head = nn.Linear(d_model, 3)
+        self.projector = XPBDProjector(
+            edge_index, rest_lengths, iters=xpbd_iters, 
+            compliance=xpbd_compliance, max_corr=xpbd_max_corr
+        )
+        if use_tangent:
+            self.tangent_projector = TangentProjector(edge_index)
+
+    def predict(self, model, keypoints, timesteps, hand_tokens) -> torch.Tensor:
+        tau = self._get_tau(timesteps)
+        v_raw = self.head(hand_tokens)
+        
+        # Tentative step
+        x_pred = keypoints + tau * v_raw
+        # Manifold projection
+        x_corrected = self.projector(x_pred)
+        
+        # Effective velocity
+        v_eff = (x_corrected - keypoints) / tau
+        return self._apply_constraints(v_eff, keypoints)
+
+
+# =============================================================================
+# Section 4: Factory & Registry
+# Centralized instantiation logic.
+# =============================================================================
+
+class ComponentFactory:
+    """Helper class to manage component creation and parameter validation."""
+    
+    @staticmethod
+    def create_velocity_strategy(
+        mode: str,
         d_model: int,
         edge_index: torch.Tensor,
         rest_lengths: torch.Tensor,
-        xpbd_iters: int = 4,
-        xpbd_compliance: float = 0.0,
-        xpbd_max_corr: float = 0.15,
-        use_tangent: bool = False,
-        tau_min: float = 1e-3,
+        template_xyz: Optional[torch.Tensor],
+        groups: List[torch.Tensor],
+        kwargs: Dict[str, Any]
+    ) -> VelocityStrategyBase:
+        
+        mode = mode.lower()
+        kwargs = kwargs or {}
+        
+        # Registry mapping: name -> (class, list of allowed kwarg keys)
+        registry = {
+            "direct": (DirectVelocityStrategy, ["use_tangent"]),
+            "direct_tangent": (
+                lambda **k: DirectVelocityStrategy(**k, use_tangent=True), ["use_tangent"]
+            ),
+            "phys_guided": (PhysGuidedVelocityStrategy, ["eta", "use_tangent"]),
+            "goal_kabsch": (GoalKabschVelocityStrategy, ["tau_min", "use_tangent"]),
+            "group_rigid": (GroupRigidParamVelocityStrategy, ["tau_min", "use_tangent"]),
+            "pbd_corrected": (PBDCorrectedVelocityStrategy, ["iters", "compliance", "max_corr", "use_tangent", "tau_min"]),
+        }
+
+        if mode not in registry:
+            raise ValueError(f"Unknown velocity mode: {mode}. Options: {list(registry.keys())}")
+
+        cls_or_func, allowed_keys = registry[mode]
+        
+        # Filter kwargs
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in allowed_keys}
+        if len(filtered_kwargs) != len(kwargs):
+            unknown = set(kwargs.keys()) - set(allowed_keys)
+            raise ValueError(f"Unknown kwargs for mode {mode}: {unknown}")
+
+        # Common arguments injection based on Strategy signature
+        # We construct a dynamic arg dictionary to satisfy different constructors
+        build_args = {"d_model": d_model, "edge_index": edge_index}
+        
+        if mode in ["phys_guided", "pbd_corrected"]:
+            build_args["rest_lengths"] = rest_lengths
+        
+        if mode in ["goal_kabsch", "group_rigid"]:
+            if template_xyz is None:
+                raise ValueError(f"Mode {mode} requires template_xyz.")
+            build_args["template_xyz"] = template_xyz
+            build_args["groups"] = groups
+
+        # Merge specific kwargs
+        build_args.update(filtered_kwargs)
+        
+        return cls_or_func(**build_args)
+
+    @staticmethod
+    def create_state_projector(
+        mode: str,
+        edge_index: torch.Tensor,
+        rest_lengths: torch.Tensor,
+        template_xyz: Optional[torch.Tensor],
+        groups: List[torch.Tensor],
+        kwargs: Dict[str, Any]
     ):
-        super().__init__(tau_min=tau_min)
-        self.head = nn.Linear(d_model, 3)
-        self.projector = XPBDProjector(
-            edge_index=edge_index,
-            rest_lengths=rest_lengths,
-            iters=xpbd_iters,
-            compliance=xpbd_compliance,
-            max_corr=xpbd_max_corr,
-        )
-        self.register_buffer("edge_index", edge_index.clone().detach())
-        self.tangent_projector = TangentProjector(edge_index) if use_tangent else None
-
-    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> torch.Tensor:
-        tau = self._tau(timesteps)
-        v_pred = self.head(hand_tokens_out)
+        mode = mode.lower()
+        kwargs = kwargs or {}
         
-        x_raw = keypoints + tau * v_pred
-        x_corr = self.projector(x_raw)
+        if mode == "none":
+            return None
         
-        v = (x_corr - keypoints) / tau
-        v = self.apply_tangent_projection(v, keypoints)
-        return v
+        elif mode == "pbd":
+            return XPBDProjector(
+                edge_index, rest_lengths,
+                iters=int(kwargs.get("iters", 2)),
+                compliance=float(kwargs.get("compliance", 0.0)),
+                max_corr=float(kwargs.get("max_corr", 0.2))
+            )
+            
+        elif mode == "rigid":
+            if template_xyz is None: raise ValueError("Rigid projection requires template_xyz")
+            return RigidGroupProjector(template_xyz, groups)
+            
+        elif mode == "hybrid":
+            if template_xyz is None: raise ValueError("Hybrid projection requires template_xyz")
+            rigid = RigidGroupProjector(template_xyz, groups)
+            pbd = XPBDProjector(
+                edge_index, rest_lengths,
+                iters=int(kwargs.get("hybrid_pbd_iters", 2)),
+                compliance=float(kwargs.get("hybrid_compliance", 0.0)),
+                max_corr=float(kwargs.get("hybrid_max_corr", 0.2))
+            )
+            return ("hybrid", rigid, pbd)
+            
+        else:
+            raise ValueError(f"Unknown state projector: {mode}")
 
 
-# =============================================================================
-# Velocity Strategy Registry
-# =============================================================================
-
-def _build_direct(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs):
-    """Builder for DirectVelocityStrategy"""
-    use_tangent = bool(kwargs.get("use_tangent", False))
-    return DirectVelocityStrategy(d_model=d_model, use_tangent=use_tangent, edge_index=edge_index)
-
-def _build_direct_tangent(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs):
-    """Builder for DirectVelocityStrategy with tangent=True"""
-    use_tangent = bool(kwargs.get("use_tangent", True))
-    return DirectVelocityStrategy(d_model=d_model, use_tangent=use_tangent, edge_index=edge_index)
-
-def _build_goal_kabsch(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs):
-    """Builder for GoalKabschVelocityStrategy"""
-    if template_xyz is None:
-        raise ValueError("template_xyz required for goal_kabsch strategy")
-    tau_min = float(kwargs.get("tau_min", 1e-3))
-    use_tangent = bool(kwargs.get("use_tangent", True))
-    return GoalKabschVelocityStrategy(
-        d_model=d_model,
-        template_xyz=template_xyz,
-        groups=groups,
-        edge_index=edge_index,
-        tau_min=tau_min,
-        use_tangent=use_tangent,
+# Public API Wrappers
+def build_velocity_strategy(mode, d_model, edge_index, rest_lengths, template_xyz, groups, kwargs=None):
+    return ComponentFactory.create_velocity_strategy(
+        mode, d_model, edge_index, rest_lengths, template_xyz, groups, kwargs or {}
     )
 
-def _build_group_rigid(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs):
-    """Builder for GroupRigidParamVelocityStrategy"""
-    if template_xyz is None:
-        raise ValueError("template_xyz required for group_rigid strategy")
-    tau_min = float(kwargs.get("tau_min", 1e-3))
-    use_tangent = bool(kwargs.get("use_tangent", True))
-    return GroupRigidParamVelocityStrategy(
-        d_model=d_model,
-        template_xyz=template_xyz,
-        groups=groups,
-        edge_index=edge_index,
-        use_tangent=use_tangent,
-        tau_min=tau_min,
+def build_state_projector(mode, edge_index, rest_lengths, template_xyz, groups, kwargs=None):
+    return ComponentFactory.create_state_projector(
+        mode, edge_index, rest_lengths, template_xyz, groups, kwargs or {}
     )
-
-def _build_pbd_corrected(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs):
-    """Builder for PBDCorrectedVelocityStrategy"""
-    return PBDCorrectedVelocityStrategy(
-        d_model=d_model,
-        edge_index=edge_index,
-        rest_lengths=rest_lengths,
-        xpbd_iters=int(kwargs.get("iters", 4)),
-        xpbd_compliance=float(kwargs.get("compliance", 0.0)),
-        xpbd_max_corr=float(kwargs.get("max_corr", 0.15)),
-        use_tangent=bool(kwargs.get("use_tangent", False)),
-        tau_min=float(kwargs.get("tau_min", 1e-3)),
-    )
-
-def _build_phys_guided(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs):
-    """Builder for PhysGuidedVelocityStrategy"""
-    return PhysGuidedVelocityStrategy(
-        d_model=d_model,
-        edge_index=edge_index,
-        rest_lengths=rest_lengths,
-        eta=float(kwargs.get("eta", 0.5)),
-        use_tangent=bool(kwargs.get("use_tangent", True)),
-    )
-
-VELOCITY_STRATEGY_REGISTRY = {
-    "direct": {
-        "builder": _build_direct,
-        "allowed_kwargs": {"use_tangent"},
-    },
-    "direct_tangent": {
-        "builder": _build_direct_tangent,
-        "allowed_kwargs": {"use_tangent"},
-    },
-    "goal_kabsch": {
-        "builder": _build_goal_kabsch,
-        "allowed_kwargs": {"tau_min", "use_tangent"},
-    },
-    "group_rigid": {
-        "builder": _build_group_rigid,
-        "allowed_kwargs": {"tau_min", "use_tangent"},
-    },
-    "pbd_corrected": {
-        "builder": _build_pbd_corrected,
-        "allowed_kwargs": {"iters", "compliance", "max_corr", "use_tangent", "tau_min"},
-    },
-    "phys_guided": {
-        "builder": _build_phys_guided,
-        "allowed_kwargs": {"eta", "use_tangent"},
-    },
-}
-
-def build_velocity_strategy(
-    mode: str,
-    d_model: int,
-    edge_index: torch.Tensor,
-    rest_lengths: torch.Tensor,
-    template_xyz: Optional[torch.Tensor],
-    groups: List[torch.Tensor],
-    kwargs: Optional[dict] = None,
-) -> VelocityStrategyBase:
-    """
-    Factory function to build a velocity strategy from registry.
-    
-    Args:
-        mode: Strategy mode name (e.g., 'direct', 'goal_kabsch', etc.)
-        d_model: Model dimension
-        edge_index: Graph edge indices
-        rest_lengths: Rest lengths for edges
-        template_xyz: Template keypoints (optional, required for some strategies)
-        groups: Rigid groups (required for some strategies)
-        kwargs: Additional strategy-specific keyword arguments
-    
-    Returns:
-        VelocityStrategyBase instance
-    
-    Raises:
-        ValueError: If mode is unknown or if unsupported kwargs are provided
-    """
-    mode_lower = str(mode).lower()
-    kwargs = dict(kwargs or {})
-    
-    if mode_lower not in VELOCITY_STRATEGY_REGISTRY:
-        available = sorted(VELOCITY_STRATEGY_REGISTRY.keys())
-        raise ValueError(f"Unknown velocity_mode: '{mode}'. Available modes: {available}")
-    
-    entry = VELOCITY_STRATEGY_REGISTRY[mode_lower]
-    allowed = entry["allowed_kwargs"]
-    
-    # Validate kwargs
-    extra = sorted(set(kwargs.keys()) - allowed)
-    if extra:
-        raise ValueError(
-            f"Unsupported velocity_kwargs for mode '{mode}': {extra}. "
-            f"Allowed: {sorted(allowed)}"
-        )
-    
-    builder = entry["builder"]
-    return builder(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs)
-
-
-# =============================================================================
-# State Projector Registry
-# =============================================================================
-
-def _build_projector_none(edge_index, rest_lengths, template_xyz, groups, kwargs):
-    """Builder for identity/no-op projector"""
-    return None
-
-def _build_projector_pbd(edge_index, rest_lengths, template_xyz, groups, kwargs):
-    """Builder for XPBDProjector"""
-    return XPBDProjector(
-        edge_index=edge_index,
-        rest_lengths=rest_lengths,
-        iters=int(kwargs.get("iters", 2)),
-        compliance=float(kwargs.get("compliance", 0.0)),
-        max_corr=float(kwargs.get("max_corr", 0.2)),
-    )
-
-def _build_projector_rigid(edge_index, rest_lengths, template_xyz, groups, kwargs):
-    """Builder for RigidGroupProjector"""
-    if template_xyz is None:
-        raise ValueError("template_xyz required for 'rigid' state projection mode")
-    return RigidGroupProjector(template_xyz=template_xyz, groups=groups)
-
-def _build_projector_hybrid(edge_index, rest_lengths, template_xyz, groups, kwargs):
-    """Builder for hybrid projector (rigid + pbd)"""
-    if template_xyz is None:
-        raise ValueError("template_xyz required for 'hybrid' state projection mode")
-    
-    rigid_proj = RigidGroupProjector(template_xyz=template_xyz, groups=groups)
-    pbd_proj = XPBDProjector(
-        edge_index=edge_index,
-        rest_lengths=rest_lengths,
-        iters=int(kwargs.get("hybrid_pbd_iters", 2)),
-        compliance=float(kwargs.get("hybrid_compliance", 0.0)),
-        max_corr=float(kwargs.get("hybrid_max_corr", 0.2)),
-    )
-    
-    # Return a tuple for hybrid mode
-    return ("hybrid", rigid_proj, pbd_proj)
-
-STATE_PROJECTOR_REGISTRY = {
-    "none": {
-        "builder": _build_projector_none,
-        "allowed_kwargs": set(),
-    },
-    "pbd": {
-        "builder": _build_projector_pbd,
-        "allowed_kwargs": {"iters", "compliance", "max_corr"},
-    },
-    "rigid": {
-        "builder": _build_projector_rigid,
-        "allowed_kwargs": set(),
-    },
-    "hybrid": {
-        "builder": _build_projector_hybrid,
-        "allowed_kwargs": {"hybrid_pbd_iters", "hybrid_compliance", "hybrid_max_corr"},
-    },
-}
-
-def build_state_projector(
-    mode: str,
-    edge_index: torch.Tensor,
-    rest_lengths: torch.Tensor,
-    template_xyz: Optional[torch.Tensor],
-    groups: List[torch.Tensor],
-    kwargs: Optional[dict] = None,
-):
-    """
-    Factory function to build a state projector from registry.
-    
-    Args:
-        mode: Projector mode ('none', 'pbd', 'rigid', 'hybrid')
-        edge_index: Graph edge indices
-        rest_lengths: Rest lengths for edges
-        template_xyz: Template keypoints (optional, required for rigid/hybrid)
-        groups: Rigid groups (required for rigid/hybrid)
-        kwargs: Additional projector-specific keyword arguments
-    
-    Returns:
-        Projector module or None for 'none' mode.
-        For 'hybrid' mode, returns tuple ('hybrid', rigid_proj, pbd_proj)
-    
-    Raises:
-        ValueError: If mode is unknown or if unsupported kwargs are provided
-    """
-    mode_lower = str(mode).lower()
-    kwargs = dict(kwargs or {})
-    
-    if mode_lower not in STATE_PROJECTOR_REGISTRY:
-        available = sorted(STATE_PROJECTOR_REGISTRY.keys())
-        raise ValueError(f"Unknown state_projection_mode: '{mode}'. Available modes: {available}")
-    
-    entry = STATE_PROJECTOR_REGISTRY[mode_lower]
-    allowed = entry["allowed_kwargs"]
-    
-    # Validate kwargs
-    extra = sorted(set(kwargs.keys()) - allowed)
-    if extra:
-        raise ValueError(
-            f"Unsupported state_projection_kwargs for mode '{mode}': {extra}. "
-            f"Allowed: {sorted(allowed)}"
-        )
-    
-    builder = entry["builder"]
-    return builder(edge_index, rest_lengths, template_xyz, groups, kwargs)

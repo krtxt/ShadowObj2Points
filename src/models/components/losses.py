@@ -1,135 +1,117 @@
-"""Loss function modules for hand pose estimation and flow matching."""
+# models/components/losses.py
+
+import logging
+from typing import Dict, Optional, Tuple, List, Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict
 
+# Optional dependency: PyTorch3D
 try:
     from pytorch3d.loss import chamfer_distance
     _PYTORCH3D_AVAILABLE = True
 except ImportError:
     _PYTORCH3D_AVAILABLE = False
-    print("Warning: pytorch3d not available. Chamfer distance will not work.")
+
+logger = logging.getLogger(__name__)
+
 
 class FlowMatchingLoss(nn.Module):
-    """Flow matching loss with optional tangent-space regularization.
-
-    For HandFlowMatchingDiT:
-      - Flow matching term: MSE(v_hat, v_star)
-      - Tangent constraint term: For each edge (i,j), penalizes ((y_i - y_j) dot (v_i - v_j))^2
-
-    Args:
-        edge_index: Edge connectivity of shape (2, E)
-        lambda_tangent: Weight of the tangent-space regularization term
+    """
+    Computes Flow Matching loss with structure-preserving tangent regularization.
+    
+    Formula:
+        L_total = ||v_pred - v_target||^2 + λ * ||(v_pred_rel · y_curr_rel)||^2
     """
     def __init__(self, edge_index: torch.Tensor, lambda_tangent: float = 1.0) -> None:
         super().__init__()
         if edge_index.dim() != 2 or edge_index.size(0) != 2:
-            raise ValueError(
-                f"edge_index must have shape (2, E), got {tuple(edge_index.shape)}"
-            )
+            raise ValueError(f"edge_index shape mismatch. Expected (2, E), got {edge_index.shape}")
+            
         self.register_buffer("edge_index", edge_index.long(), persistent=False)
         self.lambda_tangent = float(lambda_tangent)
 
     def forward(
-        self,
-        v_hat: torch.Tensor,
-        v_star: torch.Tensor,
-        y_tau: torch.Tensor,
+        self, 
+        v_hat: torch.Tensor, 
+        v_star: torch.Tensor, 
+        y_tau: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
-        """Compute flow-matching loss and tangent regularization.
-        
-        Args:
-            v_hat: Predicted velocity of shape (B, N, 3)
-            v_star: Target velocity of shape (B, N, 3)
-            y_tau: Current keypoints of shape (B, N, 3)
-            
-        Returns:
-            Dictionary with keys: loss, loss_fm, loss_tangent
-        """
-        if v_hat.shape != v_star.shape:
-            raise ValueError(f"v_hat and v_star must have the same shape, got {v_hat.shape} vs {v_star.shape}")
-        if v_hat.shape != y_tau.shape:
-            raise ValueError(f"v_hat and y_tau must have the same shape, got {v_hat.shape} vs {y_tau.shape}")
+        if v_hat.shape != v_star.shape or v_hat.shape != y_tau.shape:
+            raise ValueError(f"Shape mismatch: v_hat={v_hat.shape}, v_star={v_star.shape}, y_tau={y_tau.shape}")
+
+        # 1. Flow Matching MSE
         loss_fm = F.mse_loss(v_hat, v_star)
+
+        # 2. Tangent Regularization (vectorized)
+        loss_tan = torch.tensor(0.0, device=v_hat.device)
         if self.lambda_tangent > 0.0:
             i, j = self.edge_index
-            diff_y = y_tau[:, i, :] - y_tau[:, j, :]
-            diff_v = v_hat[:, i, :] - v_hat[:, j, :]
-            residual = (diff_y * diff_v).sum(-1)
-            loss_tan = (residual ** 2).mean()
-        else:
-            loss_tan = torch.zeros((), device=v_hat.device, dtype=v_hat.dtype)
-        loss = loss_fm + self.lambda_tangent * loss_tan
-        return {"loss": loss, "loss_fm": loss_fm, "loss_tangent": loss_tan}
+            # Relative positions and velocities along edges
+            diff_y = y_tau[:, i] - y_tau[:, j]
+            diff_v = v_hat[:, i] - v_hat[:, j]
+            
+            # Penalize velocity components parallel to the bone vector (rigid body constraint)
+            # Dot product along the last dim
+            orthogonality = (diff_y * diff_v).sum(dim=-1)
+            loss_tan = (orthogonality ** 2).mean()
+
+        total_loss = loss_fm + self.lambda_tangent * loss_tan
+        
+        return {
+            "loss": total_loss,
+            "loss_fm": loss_fm,
+            "loss_tangent": loss_tan
+        }
 
 
 class TranslationLoss(nn.Module):
-    """Translation loss using SmoothL1.
-    
-    Args:
-        beta: Smoothing parameter for SmoothL1Loss
-    """
+    """Simple wrapper for SmoothL1 translation error."""
     def __init__(self, beta: float = 0.01):
         super().__init__()
         self.loss_fn = nn.SmoothL1Loss(beta=beta)
 
     def forward(self, pred_trans: torch.Tensor, gt_trans: torch.Tensor) -> torch.Tensor:
-        """Compute translation loss.
-        
-        Args:
-            pred_trans: Predicted translation of shape (B, 3)
-            gt_trans: Ground truth translation of shape (B, 3)
-            
-        Returns:
-            Translation loss (scalar)
-        """
         return self.loss_fn(pred_trans, gt_trans)
 
+
 class RotationGeodesicLoss(nn.Module):
-    """Geodesic loss for rotation matrices."""
+    """
+    Geodesic loss on SO(3).
+    Computes the angle θ needed to rotate pred to gt: θ = arccos((tr(R_diff) - 1) / 2)
+    """
     def __init__(self):
         super().__init__()
 
     def forward(self, pred_rot: torch.Tensor, gt_rot: torch.Tensor) -> torch.Tensor:
-        """Compute geodesic distance between rotation matrices.
+        # R_diff = R_gt^T * R_pred
+        m = torch.bmm(gt_rot.transpose(1, 2), pred_rot)
         
-        Args:
-            pred_rot: Predicted rotation matrices of shape (B, 3, 3)
-            gt_rot: Ground truth rotation matrices of shape (B, 3, 3)
-            
-        Returns:
-            Geodesic distance loss in radians (scalar)
-        """
-        M = torch.bmm(gt_rot.transpose(1, 2), pred_rot)
-        trace = M.diagonal(offset=0, dim1=-2, dim2=-1).sum(-1)
+        # Trace: sum of diagonal elements
+        trace = m.diagonal(dim1=-2, dim2=-1).sum(-1)
+        
+        # Clamp for numerical stability before acos
         cos_theta = (trace - 1.0) / 2.0
-        eps = 1e-5
-        cos_theta = torch.clamp(cos_theta, -1.0 + eps, 1.0 - eps)
-        geodesic_dist = torch.acos(cos_theta)
-        return geodesic_dist.mean()
+        cos_theta = torch.clamp(cos_theta, -1.0 + 1e-6, 1.0 - 1e-6)
+        
+        return torch.acos(cos_theta).mean()
 
 
 class JointLoss(nn.Module):
-    """Joint angle loss with SmoothL1 and boundary penalty.
-    
-    Args:
-        beta: Smoothing parameter for SmoothL1Loss
-        boundary_weight: Weight for boundary violation penalty
-        joint_lower: Lower joint limits of shape (num_joints,)
-        joint_upper: Upper joint limits of shape (num_joints,)
-    """
+    """SmoothL1 loss for joint angles with physical limit penalties."""
     def __init__(
-        self,
-        beta: float = 0.01,
+        self, 
+        beta: float = 0.01, 
         boundary_weight: float = 1.0,
-        joint_lower: Optional[torch.Tensor] = None,
-        joint_upper: Optional[torch.Tensor] = None,
+        joint_lower: Optional[torch.Tensor] = None, 
+        joint_upper: Optional[torch.Tensor] = None
     ):
         super().__init__()
         self.loss_fn = nn.SmoothL1Loss(beta=beta)
         self.boundary_weight = boundary_weight
+        
+        # Only register if limits are provided
         if joint_lower is not None and joint_upper is not None:
             self.register_buffer("joint_lower", joint_lower)
             self.register_buffer("joint_upper", joint_upper)
@@ -138,69 +120,41 @@ class JointLoss(nn.Module):
             self.joint_upper = None
 
     def forward(self, pred_joints: torch.Tensor, gt_joints: torch.Tensor) -> torch.Tensor:
-        """Compute joint angle loss with boundary penalties.
+        loss = self.loss_fn(pred_joints, gt_joints)
         
-        Args:
-            pred_joints: Predicted joint angles of shape (B, num_joints)
-            gt_joints: Ground truth joint angles of shape (B, num_joints)
+        if self.joint_lower is not None and self.boundary_weight > 0:
+            violation_low = F.relu(self.joint_lower - pred_joints)
+            violation_high = F.relu(pred_joints - self.joint_upper)
+            boundary_loss = (violation_low + violation_high).mean()
+            loss = loss + self.boundary_weight * boundary_loss
             
-        Returns:
-            Joint loss (scalar)
-        """
-        base_loss = self.loss_fn(pred_joints, gt_joints)
-        if self.joint_lower is not None and self.joint_upper is not None:
-            lower_violation = F.relu(self.joint_lower - pred_joints)
-            upper_violation = F.relu(pred_joints - self.joint_upper)
-            boundary_loss = (lower_violation + upper_violation).mean()
-            return base_loss + self.boundary_weight * boundary_loss
-        else:
-            return base_loss
+        return loss
 
 
 class ChamferLoss(nn.Module):
-    """Chamfer distance loss for reconstruction quality assessment.
-    
-    Args:
-        loss_type: Distance norm ('l1' or 'l2')
-    """
+    """Interface for PyTorch3D Chamfer Distance."""
     def __init__(self, loss_type: str = "l2"):
         super().__init__()
         if not _PYTORCH3D_AVAILABLE:
-            raise ImportError("pytorch3d is required for ChamferLoss")
-        self.loss_type = loss_type
+            # We raise at runtime init rather than import time to allow flexible usage
+            raise ImportError("pytoch3d is required for ChamferLoss but not found.")
+        self.norm = 1 if loss_type == "l1" else 2
 
     def forward(self, pred_points: torch.Tensor, gt_points: torch.Tensor) -> torch.Tensor:
-        """Compute Chamfer distance between point clouds.
-        
-        Args:
-            pred_points: Predicted point cloud of shape (B, N1, 3)
-            gt_points: Ground truth point cloud of shape (B, N2, 3)
-            
-        Returns:
-            Chamfer distance loss (scalar)
-        """
-        if self.loss_type == "l1":
-            loss, _ = chamfer_distance(
-                pred_points, gt_points,
-                point_reduction="mean", batch_reduction="mean", norm=1,
-            )
-        else:
-            loss, _ = chamfer_distance(
-                pred_points, gt_points,
-                point_reduction="mean", batch_reduction="mean", norm=2,
-            )
+        loss, _ = chamfer_distance(
+            pred_points, 
+            gt_points, 
+            point_reduction="mean", 
+            batch_reduction="mean", 
+            norm=self.norm
+        )
         return loss
 
 
 class PhysicsLoss(nn.Module):
-    """Physics-based loss for self-collision, joint limits, and constraints.
-    
-    Args:
-        hand_model: HandModel instance
-        use_self_penetration: Whether to use self-collision loss
-        use_joint_limit: Whether to use joint limit loss
-        use_finger_finger: Whether to use finger-finger distance loss
-        use_finger_palm: Whether to use finger-palm distance loss
+    """
+    Computes energy-based physical constraints.
+    Note: Requires a stateful `hand_model` that can update parameters.
     """
     def __init__(
         self,
@@ -212,54 +166,34 @@ class PhysicsLoss(nn.Module):
     ):
         super().__init__()
         self.hand_model = hand_model
-        self.use_self_penetration = use_self_penetration
-        self.use_joint_limit = use_joint_limit
-        self.use_finger_finger = use_finger_finger
-        self.use_finger_palm = use_finger_palm
+        
+        # Register active energy functions
+        self.active_constraints: List[Callable[[], torch.Tensor]] = []
+        if use_self_penetration:
+            self.active_constraints.append(self.hand_model.cal_self_penetration_energy)
+        if use_joint_limit:
+            self.active_constraints.append(self.hand_model.cal_joint_limit_energy)
+        if use_finger_finger:
+            self.active_constraints.append(self.hand_model.cal_finger_finger_distance_energy)
+        if use_finger_palm:
+            self.active_constraints.append(self.hand_model.cal_finger_palm_distance_energy)
 
     def forward(self, hand_pose: torch.Tensor) -> torch.Tensor:
-        """Compute physics-based energy terms.
-        
-        Args:
-            hand_pose: Hand pose parameters of shape (B, pose_dim)
-            
-        Returns:
-            Physics loss (scalar)
-        """
-        self.hand_model.set_parameters(hand_pose)
-        total_loss = 0.0
-        count = 0
-        if self.use_self_penetration:
-            total_loss = total_loss + self.hand_model.cal_self_penetration_energy().mean()
-            count += 1
-        if self.use_joint_limit:
-            total_loss = total_loss + self.hand_model.cal_joint_limit_energy().mean()
-            count += 1
-        if self.use_finger_finger:
-            total_loss = total_loss + self.hand_model.cal_finger_finger_distance_energy().mean()
-            count += 1
-        if self.use_finger_palm:
-            total_loss = total_loss + self.hand_model.cal_finger_palm_distance_energy().mean()
-            count += 1
-        if count > 0:
-            return total_loss / count
-        else:
+        if not self.active_constraints:
             return torch.tensor(0.0, device=hand_pose.device)
+
+        # Update model state (side-effect)
+        self.hand_model.set_parameters(hand_pose)
+        
+        # Accumulate energies
+        total_energy = sum(fn().mean() for fn in self.active_constraints)
+        return total_energy / len(self.active_constraints)
 
 
 class TotalLoss(nn.Module):
-    """Unified loss function combining all loss components.
-    
-    Args:
-        hand_model: HandModel instance
-        w_trans: Translation loss weight
-        w_rot: Rotation loss weight
-        w_joint: Joint loss weight
-        w_chamfer: Chamfer loss weight
-        w_physics: Physics loss weight (final value)
-        physics_ramp_epochs: Number of epochs to ramp up physics loss weight
-        joint_lower: Lower joint limits
-        joint_upper: Upper joint limits
+    """
+    Orchestrator class that aggregates all specific losses.
+    Handles physics loss ramp-up scheduling.
     """
     def __init__(
         self,
@@ -274,111 +208,200 @@ class TotalLoss(nn.Module):
         joint_upper: Optional[torch.Tensor] = None,
     ):
         super().__init__()
-        self.hand_model = hand_model
-        self.w_trans = w_trans
-        self.w_rot = w_rot
-        self.w_joint = w_joint
-        self.w_chamfer = w_chamfer
-        self.w_physics = w_physics
+        self.weights = {
+            "trans": w_trans,
+            "rot": w_rot,
+            "joint": w_joint,
+            "chamfer": w_chamfer,
+            "physics": w_physics
+        }
         self.physics_ramp_epochs = physics_ramp_epochs
-        self.translation_loss = TranslationLoss()
-        self.rotation_loss = RotationGeodesicLoss()
-        self.joint_loss = JointLoss(joint_lower=joint_lower, joint_upper=joint_upper)
-        self.chamfer_loss = ChamferLoss()
-        self.physics_loss = PhysicsLoss(hand_model)
         self.current_epoch = 0
+        self.hand_model = hand_model
+
+        # Initialize sub-modules
+        self.trans_loss = TranslationLoss()
+        self.rot_loss = RotationGeodesicLoss()
+        self.joint_loss = JointLoss(joint_lower=joint_lower, joint_upper=joint_upper)
+        self.chamfer_loss = ChamferLoss() if _PYTORCH3D_AVAILABLE else None
+        self.physics_loss = PhysicsLoss(hand_model)
 
     def set_epoch(self, epoch: int):
-        """Set current epoch for physics loss ramp-up."""
         self.current_epoch = epoch
 
-    def get_physics_weight(self) -> float:
-        """Compute current physics loss weight with ramp-up schedule."""
+    def _get_physics_weight(self) -> float:
         if self.physics_ramp_epochs <= 0:
-            return self.w_physics
-        ramp_progress = min(1.0, self.current_epoch / self.physics_ramp_epochs)
-        return self.w_physics * ramp_progress
+            return self.weights["physics"]
+        factor = min(1.0, self.current_epoch / self.physics_ramp_epochs)
+        return self.weights["physics"] * factor
+
+    def _compute_component(self, name: str, value: torch.Tensor) -> torch.Tensor:
+        """Helper to handle zero-weighted losses efficiently."""
+        w = self._get_physics_weight() if name == "physics" else self.weights.get(name, 0.0)
+        if w > 0.0:
+            return w * value
+        # Return detached zero to avoid graph computation if weight is 0
+        return torch.zeros_like(value).detach() if value.numel() > 1 else torch.tensor(0.0, device=value.device)
 
     def forward(
         self,
-        pred_trans: torch.Tensor,
-        pred_rot: torch.Tensor,
-        pred_joints: torch.Tensor,
-        gt_trans: torch.Tensor,
-        gt_rot: torch.Tensor,
-        gt_joints: torch.Tensor,
+        pred_trans: torch.Tensor, pred_rot: torch.Tensor, pred_joints: torch.Tensor,
+        gt_trans: torch.Tensor, gt_rot: torch.Tensor, gt_joints: torch.Tensor,
         pred_hand_pose: Optional[torch.Tensor] = None,
         gt_hand_pose: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Compute all loss components and return as dictionary.
         
-        Args:
-            pred_trans: Predicted translation of shape (B, 3)
-            pred_rot: Predicted rotation matrices of shape (B, 3, 3)
-            pred_joints: Predicted joint angles of shape (B, num_joints)
-            gt_trans: Ground truth translation of shape (B, 3)
-            gt_rot: Ground truth rotation matrices of shape (B, 3, 3)
-            gt_joints: Ground truth joint angles of shape (B, num_joints)
-            pred_hand_pose: Predicted full hand pose of shape (B, pose_dim)
-            gt_hand_pose: Ground truth full hand pose of shape (B, pose_dim)
-            
-        Returns:
-            Dictionary containing all loss components and total loss
-        """
+        device = pred_trans.device
         losses = {}
-        if self.w_trans > 0:
-            losses["trans"] = self.translation_loss(pred_trans, gt_trans)
-        else:
-            losses["trans"] = torch.tensor(0.0, device=pred_trans.device)
-        if self.w_rot > 0:
-            losses["rot"] = self.rotation_loss(pred_rot, gt_rot)
-        else:
-            losses["rot"] = torch.tensor(0.0, device=pred_trans.device)
-        if self.w_joint > 0:
-            losses["joint"] = self.joint_loss(pred_joints, gt_joints)
-        else:
-            losses["joint"] = torch.tensor(0.0, device=pred_trans.device)
-        if self.w_chamfer > 0 and pred_hand_pose is not None and gt_hand_pose is not None:
+
+        # 1. Basic Regression Losses
+        losses["trans"] = self.trans_loss(pred_trans, gt_trans) if self.weights["trans"] > 0 else torch.tensor(0.0, device=device)
+        losses["rot"] = self.rot_loss(pred_rot, gt_rot) if self.weights["rot"] > 0 else torch.tensor(0.0, device=device)
+        losses["joint"] = self.joint_loss(pred_joints, gt_joints) if self.weights["joint"] > 0 else torch.tensor(0.0, device=device)
+
+        # 2. Geometric / Physics Losses (Conditional)
+        losses["chamfer"] = torch.tensor(0.0, device=device)
+        if self.weights["chamfer"] > 0 and self.chamfer_loss and pred_hand_pose is not None and gt_hand_pose is not None:
+            # We must use hand_model to get keypoints. Note: side-effects on hand_model state.
             self.hand_model.set_parameters(pred_hand_pose)
-            pred_keypoints = self.hand_model.get_penetration_keypoints()
+            pred_kps = self.hand_model.get_penetration_keypoints()
             self.hand_model.set_parameters(gt_hand_pose)
-            gt_keypoints = self.hand_model.get_penetration_keypoints()
-            losses["chamfer"] = self.chamfer_loss(pred_keypoints, gt_keypoints)
-        else:
-            losses["chamfer"] = torch.tensor(0.0, device=pred_trans.device)
-        if pred_hand_pose is not None:
-            physics_weight = self.get_physics_weight()
-            if physics_weight > 0:
-                losses["physics"] = self.physics_loss(pred_hand_pose)
-            else:
-                losses["physics"] = torch.tensor(0.0, device=pred_trans.device)
-        else:
-            losses["physics"] = torch.tensor(0.0, device=pred_trans.device)
-        physics_weight = self.get_physics_weight()
-        losses["total"] = (
-            self.w_trans * losses["trans"]
-            + self.w_rot * losses["rot"]
-            + self.w_joint * losses["joint"]
-            + self.w_chamfer * losses["chamfer"]
-            + physics_weight * losses["physics"]
+            gt_kps = self.hand_model.get_penetration_keypoints()
+            losses["chamfer"] = self.chamfer_loss(pred_kps, gt_kps)
+
+        losses["physics"] = torch.tensor(0.0, device=device)
+        if self._get_physics_weight() > 0 and pred_hand_pose is not None:
+            losses["physics"] = self.physics_loss(pred_hand_pose)
+
+        # 3. Aggregate
+        total = sum(
+            (losses[k] * (self._get_physics_weight() if k == "physics" else self.weights[k]))
+            for k in losses if k in self.weights
         )
+        losses["total"] = total
+        
         return losses
 
 
-if __name__ == "__main__":
-    print("Testing loss functions...")
-    trans_loss = TranslationLoss()
-    pred_trans = torch.randn(4, 3)
-    gt_trans = torch.randn(4, 3)
-    loss = trans_loss(pred_trans, gt_trans)
-    print(f"Translation loss: {loss.item():.6f}")
-    rot_loss = RotationGeodesicLoss()
-    pred_rot = torch.randn(4, 3, 3)
-    gt_rot = torch.randn(4, 3, 3)
-    loss = rot_loss(pred_rot, gt_rot)
-    print(f"Rotation loss: {loss.item():.6f} rad ({loss.item() * 180 / 3.14159:.2f} deg)")
-    joint_loss = JointLoss()
-    pred_joints = torch.randn(4, 16)
-    gt_joints = torch.randn(4, 16)
-    loss = joint_loss(pred_joints, gt_joints)
-    print(f"Joint loss: {loss.item():.6f}")
+class HandValidationMetricManager:
+    """
+    Computes validation metrics for Flow Matching and Hand Reconstruction.
+    Configurable via nested dictionary.
+    """
+    def __init__(self, edge_index: torch.Tensor, config: Optional[Dict] = None) -> None:
+        if edge_index.dim() != 2 or edge_index.size(0) != 2:
+            raise ValueError(f"edge_index mismatch. Expected (2, E), got {edge_index.shape}")
+        
+        self.edge_index = edge_index.long().detach().cpu()
+        cfg = config or {}
+
+        # --- Parse Config Safely ---
+        self.flow = cfg.get("flow", {})
+        self.recon = cfg.get("recon", {})
+        
+        self.flow_enabled = self.flow.get("enabled", True)
+        self.recon_enabled = self.recon.get("enabled", True)
+
+        # Pre-fetch weights to avoid dict lookups in loop
+        self.flow_weights = self.flow.get("weights", {})
+        
+        # Recon Sub-configs
+        self.cfg_smooth = self.recon.get("smooth_l1", {})
+        self.cfg_chamfer = self.recon.get("chamfer", {})
+        self.cfg_dir = self.recon.get("direction", {})
+        self.cfg_edge = self.recon.get("edge_len", {})
+
+    def compute_flow_metrics(
+        self, 
+        loss_dict: Dict[str, torch.Tensor], 
+        flow_edge_len_err: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        
+        if not self.flow_enabled:
+            return {}
+
+        # Collect raw values
+        metrics = {
+            "loss": loss_dict.get("loss"),
+            "loss_fm": loss_dict.get("loss_fm"),
+            "loss_tangent": loss_dict.get("loss_tangent"),
+            "edge_len_err": flow_edge_len_err
+        }
+        
+        # Filter None values and detach
+        metrics = {k: v.detach() for k, v in metrics.items() if v is not None}
+        
+        # Compute Weighted Total
+        total = torch.tensor(0.0, device=flow_edge_len_err.device)
+        for name, value in metrics.items():
+            w = float(self.flow_weights.get(name, 0.0 if name != "loss" else 1.0))
+            if w > 0 and torch.isfinite(value):
+                total += w * value
+                
+        metrics["total"] = total
+        return metrics
+
+    def compute_recon_metrics(
+        self, 
+        pred_xyz: torch.Tensor, 
+        gt_xyz: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        
+        if not self.recon_enabled:
+            return {}
+        if pred_xyz.shape != gt_xyz.shape:
+            raise ValueError("Shape mismatch in reconstruction metrics.")
+
+        device = pred_xyz.device
+        metrics = {}
+        total = torch.tensor(0.0, device=device)
+
+        # 1. Smooth L1
+        if self.cfg_smooth.get("enabled", True):
+            val = F.smooth_l1_loss(pred_xyz, gt_xyz, beta=self.cfg_smooth.get("beta", 0.01))
+            metrics["smooth_l1"] = val
+            total += val * self.cfg_smooth.get("weight", 1.0)
+
+        # 2. Chamfer
+        if self.cfg_chamfer.get("enabled", True):
+            w = self.cfg_chamfer.get("weight", 1.0)
+            if _PYTORCH3D_AVAILABLE and self.cfg_chamfer.get("use_pytorch3d", True):
+                val, _ = chamfer_distance(pred_xyz, gt_xyz, point_reduction="mean", batch_reduction="mean")
+                metrics["chamfer"] = val
+                total += val * w
+            else:
+                metrics["chamfer"] = torch.tensor(float("nan"), device=device)
+
+        # 3. Edge Direction
+        if self.cfg_dir.get("enabled", True):
+            w = self.cfg_dir.get("weight", 1.0)
+            eps = self.cfg_dir.get("eps", 1e-6)
+            edges = self.edge_index.to(device)
+            
+            v_gt = F.normalize(gt_xyz[:, edges[1]] - gt_xyz[:, edges[0]] + eps, dim=-1)
+            v_pd = F.normalize(pred_xyz[:, edges[1]] - pred_xyz[:, edges[0]] + eps, dim=-1)
+            
+            if self.cfg_dir.get("mode", "cos") == "l2":
+                val = (v_pd - v_gt).norm(p=2, dim=-1).mean()
+            else:
+                cos_sim = (v_gt * v_pd).sum(dim=-1).clamp(-1, 1)
+                val = (1.0 - cos_sim).mean()
+            
+            metrics["direction"] = val
+            total += val * w
+
+        # 4. Edge Length
+        if self.cfg_edge.get("enabled", True):
+            w = self.cfg_edge.get("weight", 1.0)
+            eps = self.cfg_edge.get("eps", 1e-6)
+            edges = self.edge_index.to(device)
+            
+            len_gt = (gt_xyz[:, edges[0]] - gt_xyz[:, edges[1]]).norm(dim=-1)
+            len_pd = (pred_xyz[:, edges[0]] - pred_xyz[:, edges[1]]).norm(dim=-1)
+            
+            val = ((len_pd - len_gt).abs() / (len_gt + eps)).mean()
+            metrics["edge_len_err"] = val
+            total += val * w
+
+        metrics["total"] = total
+        return metrics

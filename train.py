@@ -23,10 +23,9 @@ from lightning.pytorch.loggers import Logger
 from lightning.pytorch.tuner import Tuner
 from lightning.pytorch.utilities import rank_zero_only
 from omegaconf import DictConfig, OmegaConf
-from rich.logging import RichHandler
-from rich.traceback import install as install_rich_traceback
 from rich.console import Console
 from utils.logging_utils import setup_rich_logging
+from itertools import compress
 
 # Ensure src is in path for module resolution
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -79,7 +78,7 @@ def instantiate_datamodule(cfg: DictConfig, log: logging.Logger) -> L.LightningD
     datamodule.setup(stage="fit")
     
     if not hasattr(datamodule, "get_graph_constants"):
-        raise RuntimeError("Datamodule must implement get_graph_constants() for flow-matching training.")
+        raise RuntimeError("Datamodule must implement get_graph_constants() for training.")
     return datamodule
 
 
@@ -107,10 +106,10 @@ def maybe_save_final_config(cfg: DictConfig, log: logging.Logger) -> None:
 
 def log_trainer_summary(trainer: Trainer, cfg: DictConfig, log: logging.Logger) -> None:
     log.info("Trainer configuration:")
-    log.info(f"  - Accelerator: [bold]{trainer.accelerator}[/]")
-    log.info(f"  - Devices: [bold]{cfg.trainer.devices}[/]")
-    log.info(f"  - Precision: [bold]{cfg.trainer.precision}[/]")
-    log.info(f"  - Max epochs: [bold]{cfg.trainer.max_epochs}[/]")
+    log.info(f" Accelerator: [bold]{trainer.accelerator}[/]")
+    log.info(f" Devices: [bold]{cfg.trainer.devices}[/]")
+    log.info(f" Precision: [bold]{cfg.trainer.precision}[/]")
+    log.info(f" Max epochs: [bold]{cfg.trainer.max_epochs}[/]")
 
 
 def log_best_checkpoint(trainer: Trainer, log: logging.Logger) -> None:
@@ -207,13 +206,31 @@ def main(cfg: DictConfig) -> None:
     
     # Initialize Model
     console.print("")
-    console.rule("🔮 [bold italic #FF33CC] Initializing Flow Matching Hand DiT model[/]")
+    console.rule("🔮 [bold italic #FF33CC] Initializing Model[/]")
     console.print("")
     if not hasattr(cfg.get("model", {}), "_target_"):
         raise ValueError("cfg.model must specify a Hydra '_target_'")
 
     model = hydra_instantiate(cfg.model, graph_consts=graph_consts, _recursive_=False)
+    # run_meta = {}
+    # if cfg.get("experiment_name"):
+    #     run_meta["experiment_name"] = cfg.experiment_name
+    # backbone_cfg = OmegaConf.select(cfg, "backbone")
+    # if backbone_cfg is not None:
+    #     name = getattr(backbone_cfg, "name", None)
+    #     if name is not None:
+    #         run_meta["backbone_name"] = name
+    # if hasattr(model, "velocity_mode"):
+    #     run_meta["velocity_mode"] = model.velocity_mode
+    # model.run_meta = run_meta
 
+    model.run_meta = {
+        k: v for k, v in {
+            "experiment_name": cfg.get("experiment_name"),
+            "backbone_name": getattr(OmegaConf.select(cfg, "backbone"), "name", None),
+            "velocity_mode": getattr(model, "velocity_mode", None)
+        }.items() if v is not None
+    }
     # Compile model if configured
     if cfg.get("compile", False):
         if hasattr(torch, "compile"):
@@ -237,11 +254,11 @@ def main(cfg: DictConfig) -> None:
     # console.print("")
     callbacks = setup_callbacks(cfg)
     for cb in callbacks:
-        log.info(f"  - [bold]{cb.__class__.__name__}[/]")
+        log.info(f" [bold]{cb.__class__.__name__}[/]")
         
     logger = setup_logger(cfg)
     if logger:
-        log.info(f"  - [bold]{logger.__class__.__name__}[/]")
+        log.info(f" [bold]{logger.__class__.__name__}[/]")
     else:
         log.warning("No logger configured")
     
@@ -250,7 +267,6 @@ def main(cfg: DictConfig) -> None:
     console.rule("🦄 [bold italic #3300FF] Initializing Trainer[/]")
     console.print("")
     trainer_kwargs = OmegaConf.to_container(cfg.trainer, resolve=True)
-    # track_grad_norm logic removed as it is now handled via callbacks config
 
     # Configure Profiler
     if trainer_kwargs.get("profiler") == "advanced":

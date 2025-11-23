@@ -128,9 +128,7 @@ class RK4Solver(ODESolverBase):
         return keypoints + (dt / 6.0) * (v1 + 2.0 * v2 + 2.0 * v3 + v4)
 
 
-# =============================================================================
 # Solver Registry
-# =============================================================================
 
 SOLVER_REGISTRY = {
     "euler": EulerSolver,

@@ -1,0 +1,53 @@
+# @package _global_
+
+# Profiler Experiment Configuration
+# Usage: python train.py experiment=profiler
+
+defaults:
+  - override /trainer: default
+
+# Experiment Metadata
+experiment_name: profiler_analysis
+tags: ["profiler", "debug", "performance"]
+
+# Trainer Configuration for Profiling
+trainer:
+  profiler: "advanced"      # Enable advanced profiler
+  max_epochs: 2             # Run only 1 epoch
+  check_val_every_n_epoch: 1
+  limit_train_batches: 50  # Run only 100 batches to save time
+  limit_val_batches: 10      # Skip validation to focus on training
+  # limit_test_batches: 0     # Skip testing
+  num_sanity_val_steps: 0   # Skip sanity check to avoid noise in profile
+  log_every_n_steps: 1
+  precision: 32             # Use FP32 for accurate profiling (avoid spconv auto-tune noise)
+  benchmark: true           # Enable cuDNN benchmark
+
+# Disable Auto-Tuning (Profiling needs fixed settings)
+auto_scale_batch_size: false
+auto_lr_find: false
+auto_resume: false
+
+compile: true
+
+# Data Settings (Ensure fast loading for profiling)
+batch_size: 256
+datamodule:
+  num_workers: 8            # Ensure enough workers
+  prefetch_factor: 2
+  pin_memory: true
+
+# Logger (Disable heavy logging)
+logger:
+  _target_: lightning.pytorch.loggers.TensorBoardLogger
+  save_dir: ${paths.output_dir}/tensorboard
+  name: null
+  version: null
+  default_hp_metric: false
+
+# Disable callbacks that expect validation metrics
+# callbacks:
+#   early_stopping: null
+#   device_stats_monitor: null
+#   hand_vis: null
+#   ema: null

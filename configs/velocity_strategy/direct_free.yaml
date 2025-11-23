@@ -1,0 +1,7 @@
+# Default direct prediction
+mode: "direct"
+kwargs:
+  use_tangent: false
+# Default projection
+projection_mode: "none"
+projection_kwargs: {}

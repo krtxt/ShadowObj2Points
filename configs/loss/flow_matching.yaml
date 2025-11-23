@@ -1,1 +1,29 @@
 lambda_tangent: 1.0
+
+val_metrics:
+  flow:
+    enabled: true
+    weights:
+      loss: 1.0
+      loss_fm: 1.0
+      loss_tangent: 0.0
+      edge_len_err: 0.0
+  recon:
+    enabled: true
+    smooth_l1:
+      enabled: true
+      weight: 1.0
+      beta: 0.01
+    chamfer:
+      enabled: true
+      weight: 1.0
+      use_pytorch3d: true
+    direction:
+      enabled: true
+      weight: 1.0
+      mode: cos
+      eps: 1.0e-6
+    edge_len:
+      enabled: true
+      weight: 1.0
+      eps: 1.0e-6

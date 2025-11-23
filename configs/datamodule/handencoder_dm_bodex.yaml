@@ -45,3 +45,4 @@ dataset_kwargs:
   normalization_stats_path: assets/unified_normalization_stats
   split_file_name: bodex_split.json
   debug_mode: false
+  max_points: 4096

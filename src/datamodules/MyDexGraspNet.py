@@ -102,6 +102,7 @@ class MyDexGraspNet(Dataset):
         self.scene_ids: List[str] = []
         self.scene_pcds: Dict[str, np.ndarray] = {}
         self._scene_pc_cache: Dict[str, torch.Tensor] = {}
+        self._missing_pcd_objects: set = set()
 
         self._load_data()
         self._load_point_clouds()
@@ -235,10 +236,10 @@ class MyDexGraspNet(Dataset):
                 cmin, cmax = min(counts), max(counts)
                 cmean = sum(counts) / max(1, len(counts))
                 czero = sum(1 for c in counts if c == 0)
-                logger.info(
-                    "MyDexGraspNet: grasps/scene stats -> min=%d max=%d mean=%.1f zeros=%d (scenes=%d)",
-                    cmin, cmax, cmean, czero, len(counts)
-                )
+                # logger.info(
+                #     "MyDexGraspNet: grasps/scene stats -> min=%d max=%d mean=%.1f zeros=%d (scenes=%d)",
+                #     cmin, cmax, cmean, czero, len(counts)
+                # )
             # Translation magnitude range
             trans_all = torch.cat([self.scene_data[sid]['trans'] for sid in self.scene_ids], dim=0)
             tmin = trans_all.min().item() if trans_all.numel() > 0 else 0.0
@@ -302,7 +303,7 @@ class MyDexGraspNet(Dataset):
             try:
                 with open(path_json, 'r') as f:
                     stats_obj = json.load(f)
-                logger.info("Loaded normalization stats from JSON: %s", path_json)
+                # logger.info("Loaded normalization stats from JSON: %s", path_json)
             except Exception as e:
                 logger.warning("Failed to load JSON: %s", e)
                 stats_obj = None
@@ -528,6 +529,15 @@ class MyDexGraspNet(Dataset):
     def _load_point_cloud(self, object_name: str, scale: float) -> torch.Tensor:
         scene_pc = self.scene_pcds.get(object_name)
         if scene_pc is None or not isinstance(scene_pc, np.ndarray) or scene_pc.ndim < 2 or scene_pc.shape[1] < 3:
+            if not hasattr(self, "_missing_pcd_objects"):
+                self._missing_pcd_objects = set()
+            if object_name not in self._missing_pcd_objects:
+                logger.warning(
+                    "MyDexGraspNet: no valid point cloud found for object '%s' in %s; returning empty point cloud.",
+                    object_name,
+                    self.point_cloud_path,
+                )
+                self._missing_pcd_objects.add(object_name)
             return torch.zeros((0, 3), dtype=torch.float32)
 
         scene_pc_xyz = scene_pc[:, :3] * float(scale)

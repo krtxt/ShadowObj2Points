@@ -67,6 +67,9 @@ optimizer_cfg: ${optimizer}
 # -----------------------------------------------------------------------------
 # 5. Sampling & constraint projection
 # -----------------------------------------------------------------------------
+use_norm_data: true
+use_per_point_gaussian_noise: true
+
 # sample_num_steps: 采样时 ODE Euler 步数（从 t=0 积分到 t=1）
 #   - 20: 快速粗略采样
 #   - 40: 默认推荐

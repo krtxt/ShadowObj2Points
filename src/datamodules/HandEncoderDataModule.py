@@ -305,6 +305,38 @@ def _build_rigid_groups_from_link_map(link_to_unique: Dict[str, List[int]]) -> L
     return groups
 
 
+def _build_manual_rigid_groups_by_index(N: int) -> List[List[int]]:
+    """
+    Build rigid groups directly by index order (0-based) to match observed layout,
+    avoiding name-based dependencies.
+    """
+    manual_groups = [
+        [0, 1],
+        [1, 5, 4, 3, 2, 6],
+        [6, 20],
+        [20, 21],
+        [21, 22],
+        [2, 7],
+        [7, 8],
+        [8, 9],
+        [3, 10],
+        [10, 11],
+        [11, 12],
+        [4, 13],
+        [13, 14],
+        [14, 15],
+        [5, 16],
+        [16, 17],
+        [17, 18],
+        [18, 19],
+    ]
+    filtered: List[List[int]] = []
+    for grp in manual_groups:
+        if all(0 <= i < N for i in grp):
+            filtered.append(grp)
+    return filtered
+
+
 def _compute_rest_lengths(
     hand_model: HandModel,
     edge_index_t: torch.Tensor,
@@ -332,9 +364,13 @@ class _HandEncoderPreparedDataset(Dataset):
         scale: float = 1.0,
         norm_xyz_bounds: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_local_pose_only: bool = False,
+        return_norm: bool = False,
+        scene_pc_return_mode: Optional[str] = None,
+        cache_dataset: Optional[Dataset] = None,
     ) -> None:
         super().__init__()
         self.base = base_dataset
+        self.cache = cache_dataset
         self.hand_model = hand_model
         self.link_to_unique = canonical_link_to_unique
         self.finger_ids = finger_ids
@@ -348,7 +384,20 @@ class _HandEncoderPreparedDataset(Dataset):
         self._norm_xyz_max: Optional[torch.Tensor] = None
         self._norm_eps = 1e-6
         self.use_local_pose_only = bool(use_local_pose_only)
-        if norm_xyz_bounds is not None:
+        self.return_norm = bool(return_norm)
+        if scene_pc_return_mode is None:
+            self.scene_pc_return_mode = "norm" if self.return_norm else "raw"
+        else:
+            self.scene_pc_return_mode = str(scene_pc_return_mode).lower()
+        if self.scene_pc_return_mode not in ("raw", "norm", "both"):
+            raise ValueError(f"scene_pc_return_mode must be one of ['raw','norm','both'], got {self.scene_pc_return_mode}")
+        if self.scene_pc_return_mode in ("norm", "both") and not self.return_norm:
+            raise ValueError("scene_pc_return_mode='norm' or 'both' requires return_norm=True to compute normalized scene_pc.")
+        if self.cache is not None and len(self.cache) != len(self.base):
+            raise RuntimeError(
+                f"Cached dataset length {len(self.cache)} does not match base dataset length {len(self.base)}"
+            )
+        if self.return_norm and norm_xyz_bounds is not None:
             lo, hi = norm_xyz_bounds
             self._norm_xyz_min = lo.to(device=self.hand_model.device, dtype=torch.float32).view(1, 3)
             self._norm_xyz_max = hi.to(device=self.hand_model.device, dtype=torch.float32).view(1, 3)
@@ -440,16 +489,18 @@ class _HandEncoderPreparedDataset(Dataset):
         return xyz
 
     def _normalize_xyz(self, xyz: torch.Tensor) -> torch.Tensor:
+        """Normalize xyz using preloaded bounds to [-1, 1]."""
         if self._norm_xyz_min is None or self._norm_xyz_max is None:
-            return xyz.clone()
+            raise RuntimeError("Normalization bounds are not initialized.")
         denom = torch.clamp(self._norm_xyz_max - self._norm_xyz_min, min=self._norm_eps)
         norm = (xyz - self._norm_xyz_min) / denom
         norm = norm * 2.0 - 1.0
         return torch.clamp(norm, -1.0, 1.0)
 
     def _denormalize_xyz(self, norm_xyz: torch.Tensor) -> torch.Tensor:
+        """Inverse of _normalize_xyz."""
         if self._norm_xyz_min is None or self._norm_xyz_max is None:
-            return norm_xyz.clone()
+            raise RuntimeError("Normalization bounds are not initialized.")
         norm = torch.clamp(norm_xyz, -1.0, 1.0)
         unscaled = (norm + 1.0) * 0.5
         denom = torch.clamp(self._norm_xyz_max - self._norm_xyz_min, min=self._norm_eps)
@@ -499,19 +550,28 @@ class _HandEncoderPreparedDataset(Dataset):
             return torch.cat([local.to(dtype=scene_pc.dtype), tail], dim=1)
         return local.to(dtype=scene_pc.dtype)
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        sample = self.base[idx]
+    def _get_hand_pose_tensor(self, sample: Dict[str, Any]) -> torch.Tensor:
         hand_pose = sample['hand_model_pose']
         if not isinstance(hand_pose, torch.Tensor):
             hand_pose_t = torch.tensor(hand_pose, dtype=torch.float32)
         else:
             hand_pose_t = hand_pose.to(torch.float32)
+        return hand_pose_t
 
-        cached_xyz = sample.get('cached_xyz_local')
-        cached_se3 = sample.get('cached_se3')
+    def _get_cached_entries(self, idx: int, sample: Dict[str, Any]) -> Tuple[Any, Any]:
+        cached_xyz = None
+        cached_se3 = None
+        if self.cache is not None:
+            cache_sample = self.cache[idx]
+            cached_xyz = cache_sample.get('cached_xyz_local')
+            cached_se3 = cache_sample.get('cached_se3')
+        else:
+            cached_xyz = sample.get('cached_xyz_local')
+            cached_se3 = sample.get('cached_se3')
+        return cached_xyz, cached_se3
 
+    def _get_scene_pc_tensor(self, sample: Dict[str, Any]) -> torch.Tensor:
         scene_pc_raw = sample.get('scene_pc')
-        scene_pc: torch.Tensor
         if isinstance(scene_pc_raw, torch.Tensor):
             scene_pc = scene_pc_raw.to(torch.float32)
         elif isinstance(scene_pc_raw, np.ndarray):
@@ -522,9 +582,15 @@ class _HandEncoderPreparedDataset(Dataset):
                 scene_pc = torch.zeros((0, 3), dtype=torch.float32)
         else:
             scene_pc = torch.zeros((0, 3), dtype=torch.float32)
+        return scene_pc
 
-        xyz_world: Optional[torch.Tensor] = None
-
+    def _compute_xyz_and_scene_pc(
+        self,
+        hand_pose_t: torch.Tensor,
+        cached_xyz: Any,
+        cached_se3: Any,
+        scene_pc: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.use_local_pose_only:
             q = hand_pose_t.unsqueeze(0).to(self.hand_model.device)
             # First compute world-frame keypoints to obtain the hand's global SE(3)
@@ -549,11 +615,27 @@ class _HandEncoderPreparedDataset(Dataset):
             if cached_xyz is not None and cached_se3 is not None:
                 xyz = self._xyz_from_cache(cached_xyz, cached_se3).to(torch.float32)
             elif cached_xyz is not None:
-                xyz = (cached_xyz if isinstance(cached_xyz, torch.Tensor) else torch.tensor(cached_xyz, dtype=torch.float32)).to(torch.float32)
+                xyz = (
+                    cached_xyz
+                    if isinstance(cached_xyz, torch.Tensor)
+                    else torch.tensor(cached_xyz, dtype=torch.float32)
+                ).to(torch.float32)
             if xyz is None:
                 q = hand_pose_t.unsqueeze(0).to(self.hand_model.device)
                 xyz = self._build_xyz_from_pose(q).to(torch.float32)
-        norm_xyz = self._normalize_xyz(xyz)
+        return xyz, scene_pc
+
+    def _build_output(
+        self,
+        sample: Dict[str, Any],
+        hand_pose_t: torch.Tensor,
+        xyz: torch.Tensor,
+        scene_pc: torch.Tensor,
+    ) -> Dict[str, Any]:
+        if self.return_norm:
+            norm_xyz = self._normalize_xyz(xyz)
+        else:
+            norm_xyz = xyz.clone()
         norm_pose = sample.get('norm_pose')
         if norm_pose is not None:
             if isinstance(norm_pose, np.ndarray):
@@ -580,8 +662,35 @@ class _HandEncoderPreparedDataset(Dataset):
             'scene_id': sample.get('scene_id'),
         }
         if scene_pc.numel() > 0:
-            out['scene_pc'] = scene_pc.cpu()
+            # Normalize scene xyz using the same bounds; keep extra features unchanged.
+            norm_scene_pc = None
+            if self.return_norm:
+                xyz_part = scene_pc[:, :3]
+                norm_scene_xyz = self._normalize_xyz(xyz_part)
+                if scene_pc.shape[1] > 3:
+                    tail = scene_pc[:, 3:]
+                    norm_scene_pc = torch.cat([norm_scene_xyz, tail], dim=1)
+                else:
+                    norm_scene_pc = norm_scene_xyz
+            mode = self.scene_pc_return_mode
+            if mode in ("raw", "both"):
+                out['scene_pc'] = scene_pc.cpu()
+            if mode in ("norm", "both") and norm_scene_pc is not None:
+                out['norm_scene_pc'] = norm_scene_pc.cpu()
         return out
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sample = self.base[idx]
+        hand_pose_t = self._get_hand_pose_tensor(sample)
+        cached_xyz, cached_se3 = self._get_cached_entries(idx, sample)
+        scene_pc = self._get_scene_pc_tensor(sample)
+        xyz, scene_pc = self._compute_xyz_and_scene_pc(
+            hand_pose_t=hand_pose_t,
+            cached_xyz=cached_xyz,
+            cached_se3=cached_se3,
+            scene_pc=scene_pc,
+        )
+        return self._build_output(sample, hand_pose_t, xyz, scene_pc)
 
 
 def _collate_for_hand_encoder(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -595,39 +704,55 @@ def _collate_for_hand_encoder(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         norm_pose = torch.stack([b['norm_pose'] for b in batch], dim=0)
     obj_code = [b.get('obj_code') for b in batch]
     scene_id = [b.get('scene_id') for b in batch]
-    scene_pcs_raw = [b.get('scene_pc') for b in batch]
     scene_pc = None
-    if any(isinstance(pc, (torch.Tensor, np.ndarray)) for pc in scene_pcs_raw):
-        scene_list: List[Optional[torch.Tensor]] = []
+    norm_scene_pc = None
+    scene_list: List[Optional[torch.Tensor]] = []
+    norm_scene_list: List[Optional[torch.Tensor]] = []
+    for b in batch:
+        pc_raw = b.get('scene_pc')
+        npc_raw = b.get('norm_scene_pc')
+        pc_t = None
+        npc_t = None
+        if isinstance(pc_raw, torch.Tensor):
+            pc_t = pc_raw
+        elif isinstance(pc_raw, np.ndarray):
+            pc_t = torch.from_numpy(pc_raw)
+        if isinstance(npc_raw, torch.Tensor):
+            npc_t = npc_raw
+        elif isinstance(npc_raw, np.ndarray):
+            npc_t = torch.from_numpy(npc_raw)
+        scene_list.append(pc_t)
+        norm_scene_list.append(npc_t)
+
+    if any(pc is not None for pc in scene_list) or any(pc is not None for pc in norm_scene_list):
         max_n = 0
         feat_dim = None
         ref_tensor: Optional[torch.Tensor] = None
-        for pc in scene_pcs_raw:
-            tensor_pc: Optional[torch.Tensor] = None
-            if isinstance(pc, torch.Tensor):
-                tensor_pc = pc
-            elif isinstance(pc, np.ndarray):
-                try:
-                    tensor_pc = torch.from_numpy(pc)
-                except Exception:
-                    tensor_pc = None
-            scene_list.append(tensor_pc)
-            if tensor_pc is not None and tensor_pc.ndim == 2:
+        for pc in scene_list + norm_scene_list:
+            if pc is not None and pc.ndim == 2:
                 if ref_tensor is None:
-                    ref_tensor = tensor_pc
-                max_n = max(max_n, int(tensor_pc.shape[0]))
-                if feat_dim is None and tensor_pc.shape[1] > 0:
-                    feat_dim = int(tensor_pc.shape[1])
+                    ref_tensor = pc
+                max_n = max(max_n, int(pc.shape[0]))
+                if feat_dim is None and pc.shape[1] > 0:
+                    feat_dim = int(pc.shape[1])
         if ref_tensor is not None and feat_dim is not None and max_n > 0:
             dtype = ref_tensor.dtype
             device = ref_tensor.device
             batch_size = len(scene_list)
-            scene_pc = torch.zeros((batch_size, max_n, feat_dim), dtype=dtype, device=device)
+            if any(pc is not None for pc in scene_list):
+                scene_pc = torch.zeros((batch_size, max_n, feat_dim), dtype=dtype, device=device)
+            if any(pc is not None for pc in norm_scene_list):
+                norm_scene_pc = torch.zeros((batch_size, max_n, feat_dim), dtype=dtype, device=device)
             for i, pc in enumerate(scene_list):
-                if pc is None or pc.ndim != 2:
+                if pc is None or pc.ndim != 2 or scene_pc is None:
                     continue
                 n_i = min(int(pc.shape[0]), max_n)
                 scene_pc[i, :n_i, :pc.shape[1]] = pc[:n_i]
+            for i, npc in enumerate(norm_scene_list):
+                if npc is None or npc.ndim != 2 or norm_scene_pc is None:
+                    continue
+                n_i = min(int(npc.shape[0]), max_n)
+                norm_scene_pc[i, :n_i, :npc.shape[1]] = npc[:n_i]
     result: Dict[str, Any] = {
         'xyz': xyz,
         'hand_model_pose': hand_model_pose,
@@ -638,6 +763,8 @@ def _collate_for_hand_encoder(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
     if scene_pc is not None:
         result['scene_pc'] = scene_pc
+    if norm_scene_pc is not None:
+        result['norm_scene_pc'] = norm_scene_pc
     return result
 
 
@@ -666,12 +793,15 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
         cache_max_shards_in_memory: Optional[Any] = None,
         cache_max_shards: Optional[Any] = 2,
         norm_xyz_stats_path: Optional[str] = None,
+        xyz_per_point_stats_path: Optional[str] = None,
         cache_preload_to_ram: bool = False,
         cache_show_progress: bool = True,
         prefetch_factor: int = 1,
         persistent_workers: Optional[bool] = None,
         # Legacy arg ignored
         data_cfg: Optional[Any] = None,
+        return_norm: bool = False,
+        scene_pc_return_mode: Optional[str] = None,
     ) -> None:
         """
         Initialize via Hydra instantiation.
@@ -691,6 +821,11 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
         
         self.use_cached_keypoints = bool(use_cached_keypoints)
         self.cache_root = cache_root
+        self.return_norm = bool(return_norm)
+        if scene_pc_return_mode is None:
+            self.scene_pc_return_mode = "norm" if self.return_norm else "raw"
+        else:
+            self.scene_pc_return_mode = str(scene_pc_return_mode).lower()
 
         # Cache shards parsing
         def _parse_cache_max(v: Any):
@@ -732,8 +867,11 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
             self.dataset_kwargs['normalization_stats_path'] = self.normalization_stats_path
         else:
             self.normalization_stats_path = None
-            
-        self.norm_xyz_stats_path = norm_xyz_stats_path
+
+        self.norm_xyz_stats_path = str(norm_xyz_stats_path) if norm_xyz_stats_path is not None else None
+        self.xyz_per_point_stats_path = (
+            str(xyz_per_point_stats_path) if xyz_per_point_stats_path is not None else None
+        )
 
         # Hand/rotation config
         self.rot_type = str(rot_type or 'quat')
@@ -765,167 +903,93 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
     def prepare_data(self) -> None:
         pass
 
-    def _load_normalization_stats(self) -> Optional[Dict[str, Any]]:
-        base_path = self.normalization_stats_path
-        if not base_path:
-            logger.warning("HandEncoderDataModule: normalization_stats_path is not set; norm_xyz will be raw xyz.")
-            return None
-
-        if base_path.endswith('.json'):
-            json_path = base_path
-            pt_path = base_path[:-5] + '.pt'
-        elif base_path.endswith('.pt'):
-            pt_path = base_path
-            json_path = base_path[:-3] + '.json'
+    def _resolve_stats_path(self, configured_path: Optional[str], default_relpath: Path) -> Path:
+        proj_root = Path(__file__).resolve().parents[2]
+        if configured_path is not None:
+            json_path = Path(configured_path)
+            if not json_path.is_absolute():
+                json_path = proj_root / json_path
         else:
-            json_path = base_path + '.json'
-            pt_path = base_path + '.pt'
+            json_path = proj_root / default_relpath
+        return json_path
 
-        stats_obj: Optional[Dict[str, Any]] = None
-        if os.path.exists(json_path):
-            try:
-                with open(json_path, 'r') as f:
-                    stats_obj = json.load(f)
-            except Exception as exc:
-                logger.warning("HandEncoderDataModule: failed to read normalization JSON %s: %s", json_path, exc)
-        if stats_obj is None and os.path.exists(pt_path):
-            try:
-                stats_obj = torch.load(pt_path, map_location='cpu')
-            except Exception as exc:
-                logger.warning("HandEncoderDataModule: failed to read normalization PT %s: %s", pt_path, exc)
-        if stats_obj is None:
-            logger.warning("HandEncoderDataModule: normalization stats not found at base path %s", base_path)
-        return stats_obj
-
-    @staticmethod
-    def _pick_stat_bounds(block: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
-        mn = block.get('min_with_margin', block.get('min'))
-        mx = block.get('max_with_margin', block.get('max'))
-        return np.asarray(mn, dtype=np.float32), np.asarray(mx, dtype=np.float32)
-
-    def _prepare_norm_xyz_bounds(self, device: torch.device) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        stats_obj = self._load_normalization_stats()
-        if stats_obj is None:
-            return None
-        if 'hand_trans' not in stats_obj:
-            logger.warning("HandEncoderDataModule: normalization stats missing 'hand_trans'; norm_xyz will be raw xyz.")
-            return None
-
-        lo, hi = self._pick_stat_bounds(stats_obj['hand_trans'])
-        lo = lo.reshape(-1)
-        hi = hi.reshape(-1)
-        if lo.shape[0] != 3 or hi.shape[0] != 3:
-            logger.warning("HandEncoderDataModule: expected 3D hand_trans bounds, got %s/%s", lo.shape, hi.shape)
-            return None
-
-        diff = hi - lo
-        shrink_mask = diff > (2 * MJCF_ANCHOR_MARGIN)
-        shrunk_lo = np.where(shrink_mask, lo + MJCF_ANCHOR_MARGIN, lo)
-        shrunk_hi = np.where(shrink_mask, hi - MJCF_ANCHOR_MARGIN, hi)
-
-        lo_t = torch.from_numpy(shrunk_lo.astype(np.float32)).to(device=device, dtype=torch.float32).view(1, 3)
-        hi_t = torch.from_numpy(shrunk_hi.astype(np.float32)).to(device=device, dtype=torch.float32).view(1, 3)
-        logger.info("HandEncoderDataModule: prepared norm_xyz bounds (mjcf shrink) min=%s max=%s", shrunk_lo.tolist(), shrunk_hi.tolist())
-        return lo_t, hi_t
-
-    def _load_norm_xyz_stats_local(self) -> Optional[Dict[str, Any]]:
-        """Load xyz statistics for use_local_pose_only, optionally anchor-specific.
-
-        优先使用 norm_xyz_stats_path；若未设置，则默认从数据集根目录下的
-        "norm_xyz_stats_use_local_anchor-{anchor}.json" 读取，其中 anchor 取自
-        self.trans_anchor。
-        """
-        base_path = self.norm_xyz_stats_path
-        if not base_path:
-            asset_dir = self.dataset_kwargs.get('asset_dir')
-            if not asset_dir:
-                logger.warning("HandEncoderDataModule: dataset_kwargs.asset_dir 未设置，无法推断 norm_xyz 统计文件路径。")
-                return None
-            if not os.path.isabs(asset_dir):
-                proj_root = Path(__file__).resolve().parents[2]
-                asset_dir = str((proj_root / asset_dir).resolve())
-            base_path = os.path.join(asset_dir, f"norm_xyz_stats_use_local_anchor-{self.trans_anchor}")
-
-        if base_path.endswith('.json'):
-            json_path = base_path
-            pt_path = base_path[:-5] + '.pt'
-        elif base_path.endswith('.pt'):
-            pt_path = base_path
-            json_path = base_path[:-3] + '.json'
-        else:
-            json_path = base_path + '.json'
-            pt_path = base_path + '.pt'
-
-        stats_obj: Optional[Dict[str, Any]] = None
-        if os.path.exists(json_path):
-            try:
-                with open(json_path, 'r') as f:
-                    stats_obj = json.load(f)
-            except Exception as exc:
-                logger.warning("HandEncoderDataModule: failed to read norm_xyz JSON %s: %s", json_path, exc)
-        if stats_obj is None and os.path.exists(pt_path):
-            try:
-                stats_obj = torch.load(pt_path, map_location='cpu')
-            except Exception as exc:
-                logger.warning("HandEncoderDataModule: failed to read norm_xyz PT %s: %s", pt_path, exc)
-        if stats_obj is None:
-            logger.warning("HandEncoderDataModule: norm_xyz stats not found at base path %s", base_path)
-        return stats_obj
-
-    def _prepare_norm_xyz_bounds_local(self, device: torch.device) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Prepare xyz normalization bounds for use_local_pose_only based on xyz stats.
-
-        该逻辑假定 xyz 分布统计是针对 use_local_pose_only=true 且特定 anchor
-        下的 joint keypoints，在此基础上增加一定比例的 margin，避免采样不完全
-        带来的截断。
-        """
-        stats_obj = self._load_norm_xyz_stats_local()
-        if stats_obj is None:
-            return None
-        block = stats_obj.get('stats') or {}
-        mins = block.get('min')
-        maxs = block.get('max')
-        if mins is None or maxs is None:
-            logger.warning("HandEncoderDataModule: norm_xyz stats missing 'min'/'max'; norm_xyz 将退回 raw xyz。")
-            return None
-        lo = np.asarray(mins, dtype=np.float32).reshape(-1)
-        hi = np.asarray(maxs, dtype=np.float32).reshape(-1)
-        if lo.shape[0] != 3 or hi.shape[0] != 3:
-            logger.warning("HandEncoderDataModule: expected 3D norm_xyz bounds, got %s/%s", lo.shape, hi.shape)
-            return None
-
-        script_args = stats_obj.get('script_args') or {}
-        max_grasps_sampled = int(script_args.get('max_grasps', 0) or 0)
-        margin_ratio = 0.05
-        # 如果统计脚本使用了 max_grasps 进行抽样，则采用更大的 margin，
-        # 以降低尾部截断风险。
-        if max_grasps_sampled > 0:
-            margin_ratio = 0.25
-
-        diff = hi - lo
-        margin = diff * float(margin_ratio)
-        expanded_lo = lo - margin
-        expanded_hi = hi + margin
-
-        lo_t = torch.from_numpy(expanded_lo.astype(np.float32)).to(device=device, dtype=torch.float32).view(1, 3)
-        hi_t = torch.from_numpy(expanded_hi.astype(np.float32)).to(device=device, dtype=torch.float32).view(1, 3)
-        logger.info(
-            "HandEncoderDataModule: prepared norm_xyz bounds (local, anchor=%s, margin=%.3f) min=%s max=%s",
-            self.trans_anchor,
-            margin_ratio,
-            expanded_lo.tolist(),
-            expanded_hi.tolist(),
+    def _load_handencoder_scene_bounds(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Load unified xyz bounds for hand+scene from precomputed stats JSON."""
+        json_path = self._resolve_stats_path(
+            self.norm_xyz_stats_path,
+            Path("data") / "DexGraspNet" / "handencoder_scene_xyz_bounds.json",
         )
-        return lo_t, hi_t
+        if not json_path.exists():
+            raise RuntimeError(f"Normalization stats file not found: {json_path}")
+        try:
+            with open(json_path, "r") as f:
+                stats_obj = json.load(f)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read normalization stats from {json_path}: {exc}") from exc
+
+        stats_block = stats_obj.get("stats", {})
+        combined = stats_block.get("combined")
+        if combined is None:
+            raise RuntimeError("Normalization stats missing 'combined' block with min/max.")
+        mins = np.asarray(combined.get("min"), dtype=np.float32).reshape(-1)
+        maxs = np.asarray(combined.get("max"), dtype=np.float32).reshape(-1)
+        if mins.shape[0] != 3 or maxs.shape[0] != 3:
+            raise RuntimeError(f"Expected 3D bounds in normalization stats, got {mins.shape}/{maxs.shape}")
+        lo = torch.from_numpy(mins).view(1, 3)
+        hi = torch.from_numpy(maxs).view(1, 3)
+        return lo, hi
+
+    def _load_handencoder_per_point_stats(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Load per-point canonical xyz and approx std stats from JSON.
+        """
+        json_path = self._resolve_stats_path(
+            self.xyz_per_point_stats_path,
+            Path("data") / "DexGraspNet" / "handencoder_xyz_per_point_stats.json",
+        )
+        if not json_path.exists():
+            raise RuntimeError(f"Per-point stats file not found: {json_path}")
+        try:
+            with open(json_path, "r") as f:
+                stats_obj = json.load(f)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read per-point stats from {json_path}: {exc}") from exc
+
+        stats_block = stats_obj.get("stats", {})
+        xyz_stats = stats_block.get("xyz_per_point")
+        if xyz_stats is None:
+            raise RuntimeError("Per-point stats missing 'xyz_per_point' block.")
+        per_point = xyz_stats.get("per_point")
+        if per_point is None:
+            raise RuntimeError("Per-point stats missing 'per_point' entries.")
+
+        try:
+            canonical_xyz = torch.tensor(
+                [p["canonical_xyz"] for p in per_point],
+                dtype=torch.float32,
+            )
+            approx_std = torch.tensor(
+                [p["approx_std"] for p in per_point],
+                dtype=torch.float32,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Failed to parse per-point stats from {json_path}: {exc}") from exc
+
+        return canonical_xyz, approx_std
 
     def _ensure_norm_xyz_bounds(self, device: torch.device) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if not self.return_norm:
+            return None
+        if not self.use_local_pose_only or self.trans_anchor != "palm_center":
+            raise RuntimeError(
+                "Normalization is only supported when use_local_pose_only=True and trans_anchor='palm_center'."
+            )
         if self._norm_xyz_bounds is None:
-            if self.use_local_pose_only:
-                self._norm_xyz_bounds = self._prepare_norm_xyz_bounds_local(device)
-                if self._norm_xyz_bounds is None:
-                    self._norm_xyz_bounds = self._prepare_norm_xyz_bounds(device)
-            else:
-                self._norm_xyz_bounds = self._prepare_norm_xyz_bounds(device)
+            lo, hi = self._load_handencoder_scene_bounds()
+            lo = lo.to(device=device, dtype=torch.float32)
+            hi = hi.to(device=device, dtype=torch.float32)
+            self._norm_xyz_bounds = (lo, hi)
+            logger.info("HandEncoderDataModule: loaded norm bounds from handencoder_scene_xyz_bounds.json min=%s max=%s", lo.tolist(), hi.tolist())
         return self._norm_xyz_bounds
 
     def _clone_norm_bounds(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
@@ -944,9 +1008,6 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
         return str(urdf_path), str(meshes_path)
 
     def _make_base_dataset(self, phase: str) -> Dataset:
-        if self.use_cached_keypoints:
-            return self._make_cached_dataset(phase)
-
         kwargs = dict(self.dataset_kwargs)
         kwargs['phase'] = phase
         kwargs['rot_type'] = self.rot_type
@@ -1045,7 +1106,7 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
         finger_ids_t = torch.from_numpy(finger_ids_np).to(device=device, dtype=torch.long)
         joint_ids_t = torch.from_numpy(joint_ids_np).to(device=device, dtype=torch.long)
         template_xyz = xyz_u.squeeze(0).to(device=device, dtype=torch.float32)
-        rigid_groups = _build_rigid_groups_from_link_map(link_to_unique)
+        rigid_groups = _build_manual_rigid_groups_by_index(len(names))
         return {
             'link_to_unique': link_to_unique,
             'finger_ids': finger_ids_t,
@@ -1061,7 +1122,7 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
             'E': int(edge_index_t.shape[1]),
         }
 
-    def setup(self, stage: Optional[str] = None) -> None:
+    def _ensure_prepared_constants_and_norm_bounds(self) -> None:
         # Build constants and hand_model once
         if self._prepared_constants is None:
             urdf_path, meshes_path = self._load_urdf_assets()
@@ -1078,12 +1139,27 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
                 mesh_source='urdf',
             )
             canon = self._build_canonical(hand_model)
+            canonical_xyz_stats, approx_std_stats = self._load_handencoder_per_point_stats()
+            canonical_xyz_stats = canonical_xyz_stats.to(device=device, dtype=torch.float32)
+            approx_std_stats = approx_std_stats.to(device=device, dtype=torch.float32)
+            N = canon['finger_ids'].shape[0]
+            if canonical_xyz_stats.shape[0] != N or approx_std_stats.shape[0] != N:
+                raise RuntimeError(
+                    f"Per-point stats length mismatch: got canonical={canonical_xyz_stats.shape[0]}, "
+                    f"approx_std={approx_std_stats.shape[0]}, expected {N}."
+                )
             self._prepared_constants = {
                 'hand_model': hand_model,
                 **canon,
+                'canonical_xyz': canonical_xyz_stats,
+                'approx_std': approx_std_stats,
             }
-            self._ensure_norm_xyz_bounds(device)
+        else:
+            device = self._prepared_constants['hand_model'].device
+        self._ensure_norm_xyz_bounds(device)
 
+    def setup(self, stage: Optional[str] = None) -> None:
+        self._ensure_prepared_constants_and_norm_bounds()
         # Resolve what to (ensure) build for this stage
         want_train = (stage is None) or (stage == 'fit')
         want_val = ((stage is None) or (stage in ('fit', 'validate'))) and (self.val_phase is not None)
@@ -1109,6 +1185,9 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
                     "This typically indicates a mismatch between the DexGraspNet "
                     "split file and the .pt data, or missing debug assets."
                 )
+            cache_train: Optional[Dataset] = None
+            if self.use_cached_keypoints:
+                cache_train = self._make_cached_dataset(phase=train_phase)
             self.train_dataset = _HandEncoderPreparedDataset(
                 base_train,
                 hand_model,
@@ -1121,11 +1200,17 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
                 scale=self.hand_scale,
                 norm_xyz_bounds=self._clone_norm_bounds(),
                 use_local_pose_only=self.use_local_pose_only,
+                return_norm=self.return_norm,
+                scene_pc_return_mode=self.scene_pc_return_mode,
+                cache_dataset=cache_train,
             )
 
         # Validation dataset
         if want_val and self.val_dataset is None:
             base_val = self._make_base_dataset(phase=self.val_phase)
+            cache_val: Optional[Dataset] = None
+            if self.use_cached_keypoints:
+                cache_val = self._make_cached_dataset(phase=self.val_phase)
             self.val_dataset = _HandEncoderPreparedDataset(
                 base_val,
                 hand_model,
@@ -1138,11 +1223,17 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
                 scale=self.hand_scale,
                 norm_xyz_bounds=self._clone_norm_bounds(),
                 use_local_pose_only=self.use_local_pose_only,
+                return_norm=self.return_norm,
+                scene_pc_return_mode=self.scene_pc_return_mode,
+                cache_dataset=cache_val,
             )
 
         # Test dataset
         if want_test and self.test_dataset is None:
             base_test = self._make_base_dataset(phase=self.test_phase)
+            cache_test: Optional[Dataset] = None
+            if self.use_cached_keypoints:
+                cache_test = self._make_cached_dataset(phase=self.test_phase)
             self.test_dataset = _HandEncoderPreparedDataset(
                 base_test,
                 hand_model,
@@ -1155,6 +1246,9 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
                 scale=self.hand_scale,
                 norm_xyz_bounds=self._clone_norm_bounds(),
                 use_local_pose_only=self.use_local_pose_only,
+                return_norm=self.return_norm,
+                scene_pc_return_mode=self.scene_pc_return_mode,
+                cache_dataset=cache_test,
             )
 
     def get_graph_constants(self) -> Dict[str, torch.Tensor]:
@@ -1174,6 +1268,21 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
         if template_xyz is None:
             raise KeyError("Missing 'template_xyz' in prepared constants")
         consts['template_xyz'] = template_xyz.detach().cpu()
+
+        canonical_xyz = self._prepared_constants.get('canonical_xyz')
+        if canonical_xyz is None:
+            raise KeyError("Missing 'canonical_xyz' in prepared constants")
+        consts['canonical_xyz'] = canonical_xyz.detach().cpu()
+
+        approx_std = self._prepared_constants.get('approx_std')
+        if approx_std is None:
+            raise KeyError("Missing 'approx_std' in prepared constants")
+        consts['approx_std'] = approx_std.detach().cpu()
+
+        if self._norm_xyz_bounds is not None:
+            lo, hi = self._norm_xyz_bounds
+            consts['norm_min'] = lo.detach().cpu().view(1, 1, 3)
+            consts['norm_max'] = hi.detach().cpu().view(1, 1, 3)
 
         rigid_groups_raw = self._prepared_constants.get('rigid_groups', []) or []
         consts['rigid_groups'] = [

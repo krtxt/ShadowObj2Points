@@ -1,0 +1,38 @@
+lambda_pos: 1.0
+lambda_bone: 1.0
+lambda_collision: 0.25
+
+# Collision-related hyperparameters (same units as world coordinates)
+collision_margin: 0.002
+collision_max_scene_points: 2048
+collision_capsule_radius: 0.008
+collision_capsule_circle_segments: 8
+collision_capsule_cap_segments: 3
+
+# Reconstruction-style loss terms used by DeterministicRegressionLoss
+recon:
+  enabled: true
+  smooth_l1:
+    enabled: true
+    weight: 1.0
+    beta: 0.01
+  chamfer:
+    enabled: true
+    weight: 1.0
+    use_pytorch3d: true
+  direction:
+    enabled: true
+    weight: 1.0
+    mode: cos
+    eps: 1.0e-06
+  edge_len:
+    enabled: true
+    weight: 1.0
+    eps: 1.0e-06
+
+# Validation metrics configuration (can be disabled independently of training loss)
+val_metrics:
+  flow:
+    enabled: false
+  recon:
+    enabled: false

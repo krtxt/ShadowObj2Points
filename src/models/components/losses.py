@@ -1,11 +1,16 @@
 # models/components/losses.py
 
 import logging
+import math
 from typing import Dict, Optional, Tuple, List, Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from kaolin.metrics.trianglemesh import (
+    compute_sdf,
+    CUSTOM_index_vertices_by_faces as index_vertices_by_faces,
+)
 
 # Optional dependency: PyTorch3D
 try:
@@ -15,6 +20,178 @@ except ImportError:
     _PYTORCH3D_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+# Cached unit capsule mesh (z-axis aligned, length=1 between cap centers, radius=1)
+_CAPSULE_TEMPLATE_CACHE: Dict[
+    Tuple[str, torch.dtype, int, int], Tuple[torch.Tensor, torch.Tensor]
+] = {}
+_REF_CACHE: Dict[Tuple[str, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _build_unit_capsule_template(
+    circle_segments: int = 8, cap_segments: int = 3
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Create a coarse unit capsule mesh centered at origin, aligned with +Z.
+
+    The template uses cap centers at z=-0.5 and z=0.5 with softened poles
+    (reduced cap depth) to avoid sharp tips. Faces are oriented outward.
+    """
+    if circle_segments < 3:
+        raise ValueError("circle_segments must be >= 3 for a valid capsule mesh.")
+    if cap_segments < 1:
+        raise ValueError("cap_segments must be >= 1 for a valid capsule mesh.")
+
+    cap_depth = 0.7  # slightly deeper caps to restore roundness
+
+    angles = torch.linspace(0.0, 2 * math.pi, steps=circle_segments + 1, dtype=torch.float32)[:-1]
+    cos, sin = torch.cos(angles), torch.sin(angles)
+
+    verts: List[torch.Tensor] = [torch.tensor([0.0, 0.0, -0.5 - cap_depth], dtype=torch.float32)]  # bottom pole
+    ring_starts: List[int] = []
+
+    # Bottom hemisphere (exclude the pole to avoid degeneracy)
+    phi_bottom = torch.linspace(0.2, math.pi / 2.0, steps=cap_segments + 2, dtype=torch.float32)[1:]
+    phi_bottom = phi_bottom[phi_bottom < (math.pi / 2.0)]
+    for phi in phi_bottom:
+        z = -0.5 - cap_depth * torch.cos(phi)
+        r = torch.sin(phi)
+        ring_starts.append(len(verts))
+        ring = torch.stack([r * cos, r * sin, torch.full_like(cos, z)], dim=1)
+        verts.extend(ring)
+
+    # Cylinder end at z = 0.5 (start is already added by the last bottom ring)
+    ring_starts.append(len(verts))
+    ring = torch.stack([cos, sin, torch.full_like(cos, 0.5)], dim=1)
+    verts.extend(ring)
+
+    # Top hemisphere (exclude the top pole to connect separately)
+    phi_top = torch.linspace(math.pi / 2.0, 0.2, steps=cap_segments + 2, dtype=torch.float32)[1:]
+    for phi in phi_top:
+        z = 0.5 + cap_depth * torch.cos(phi)
+        r = torch.sin(phi)
+        ring_starts.append(len(verts))
+        ring = torch.stack([r * cos, r * sin, torch.full_like(cos, z)], dim=1)
+        verts.extend(ring)
+
+    top_pole_idx = len(verts)
+    verts.append(torch.tensor([0.0, 0.0, 0.5 + cap_depth], dtype=torch.float32))
+
+    faces: List[List[int]] = []
+    K = circle_segments
+
+    # Connect bottom pole to first ring
+    if ring_starts:
+        first = ring_starts[0]
+        for k in range(K):
+            k_next = (k + 1) % K
+            faces.append([0, first + k_next, first + k])
+
+    # Connect intermediate rings (including cylinder)
+    for ridx in range(len(ring_starts) - 1):
+        a = ring_starts[ridx]
+        b = ring_starts[ridx + 1]
+        for k in range(K):
+            k_next = (k + 1) % K
+            faces.append([a + k, b + k, a + k_next])
+            faces.append([a + k_next, b + k, b + k_next])
+
+    # Connect last ring to top pole
+    if ring_starts:
+        last = ring_starts[-1]
+        for k in range(K):
+            k_next = (k + 1) % K
+            faces.append([last + k, last + k_next, top_pole_idx])
+
+    return torch.stack(verts, dim=0), torch.tensor(faces, dtype=torch.long)
+
+
+def _get_capsule_template(
+    device: torch.device, dtype: torch.dtype, circle_segments: int = 8, cap_segments: int = 3
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return cached unit capsule vertices/faces on the requested device/dtype."""
+    key = (str(device), dtype, circle_segments, cap_segments)
+    if key not in _CAPSULE_TEMPLATE_CACHE:
+        v, f = _build_unit_capsule_template(circle_segments, cap_segments)
+        _CAPSULE_TEMPLATE_CACHE[key] = (v.to(device=device, dtype=dtype), f.to(device=device))
+    return _CAPSULE_TEMPLATE_CACHE[key]
+
+
+def _get_ref_vectors(device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+    key = (str(device), dtype)
+    if key not in _REF_CACHE:
+        _REF_CACHE[key] = (
+            torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype),
+            torch.tensor([0.0, 1.0, 0.0], device=device, dtype=dtype),
+        )
+    return _REF_CACHE[key]
+
+
+def _capsule_vertices_from_edge(
+    template_vertices: torch.Tensor,
+    start: torch.Tensor,
+    end: torch.Tensor,
+    radius: float,
+) -> torch.Tensor:
+    """Transform a unit capsule template to match an edge segment."""
+    verts = _capsule_vertices_from_edges(
+        template_vertices,
+        start.unsqueeze(0),
+        end.unsqueeze(0),
+        radius,
+    )
+    return verts[0]
+
+
+def _capsule_vertices_from_edges(
+    template_vertices: torch.Tensor,
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    radius: float,
+    cap_scale: float = 1.5,
+) -> torch.Tensor:
+    """Vectorized capsule generation for multiple edges.
+
+    Args:
+        template_vertices: (V, 3) unit capsule vertices (z axis aligned).
+        starts, ends: (E, 3) edge endpoints.
+        radius: scalar radius in world units.
+        cap_scale: scalar factor for cap protrusion (relative to radius).
+    Returns:
+        (E, V, 3) transformed vertices.
+    """
+    axis = ends - starts  # (E, 3)
+    length = torch.linalg.norm(axis, dim=-1, keepdim=True).clamp_min(1e-8)
+    axis_dir = axis / length
+
+    ref_x, ref_y = _get_ref_vectors(starts.device, starts.dtype)
+    ref = torch.where(
+        torch.abs((axis_dir * ref_x).sum(dim=-1, keepdim=True)) > 0.99,
+        ref_y,
+        ref_x,
+    )
+
+    basis_u = F.normalize(torch.cross(axis_dir, ref, dim=-1), dim=-1)
+    basis_v = torch.cross(axis_dir, basis_u, dim=-1)
+    basis = torch.stack([basis_u, basis_v, axis_dir], dim=-2)  # (E, 3, 3)
+
+    z = template_vertices[:, 2]
+    base_xy = template_vertices[:, :2] * radius  # (V, 2)
+
+    z_cyl = z.clamp(min=-0.5, max=0.5).unsqueeze(0) * length  # (E, V)
+    cap_offset = (z.abs() - 0.5).clamp(min=0.0) * radius * cap_scale
+    z_scaled = z_cyl + torch.sign(z).unsqueeze(0) * cap_offset  # (E, V)
+
+    scaled = torch.cat(
+        [
+            base_xy.unsqueeze(0).expand(length.shape[0], -1, -1),
+            z_scaled.unsqueeze(-1),
+        ],
+        dim=-1,
+    )  # (E, V, 3)
+
+    rotated = torch.einsum("evc,ecd->evd", scaled, basis)
+    centers = (starts + ends) * 0.5
+    return rotated + centers.unsqueeze(1)
 
 
 class FlowMatchingLoss(nn.Module):
@@ -346,62 +523,358 @@ class HandValidationMetricManager:
         pred_xyz: torch.Tensor, 
         gt_xyz: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
+        return _compute_recon_components(
+            edge_index=self.edge_index,
+            pred_xyz=pred_xyz,
+            gt_xyz=gt_xyz,
+            cfg_smooth=self.cfg_smooth,
+            cfg_chamfer=self.cfg_chamfer,
+            cfg_dir=self.cfg_dir,
+            cfg_edge=self.cfg_edge,
+            recon_enabled=self.recon_enabled,
+        )
+
+
+def _compute_recon_components(
+    edge_index: torch.Tensor,
+    pred_xyz: torch.Tensor,
+    gt_xyz: torch.Tensor,
+    cfg_smooth: Dict,
+    cfg_chamfer: Dict,
+    cfg_dir: Dict,
+    cfg_edge: Dict,
+    recon_enabled: bool = True,
+) -> Dict[str, torch.Tensor]:
+    """Shared implementation for reconstruction-style losses/metrics.
+
+    Used both by HandValidationMetricManager and deterministic regression loss
+    to avoid code duplication.
+    """
+
+    if not recon_enabled:
+        return {}
+    if pred_xyz.shape != gt_xyz.shape:
+        raise ValueError("Shape mismatch in reconstruction metrics.")
+
+    device = pred_xyz.device
+    metrics: Dict[str, torch.Tensor] = {}
+    total = torch.tensor(0.0, device=device)
+
+    # 1. Smooth L1
+    if cfg_smooth.get("enabled", True):
+        val = F.smooth_l1_loss(pred_xyz, gt_xyz, beta=cfg_smooth.get("beta", 0.01))
+        metrics["smooth_l1"] = val
+        total += val * cfg_smooth.get("weight", 1.0)
+
+    # 2. Chamfer
+    if cfg_chamfer.get("enabled", True):
+        w = cfg_chamfer.get("weight", 1.0)
+        if _PYTORCH3D_AVAILABLE and cfg_chamfer.get("use_pytorch3d", True):
+            val, _ = chamfer_distance(pred_xyz, gt_xyz, point_reduction="mean", batch_reduction="mean")
+            metrics["chamfer"] = val
+            total += val * w
+        else:
+            metrics["chamfer"] = torch.tensor(float("nan"), device=device)
+
+    # 3. Edge Direction
+    if cfg_dir.get("enabled", True):
+        w = cfg_dir.get("weight", 1.0)
+        eps = cfg_dir.get("eps", 1e-6)
+        edges = edge_index.to(device)
         
-        if not self.recon_enabled:
-            return {}
-        if pred_xyz.shape != gt_xyz.shape:
-            raise ValueError("Shape mismatch in reconstruction metrics.")
+        v_gt = F.normalize(gt_xyz[:, edges[1]] - gt_xyz[:, edges[0]] + eps, dim=-1)
+        v_pd = F.normalize(pred_xyz[:, edges[1]] - pred_xyz[:, edges[0]] + eps, dim=-1)
+        
+        if cfg_dir.get("mode", "cos") == "l2":
+            val = (v_pd - v_gt).norm(p=2, dim=-1).mean()
+        else:
+            cos_sim = (v_gt * v_pd).sum(dim=-1).clamp(-1, 1)
+            val = (1.0 - cos_sim).mean()
+        
+        metrics["direction"] = val
+        total += val * w
+
+    # 4. Edge Length
+    if cfg_edge.get("enabled", True):
+        w = cfg_edge.get("weight", 1.0)
+        eps = cfg_edge.get("eps", 1e-6)
+        edges = edge_index.to(device)
+        
+        len_gt = (gt_xyz[:, edges[0]] - gt_xyz[:, edges[1]]).norm(dim=-1)
+        len_pd = (pred_xyz[:, edges[0]] - pred_xyz[:, edges[1]]).norm(dim=-1)
+        
+        val = ((len_pd - len_gt).abs() / (len_gt + eps)).mean()
+        metrics["edge_len_err"] = val
+        total += val * w
+
+    metrics["total"] = total
+    return metrics
+
+
+class DeterministicRegressionLoss(nn.Module):
+    """Loss manager for deterministic hand regression model.
+
+    Combines reconstruction-style terms (Smooth L1, Chamfer, edge direction,
+    and edge length) with optional bone-length regularization and collision
+    penalty against the scene point cloud.
+    """
+
+    def __init__(self, edge_index: torch.Tensor, config: Optional[Dict] = None) -> None:
+        super().__init__()
+        if edge_index.dim() != 2 or edge_index.size(0) != 2:
+            raise ValueError(f"edge_index mismatch. Expected (2, E), got {edge_index.shape}")
+
+        self.register_buffer("edge_index", edge_index.long(), persistent=False)
+
+        cfg = config or {}
+
+        # Recon-style loss configuration (mirrors HandValidationMetricManager)
+        self.recon = cfg.get("recon", {})
+        self.recon_enabled = self.recon.get("enabled", True)
+
+        self.cfg_smooth = dict(self.recon.get("smooth_l1", {}))
+        self.cfg_chamfer = dict(self.recon.get("chamfer", {}))
+        self.cfg_dir = dict(self.recon.get("direction", {}))
+        self.cfg_edge = dict(self.recon.get("edge_len", {}))
+
+        # Backwards-compat: allow a top-level lambda_pos to scale SmoothL1
+        lambda_pos = float(cfg.get("lambda_pos", 1.0))
+        if lambda_pos != 1.0:
+            base_w = float(self.cfg_smooth.get("weight", 1.0))
+            self.cfg_smooth["weight"] = base_w * lambda_pos
+
+        # Structural / collision terms
+        self.lambda_bone = float(cfg.get("lambda_bone", 0.0))
+        self.lambda_collision = float(cfg.get("lambda_collision", 0.0))
+        self.collision_margin = float(cfg.get("collision_margin", 0.0))
+        self.collision_capsule_radius = float(cfg.get("collision_capsule_radius", 0.008))
+        self.collision_capsule_circle_segments = int(cfg.get("collision_capsule_circle_segments", 8))
+        self.collision_capsule_cap_segments = int(cfg.get("collision_capsule_cap_segments", 2))
+
+        max_pts = int(cfg.get("collision_max_scene_points", 0))
+        self.collision_max_scene_points = max_pts if max_pts > 0 else None
+
+    def _compute_bone_loss(
+        self,
+        pred_xyz: torch.Tensor,
+        edge_rest_lengths: Optional[torch.Tensor],
+        active_edge_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.lambda_bone <= 0.0 or edge_rest_lengths is None:
+            return torch.tensor(0.0, device=pred_xyz.device)
+
+        i, j = self.edge_index
+        lengths = torch.linalg.norm(pred_xyz[:, i] - pred_xyz[:, j], dim=-1)
+        target = edge_rest_lengths.view(1, -1)
+
+        rel_err = (lengths - target) / (target + 1e-6)
+        if active_edge_mask is not None:
+            rel_err = rel_err[:, active_edge_mask]
+
+        return rel_err.pow(2).mean()
+
+    def _compute_collision_loss(
+        self,
+        pred_xyz: torch.Tensor,
+        scene_pc: Optional[torch.Tensor],
+        denorm_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        active_edge_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if (
+            self.lambda_collision <= 0.0
+            or scene_pc is None
+            or scene_pc.shape[1] == 0
+        ):
+            return torch.tensor(0.0, device=pred_xyz.device)
+
+        # Work in world space for physical margin if denorm_fn is provided
+        pred_w = denorm_fn(pred_xyz) if denorm_fn is not None else pred_xyz
+        scene_w = denorm_fn(scene_pc) if denorm_fn is not None else scene_pc
+
+        template_v, template_f = _get_capsule_template(
+            device=pred_w.device,
+            dtype=pred_w.dtype,
+            circle_segments=self.collision_capsule_circle_segments,
+            cap_segments=self.collision_capsule_cap_segments,
+        )
+
+        batch_size = pred_w.shape[0]
+        edge_index = self.edge_index.to(pred_w.device)
+        i, j = edge_index
+
+        # Normalize active edge mask shape: allow (E,) or (B, E)
+        edge_mask_global = None
+        if active_edge_mask is not None:
+            edge_mask_global = active_edge_mask.to(device=pred_w.device)
+
+        static_active_edges = None
+        if edge_mask_global is not None and edge_mask_global.dim() == 1:
+            static_active_edges = torch.nonzero(edge_mask_global, as_tuple=False).squeeze(-1)
+
+        faces_cache: Dict[Tuple[str, torch.dtype, int], torch.Tensor] = {}
+
+        losses: List[torch.Tensor] = []
+        if static_active_edges is not None:
+            active_edges = static_active_edges
+
+            starts_all = pred_w[:, i[active_edges]]  # (B, E, 3)
+            ends_all = pred_w[:, j[active_edges]]    # (B, E, 3)
+            verts_all = _capsule_vertices_from_edges(
+                template_vertices=template_v,
+                starts=starts_all.reshape(-1, 3),
+                ends=ends_all.reshape(-1, 3),
+                radius=self.collision_capsule_radius,
+                cap_scale=1.5,
+            ).reshape(batch_size, -1, template_v.shape[0], 3)
+
+            num_edges = active_edges.numel()
+            num_vertices = template_v.shape[0]
+            num_faces = template_f.shape[0]
+
+            cache_key = (str(pred_w.device), pred_w.dtype, num_edges)
+            if cache_key not in faces_cache:
+                base_faces = template_f.unsqueeze(0) + (
+                    torch.arange(num_edges, device=pred_w.device).view(-1, 1, 1) * num_vertices
+                )
+                faces_cache[cache_key] = base_faces.reshape(-1, 3)
+            base_faces = faces_cache[cache_key]
+
+            for b in range(batch_size):
+                scene_pts = scene_w[b]
+                if scene_pts.shape[0] == 0:
+                    continue
+
+                if (
+                    self.collision_max_scene_points
+                    and scene_pts.shape[0] > self.collision_max_scene_points
+                ):
+                    perm = torch.randperm(scene_pts.shape[0], device=scene_pts.device)
+                    scene_pts = scene_pts[perm[: self.collision_max_scene_points]]
+
+                vertices = verts_all[b].reshape(-1, 3)
+                faces = base_faces + (b * num_edges * num_vertices)
+                face_vertices = index_vertices_by_faces(vertices, faces)
+
+                sdf, dist_sign, _, _ = compute_sdf(scene_pts, face_vertices)
+                signed_dist = sdf * dist_sign.sign().to(sdf.dtype)
+
+                penetration = torch.relu(self.collision_margin - signed_dist)
+                losses.append(penetration.mean())
+        else:
+            for b in range(batch_size):
+                edge_mask = edge_mask_global[b] if edge_mask_global is not None else None
+                if edge_mask is not None:
+                    active_edges = torch.nonzero(edge_mask, as_tuple=False).squeeze(-1)
+                else:
+                    active_edges = torch.arange(i.numel(), device=pred_w.device)
+
+                if active_edges.numel() == 0:
+                    continue
+
+                scene_pts = scene_w[b]
+                if scene_pts.shape[0] == 0:
+                    continue
+
+                if (
+                    self.collision_max_scene_points
+                    and scene_pts.shape[0] > self.collision_max_scene_points
+                ):
+                    perm = torch.randperm(scene_pts.shape[0], device=scene_pts.device)
+                    scene_pts = scene_pts[perm[: self.collision_max_scene_points]]
+
+                starts = pred_w[b, i[active_edges]]
+                ends = pred_w[b, j[active_edges]]
+
+                verts = _capsule_vertices_from_edges(
+                    template_vertices=template_v,
+                    starts=starts,
+                    ends=ends,
+                    radius=self.collision_capsule_radius,
+                    cap_scale=1.5,
+                )  # (E, V, 3)
+
+                num_edges = verts.shape[0]
+                if num_edges == 0:
+                    continue
+
+                vertices = verts.reshape(-1, 3)
+                faces = template_f.unsqueeze(0) + (
+                    torch.arange(num_edges, device=pred_w.device).view(-1, 1, 1) * template_v.shape[0]
+                )
+                faces = faces.reshape(-1, 3)
+                face_vertices = index_vertices_by_faces(vertices, faces)
+
+                sdf, dist_sign, _, _ = compute_sdf(scene_pts, face_vertices)
+                signed_dist = sdf * dist_sign.sign().to(sdf.dtype)
+
+                penetration = torch.relu(self.collision_margin - signed_dist)
+                losses.append(penetration.mean())
+
+        if not losses:
+            return torch.tensor(0.0, device=pred_xyz.device)
+
+        return torch.stack(losses).mean()
+
+    def forward(
+        self,
+        pred_xyz: torch.Tensor,
+        gt_xyz: torch.Tensor,
+        *,
+        edge_rest_lengths: Optional[torch.Tensor] = None,
+        active_edge_mask: Optional[torch.Tensor] = None,
+        scene_pc: Optional[torch.Tensor] = None,
+        denorm_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute total deterministic regression loss and its components.
+
+        Args:
+            pred_xyz: Predicted hand keypoints (B, N, 3), typically in normalized space.
+            gt_xyz: Ground-truth keypoints (B, N, 3), same space as pred_xyz.
+            edge_rest_lengths: Rest bone lengths for regularization (E,).
+            active_edge_mask: Optional mask to select active edges for bone and collision losses.
+            scene_pc: Scene point cloud (B, P, 3) in same space as pred_xyz.
+            denorm_fn: Optional function mapping normalized coords -> world coords
+                for collision loss when working in normalized space.
+        """
+
+        recon_metrics = _compute_recon_components(
+            edge_index=self.edge_index,
+            pred_xyz=pred_xyz,
+            gt_xyz=gt_xyz,
+            cfg_smooth=self.cfg_smooth,
+            cfg_chamfer=self.cfg_chamfer,
+            cfg_dir=self.cfg_dir,
+            cfg_edge=self.cfg_edge,
+            recon_enabled=self.recon_enabled,
+        )
 
         device = pred_xyz.device
-        metrics = {}
-        total = torch.tensor(0.0, device=device)
+        zero = torch.tensor(0.0, device=device)
 
-        # 1. Smooth L1
-        if self.cfg_smooth.get("enabled", True):
-            val = F.smooth_l1_loss(pred_xyz, gt_xyz, beta=self.cfg_smooth.get("beta", 0.01))
-            metrics["smooth_l1"] = val
-            total += val * self.cfg_smooth.get("weight", 1.0)
+        smooth = recon_metrics.get("smooth_l1", zero)
+        chamfer = recon_metrics.get("chamfer", zero)
+        direction = recon_metrics.get("direction", zero)
+        edge_len_err = recon_metrics.get("edge_len_err", zero)
+        recon_total = recon_metrics.get("total", zero)
 
-        # 2. Chamfer
-        if self.cfg_chamfer.get("enabled", True):
-            w = self.cfg_chamfer.get("weight", 1.0)
-            if _PYTORCH3D_AVAILABLE and self.cfg_chamfer.get("use_pytorch3d", True):
-                val, _ = chamfer_distance(pred_xyz, gt_xyz, point_reduction="mean", batch_reduction="mean")
-                metrics["chamfer"] = val
-                total += val * w
-            else:
-                metrics["chamfer"] = torch.tensor(float("nan"), device=device)
+        bone = self._compute_bone_loss(pred_xyz, edge_rest_lengths, active_edge_mask)
+        collision = self._compute_collision_loss(
+            pred_xyz,
+            scene_pc,
+            denorm_fn,
+            active_edge_mask=active_edge_mask,
+        )
 
-        # 3. Edge Direction
-        if self.cfg_dir.get("enabled", True):
-            w = self.cfg_dir.get("weight", 1.0)
-            eps = self.cfg_dir.get("eps", 1e-6)
-            edges = self.edge_index.to(device)
-            
-            v_gt = F.normalize(gt_xyz[:, edges[1]] - gt_xyz[:, edges[0]] + eps, dim=-1)
-            v_pd = F.normalize(pred_xyz[:, edges[1]] - pred_xyz[:, edges[0]] + eps, dim=-1)
-            
-            if self.cfg_dir.get("mode", "cos") == "l2":
-                val = (v_pd - v_gt).norm(p=2, dim=-1).mean()
-            else:
-                cos_sim = (v_gt * v_pd).sum(dim=-1).clamp(-1, 1)
-                val = (1.0 - cos_sim).mean()
-            
-            metrics["direction"] = val
-            total += val * w
+        total = recon_total + self.lambda_bone * bone + self.lambda_collision * collision
 
-        # 4. Edge Length
-        if self.cfg_edge.get("enabled", True):
-            w = self.cfg_edge.get("weight", 1.0)
-            eps = self.cfg_edge.get("eps", 1e-6)
-            edges = self.edge_index.to(device)
-            
-            len_gt = (gt_xyz[:, edges[0]] - gt_xyz[:, edges[1]]).norm(dim=-1)
-            len_pd = (pred_xyz[:, edges[0]] - pred_xyz[:, edges[1]]).norm(dim=-1)
-            
-            val = ((len_pd - len_gt).abs() / (len_gt + eps)).mean()
-            metrics["edge_len_err"] = val
-            total += val * w
+        components: Dict[str, torch.Tensor] = {
+            "smooth_l1": smooth,
+            "chamfer": chamfer,
+            "direction": direction,
+            "edge_len_err": edge_len_err,
+            "bone": bone,
+            "collision": collision,
+            "recon_total": recon_total,
+        }
 
-        metrics["total"] = total
-        return metrics
+        return total, components

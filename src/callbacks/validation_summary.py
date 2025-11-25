@@ -58,11 +58,27 @@ class ValidationSummaryCallback(Callback):
             except Exception:
                 return None
 
-        # Detailed loss breakdown (can be extended as needed)
+        # Detailed loss breakdown: collect all validation loss-like metrics
+        # - Always include "val_loss" if available
+        # - Additionally include any metrics whose key starts with "val/loss"
+        #   so different models can expose their own loss components without
+        #   requiring hard-coded names here.
         val_detailed_loss: Dict[str, float] = {}
-        val_loss_val = _get_metric("val_loss")
-        if val_loss_val is not None and math.isfinite(val_loss_val):
-            val_detailed_loss["val_loss"] = val_loss_val
+
+        for name in metrics.keys():
+            if name == "val_loss" or name.startswith("val/loss"):
+                v = _get_metric(name)
+                if v is None or not math.isfinite(v):
+                    continue
+
+                # Normalize display key: strip "val/" prefix if present so
+                # components like "val/loss_pos" become "loss_pos".
+                display_key = name.split("/", 1)[-1] if "/" in name else name
+
+                # Later metrics with the same display_key should not
+                # overwrite earlier ones (e.g., keep the primary val_loss).
+                if display_key not in val_detailed_loss:
+                    val_detailed_loss[display_key] = v
 
         # Flow metrics group
         flow_metric_keys = [

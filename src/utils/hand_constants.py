@@ -1,3 +1,0 @@
-import torch
-
-SELF_PENETRATION_POINT_RADIUS = 0.01

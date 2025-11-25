@@ -1,37 +1,37 @@
 import json
 import logging
 import os
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
+import lightning.pytorch as L
 from torch.utils.data import Dataset, DataLoader
 
-import lightning.pytorch as L
-
-# Optional omegaconf support for DictConfig-based configuration
+# Optional OmegaConf support
 try:  # pragma: no cover
     from omegaconf import DictConfig, OmegaConf  # type: ignore
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     DictConfig = Any  # type: ignore
     OmegaConf = None  # type: ignore
 
+# Internal imports (Project specific)
 from .MyDexGraspNet import MyDexGraspNet
 from .MyBodexShadow import MyBodexShadow
 from .CachedHandKeypointDataset import CachedHandKeypointDataset, HDF5HandKeypointDataset
-from utils.shadown_hand_model import HandModel
+from utils.shadown_hand_model import (
+    HandModel,
+    PALM_CENTER_ANCHOR_TRANSLATION,
+    MJCF_ANCHOR_TRANSLATION,
+)
 
 logger = logging.getLogger(__name__)
 
 
 FINGER_PREFIX_MAP = {
-    'th': 0,
-    'ff': 1,
-    'mf': 2,
-    'rf': 3,
-    'lf': 4,
+    'th': 0, 'ff': 1, 'mf': 2, 'rf': 3, 'lf': 4,
 }
 
 JOINT_TYPE_ORDER = [
@@ -39,8 +39,16 @@ JOINT_TYPE_ORDER = [
     'metacarpal', 'base', 'hub', 'palm', 'wrist', 'forearm'
 ]
 JOINT_TYPE_TO_ID = {name: i for i, name in enumerate(JOINT_TYPE_ORDER)}
+
 MJCF_ANCHOR_MARGIN = 0.2
 
+FINGER_CHAINS = {
+    'ff': ['ffknuckle', 'ffproximal', 'ffmiddle', 'ffdistal', 'fftip'],
+    'mf': ['mfknuckle', 'mfproximal', 'mfmiddle', 'mfdistal', 'mftip'],
+    'rf': ['rfknuckle', 'rfproximal', 'rfmiddle', 'rfdistal', 'rftip'],
+    'lf': ['lfmetacarpal', 'lfknuckle', 'lfproximal', 'lfmiddle', 'lfdistal', 'lftip'],
+    'th': ['thbase', 'thproximal', 'thhub', 'thmiddle', 'thdistal', 'thtip'],
+}
 
 def _resolve_finger_id(link_name: str) -> int:
     ln = link_name.lower()
@@ -48,7 +56,6 @@ def _resolve_finger_id(link_name: str) -> int:
         if ln.startswith(pre):
             return fid
     return 5
-
 
 def _resolve_joint_type_id(link_name: str) -> int:
     ln = link_name.lower()
@@ -59,7 +66,6 @@ def _resolve_joint_type_id(link_name: str) -> int:
         return JOINT_TYPE_TO_ID.get(ln, len(JOINT_TYPE_TO_ID))
     return JOINT_TYPE_TO_ID['knuckle']
 
-
 def _build_ids_from_primary(primary: Dict[int, str], N: int) -> Tuple[np.ndarray, np.ndarray, int, int]:
     finger_ids = np.zeros(N, dtype=np.int64)
     joint_ids = np.zeros(N, dtype=np.int64)
@@ -67,101 +73,72 @@ def _build_ids_from_primary(primary: Dict[int, str], N: int) -> Tuple[np.ndarray
         lk = primary.get(i, 'unknown')
         finger_ids[i] = _resolve_finger_id(lk)
         joint_ids[i] = _resolve_joint_type_id(lk)
+    
     num_fingers = int(finger_ids.max()) + 1 if N > 0 else 1
     num_joint_types = int(joint_ids.max()) + 1 if N > 0 else 1
     return finger_ids, joint_ids, num_fingers, num_joint_types
-
-
-FINGER_CHAINS = {
-    'ff': ['ffknuckle', 'ffproximal', 'ffmiddle', 'ffdistal', 'fftip'],
-    'mf': ['mfknuckle', 'mfproximal', 'mfmiddle', 'mfdistal', 'mftip'],
-    'rf': ['rfknuckle', 'rfproximal', 'rfmiddle', 'rfdistal', 'rftip'],
-    'lf': ['lfmetacarpal', 'lfknuckle', 'lfproximal', 'lfmiddle', 'lfdistal', 'lftip'],
-    'th': ['thbase', 'thproximal', 'thhub', 'thmiddle', 'thdistal', 'thtip'],
-}
-MIDDLE_DISTAL_PAIRS = [
-    ('ffmiddle', 'ffdistal'),
-    ('mfmiddle', 'mfdistal'),
-    ('rfmiddle', 'rfdistal'),
-    ('lfmiddle', 'lfdistal'),
-    ('thmiddle', 'thdistal'),
-]
-
 
 def _build_unique_names_and_primary_map(
     link_to_unique: Dict[str, List[int]],
     link_order: List[str],
 ) -> Tuple[List[str], Dict[int, str]]:
     """
-    Select a primary link name for each unique index using suffix-priority,
-    so that e.g. '*middle' wins over '*proximal' when the same unique point
-    is shared by multiple links. This matches the notebook behavior.
+    Selects a primary link name for each unique index based on suffix priority.
     """
     if not link_to_unique:
         return [], {}
 
-    # Count unique points
+    # Determine max unique index
     N = 0
     for idxs in link_to_unique.values():
-        if not idxs:
-            continue
-        N = max(N, max(int(i) for i in idxs) + 1)
+        if idxs:
+            N = max(N, max(int(i) for i in idxs) + 1)
 
-    # Build candidates per unique id
+    # Map unique ID back to list of candidate link names
     unique_to_links: Dict[int, List[str]] = defaultdict(list)
     for lk, idxs in link_to_unique.items():
         for u in idxs:
             unique_to_links[int(u)].append(lk)
 
-    # Suffix priority (lower is stronger)
-    SUFFIX_PRIORITY = {
-        'middle': 0,
-        'proximal': 1,
-        'knuckle': 2,
-        'metacarpal': 3,
-        'base': 4,
-        'hub': 5,
-        'palm': 6,
-        'wrist': 7,
-        'forearm': 8,
-        'distal': 9,
-        'tip': 10,
+    # Priority mapping (lower value = higher priority)
+    suffix_priority_map = {
+        'middle': 0, 'proximal': 1, 'knuckle': 2, 'metacarpal': 3,
+        'base': 4, 'hub': 5, 'palm': 6, 'wrist': 7, 'forearm': 8,
+        'distal': 9, 'tip': 10,
     }
 
-    def suffix_priority(lk: str) -> int:
-        for suf, pr in SUFFIX_PRIORITY.items():
+    def _get_priority(lk: str) -> int:
+        for suf, pr in suffix_priority_map.items():
             if lk.endswith(suf):
                 return pr
         return 100
 
-    # Choose primary by priority
     primary: Dict[int, str] = {}
+    names: List[Optional[str]] = [None] * N
+    counters: Dict[str, int] = defaultdict(int)
+
     for u in range(N):
         cands = unique_to_links.get(u, [])
         if not cands:
             primary[u] = 'unknown'
         else:
-            primary[u] = min(cands, key=suffix_priority)
+            primary[u] = min(cands, key=_get_priority)
 
-    # Assign names with running counters
-    names: List[Optional[str]] = [None] * N
-    counters: Dict[str, int] = defaultdict(int)
-    for u in range(N):
+        # Generate unique name
         lk = primary[u]
-        k = counters[lk]
-        names[u] = f"{lk}_{k}"
+        names[u] = f"{lk}_{counters[lk]}"
         counters[lk] += 1
 
-    return [n if n is not None else f"u{i}" for i, n in enumerate(names)], primary
+    final_names = [n if n is not None else f"u{i}" for i, n in enumerate(names)]
+    return final_names, primary
 
-
-def _add_middle_distal_bridges_dynamic(link_to_unique: Dict[str, List[int]], edges: List[Tuple[int, int, int]]) -> None:
+def _add_middle_distal_bridges_dynamic(
+    link_to_unique: Dict[str, List[int]], 
+    edges: List[Tuple[int, int, int]]
+) -> None:
     """
-    Add middle<->distal directed edges (type=3) per finger dynamically.
-    - Supports ff/if prefix for index finger.
-    - Picks the last index for lfmiddle/rfmiddle (e.g., *_middle_1) if present,
-      otherwise falls back to the first.
-    - Distal always uses its first index.
+    Dynamically adds middle<->distal directed edges (type=3).
+    Includes logic for resolving aliases (e.g., ffmiddle vs ifmiddle).
     """
     def pick(idxs: List[int], mode: str = 'first') -> Optional[int]:
         if not idxs:
@@ -175,33 +152,33 @@ def _add_middle_distal_bridges_dynamic(link_to_unique: Dict[str, List[int]], edg
         (['lfmiddle'], ['lfdistal']),
         (['thmiddle'], ['thdistal']),
     ]
-
+    
+    # Specific override for picking the last index for certain links
     middle_pick_mode = {
-        'ffmiddle': 'last',
-        'ifmiddle': 'last',
-        'mfmiddle': 'last',
-        'lfmiddle': 'last',
-        'rfmiddle': 'last',
-        'thmiddle': 'last',
+        k: 'last' for k in ['ffmiddle', 'ifmiddle', 'mfmiddle', 'lfmiddle', 'rfmiddle', 'thmiddle']
     }
 
     for mids, dists in finger_sets:
-        u = v = None
+        u, v = None, None
+        
+        # Resolve 'middle' joint index
         for nm in mids:
-            if nm in link_to_unique and len(link_to_unique[nm]) > 0:
+            if nm in link_to_unique and link_to_unique[nm]:
                 mode = middle_pick_mode.get(nm, 'first')
                 u = pick(link_to_unique[nm], mode)
                 if u is not None:
                     break
+        
+        # Resolve 'distal' joint index
         for nm in dists:
-            if nm in link_to_unique and len(link_to_unique[nm]) > 0:
+            if nm in link_to_unique and link_to_unique[nm]:
                 v = pick(link_to_unique[nm], 'first')
                 if v is not None:
                     break
+                    
         if u is not None and v is not None and u != v:
             edges.append((u, v, 3))
             edges.append((v, u, 3))
-
 
 def _build_rigid_edges_unique(
     link_to_unique: Dict[str, List[int]],
@@ -209,133 +186,121 @@ def _build_rigid_edges_unique(
     connect_forearm: bool = True,
     add_middle_distal: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Constructs the graph edge index and edge types based on connectivity rules.
+    """
     edges: List[Tuple[int, int, int]] = []
-    for _, idxs in link_to_unique.items():
+
+    # 1. Intra-link edges (Type 0: Rigid body connectivity)
+    for idxs in link_to_unique.values():
         if not idxs or len(idxs) < 2:
             continue
-        seen = set()
-        seq: List[int] = []
-        for w in idxs:
-            w = int(w)
-            if w not in seen:
-                seen.add(w)
-                seq.append(w)
-        for a, b in zip(seq[:-1], seq[1:]):
+        # Deduplicate indices while preserving order
+        unique_seq = sorted(set(int(x) for x in idxs), key=lambda x: list(map(int, idxs)).index(x))
+        for a, b in zip(unique_seq[:-1], unique_seq[1:]):
             if a != b:
-                edges.append((a, b, 0))
-                edges.append((b, a, 0))
-    if use_palm_star and 'palm' in link_to_unique and len(link_to_unique['palm']) > 0:
+                edges.extend([(a, b, 0), (b, a, 0)])
+
+    # 2. Palm Star (Type 1: Kinematic tree roots)
+    if use_palm_star and link_to_unique.get('palm'):
         palm_root = int(link_to_unique['palm'][0])
-        for _, chain in FINGER_CHAINS.items():
+        for chain in FINGER_CHAINS.values():
             target = None
             for lk in chain:
-                if lk in link_to_unique and len(link_to_unique[lk]) > 0:
+                if link_to_unique.get(lk):
                     target = int(link_to_unique[lk][0])
                     break
             if target is not None and target != palm_root:
-                edges.append((palm_root, target, 1))
-                edges.append((target, palm_root, 1))
-    if connect_forearm and ('forearm' in link_to_unique) and ('wrist' in link_to_unique):
-        if len(link_to_unique['forearm']) > 0 and len(link_to_unique['wrist']) > 0:
-            u = int(link_to_unique['forearm'][0])
-            v = int(link_to_unique['wrist'][0])
-            if u != v:
-                edges.append((u, v, 2))
-                edges.append((v, u, 2))
+                edges.extend([(palm_root, target, 1), (target, palm_root, 1)])
+
+    # 3. Forearm <-> Wrist (Type 2)
+    if connect_forearm and link_to_unique.get('forearm') and link_to_unique.get('wrist'):
+        u = int(link_to_unique['forearm'][0])
+        v = int(link_to_unique['wrist'][0])
+        if u != v:
+            edges.extend([(u, v, 2), (v, u, 2)])
+
+    # 4. Middle <-> Distal Bridges (Type 3)
     if add_middle_distal:
         _add_middle_distal_bridges_dynamic(link_to_unique, edges)
+
+    # 5. Specific Kinematic Connections & Pruning
     def _get_idx(name: str, k: int = 0) -> Optional[int]:
         if name in link_to_unique and len(link_to_unique[name]) > k:
             return int(link_to_unique[name][k])
         return None
+    
     def _get_idx_any(names: List[str], k: int = 0) -> Optional[int]:
         for nm in names:
             if nm in link_to_unique and len(link_to_unique[nm]) > k:
                 return int(link_to_unique[nm][k])
         return None
+
     palm0 = _get_idx('palm', 0)
     thprox0 = _get_idx('thproximal', 0)
-    ifmeta0 = _get_idx_any(['ifmetacarpal', 'ffmetacarpal', 'ffknuckle'], 0)
     ffprox0 = _get_idx('ffproximal', 0)
     lfmeta0 = _get_idx('lfmetacarpal', 0)
-    def _add_pair(u: Optional[int], v: Optional[int], t: int = 1) -> None:
+    ifmeta0 = _get_idx_any(['ifmetacarpal', 'ffmetacarpal', 'ffknuckle'], 0)
+
+    # Add specific kinematic links
+    for u, v in [
+        (palm0, ifmeta0), (palm0, lfmeta0), (palm0, thprox0), (ffprox0, thprox0)
+    ]:
         if u is not None and v is not None and u != v:
-            edges.append((u, v, t))
-            edges.append((v, u, t))
-    _add_pair(palm0, ifmeta0, 1)
-    _add_pair(palm0, lfmeta0, 1)
-    _add_pair(palm0, thprox0, 1)
-    _add_pair(ffprox0, thprox0, 1)
+            edges.extend([(u, v, 1), (v, u, 1)])
+
+    # Remove specific conflicting pairs
     remove_pairs = set()
     if palm0 is not None and ffprox0 is not None and palm0 != ffprox0:
-        remove_pairs.add((palm0, ffprox0))
-        remove_pairs.add((ffprox0, palm0))
+        remove_pairs.update([(palm0, ffprox0), (ffprox0, palm0)])
+    
     if ifmeta0 is not None and thprox0 is not None and ifmeta0 != thprox0:
-        # If ifmeta0 aliases ffprox0 (due to shared unique index), do not remove ffprox0↔thprox0
+        # Avoid removing valid ffprox-thprox if alias collision occurs
         if not (ffprox0 is not None and ifmeta0 == ffprox0):
-            remove_pairs.add((ifmeta0, thprox0))
-            remove_pairs.add((thprox0, ifmeta0))
+            remove_pairs.update([(ifmeta0, thprox0), (thprox0, ifmeta0)])
+            
     if lfmeta0 is not None and thprox0 is not None and lfmeta0 != thprox0:
-        remove_pairs.add((lfmeta0, thprox0))
-        remove_pairs.add((thprox0, lfmeta0))
+        remove_pairs.update([(lfmeta0, thprox0), (thprox0, lfmeta0)])
+
     if remove_pairs:
         edges = [e for e in edges if (e[0], e[1]) not in remove_pairs]
-    if len(edges) == 0:
+
+    if not edges:
         return np.zeros((2, 0), dtype=np.int64), np.zeros((0,), dtype=np.int64)
-    uniq = sorted(set(edges))
-    edge_index = np.array([[u for (u, v, t) in uniq], [v for (u, v, t) in uniq]], dtype=np.int64)
-    edge_type = np.array([t for (u, v, t) in uniq], dtype=np.int64)
+
+    # Build final arrays
+    uniq_edges = sorted(set(edges))
+    edge_index = np.array([[u for u, _, _ in uniq_edges], [v for _, v, _ in uniq_edges]], dtype=np.int64)
+    edge_type = np.array([t for _, _, t in uniq_edges], dtype=np.int64)
     return edge_index, edge_type
 
-
 def _build_rigid_groups_from_link_map(link_to_unique: Dict[str, List[int]]) -> List[List[int]]:
-    """Each rigid body link forms one group of unique point indices."""
-
     groups: List[List[int]] = []
-    for _, idxs in link_to_unique.items():
+    for idxs in link_to_unique.values():
         if not idxs:
             continue
-        seen: List[int] = []
-        for raw_idx in idxs:
-            idx = int(raw_idx)
-            if idx not in seen:
-                seen.append(idx)
+        # Preserve order, remove duplicates
+        seen = []
+        for raw in idxs:
+            val = int(raw)
+            if val not in seen:
+                seen.append(val)
         if seen:
             groups.append(seen)
     return groups
 
-
 def _build_manual_rigid_groups_by_index(N: int) -> List[List[int]]:
     """
-    Build rigid groups directly by index order (0-based) to match observed layout,
-    avoiding name-based dependencies.
+    Hardcoded rigid groups matching the observed hardware layout.
     """
     manual_groups = [
-        [0, 1],
-        [1, 5, 4, 3, 2, 6],
-        [6, 20],
-        [20, 21],
-        [21, 22],
-        [2, 7],
-        [7, 8],
-        [8, 9],
-        [3, 10],
-        [10, 11],
-        [11, 12],
-        [4, 13],
-        [13, 14],
-        [14, 15],
-        [5, 16],
-        [16, 17],
-        [17, 18],
-        [18, 19],
+        [0, 1], [1, 5, 4, 3, 2, 6], [6, 20], [20, 21], [21, 22],
+        [2, 7], [7, 8], [8, 9],
+        [3, 10], [10, 11], [11, 12],
+        [4, 13], [13, 14], [14, 15],
+        [5, 16], [16, 17], [17, 18], [18, 19],
     ]
-    filtered: List[List[int]] = []
-    for grp in manual_groups:
-        if all(0 <= i < N for i in grp):
-            filtered.append(grp)
-    return filtered
-
+    return [g for g in manual_groups if all(0 <= i < N for i in g)]
 
 def _compute_rest_lengths(
     hand_model: HandModel,
@@ -344,13 +309,21 @@ def _compute_rest_lengths(
 ) -> torch.Tensor:
     with torch.no_grad():
         xyz_rest = hand_model.get_joint_keypoints_unique(q=q_rest)[0]
+    
     i, j = edge_index_t[0], edge_index_t[1]
     diff = xyz_rest[:, i, :] - xyz_rest[:, j, :]
+    # Add epsilon for numerical stability
     dist = torch.sqrt((diff ** 2).sum(-1) + 1e-9)
     return dist.squeeze(0)
 
 
 class _HandEncoderPreparedDataset(Dataset):
+    """
+    Internal dataset wrapper that handles:
+    1. Kinematic Forward Pass (World & Local)
+    2. Caching integration
+    3. Point cloud transformation & Normalization
+    """
     def __init__(
         self,
         base_dataset: Dataset,
@@ -367,11 +340,15 @@ class _HandEncoderPreparedDataset(Dataset):
         return_norm: bool = False,
         scene_pc_return_mode: Optional[str] = None,
         cache_dataset: Optional[Dataset] = None,
+        cached_stored_anchor: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.base = base_dataset
         self.cache = cache_dataset
         self.hand_model = hand_model
+        self.cached_stored_anchor = (cached_stored_anchor or "base").lower()
+        
+        # Graph constants
         self.link_to_unique = canonical_link_to_unique
         self.finger_ids = finger_ids
         self.joint_type_ids = joint_type_ids
@@ -379,24 +356,26 @@ class _HandEncoderPreparedDataset(Dataset):
         self.edge_type = edge_type
         self.edge_rest_lengths = edge_rest_lengths
         self.N = int(finger_ids.shape[0])
+        
         self.scale = float(scale)
+        self.use_local_pose_only = bool(use_local_pose_only)
+        self.return_norm = bool(return_norm)
+
+        # Scene PC Mode Configuration
+        self.scene_pc_return_mode = str(scene_pc_return_mode).lower() if scene_pc_return_mode else ("norm" if self.return_norm else "raw")
+        if self.scene_pc_return_mode not in ("raw", "norm", "both"):
+            raise ValueError(f"Invalid scene_pc_return_mode: {self.scene_pc_return_mode}")
+        if self.scene_pc_return_mode in ("norm", "both") and not self.return_norm:
+            raise ValueError("scene_pc_return_mode requires return_norm=True for 'norm' or 'both'.")
+
+        # Cache Integrity Check
+        if self.cache is not None and len(self.cache) != len(self.base):
+            raise RuntimeError(f"Cache/Base length mismatch: {len(self.cache)} vs {len(self.base)}")
+
+        # Normalization Bounds
         self._norm_xyz_min: Optional[torch.Tensor] = None
         self._norm_xyz_max: Optional[torch.Tensor] = None
         self._norm_eps = 1e-6
-        self.use_local_pose_only = bool(use_local_pose_only)
-        self.return_norm = bool(return_norm)
-        if scene_pc_return_mode is None:
-            self.scene_pc_return_mode = "norm" if self.return_norm else "raw"
-        else:
-            self.scene_pc_return_mode = str(scene_pc_return_mode).lower()
-        if self.scene_pc_return_mode not in ("raw", "norm", "both"):
-            raise ValueError(f"scene_pc_return_mode must be one of ['raw','norm','both'], got {self.scene_pc_return_mode}")
-        if self.scene_pc_return_mode in ("norm", "both") and not self.return_norm:
-            raise ValueError("scene_pc_return_mode='norm' or 'both' requires return_norm=True to compute normalized scene_pc.")
-        if self.cache is not None and len(self.cache) != len(self.base):
-            raise RuntimeError(
-                f"Cached dataset length {len(self.cache)} does not match base dataset length {len(self.base)}"
-            )
         if self.return_norm and norm_xyz_bounds is not None:
             lo, hi = norm_xyz_bounds
             self._norm_xyz_min = lo.to(device=self.hand_model.device, dtype=torch.float32).view(1, 3)
@@ -419,107 +398,127 @@ class _HandEncoderPreparedDataset(Dataset):
 
     @torch.no_grad()
     def _build_xyz_from_pose(self, q: torch.Tensor) -> torch.Tensor:
+        """Computes keypoints in World Frame using the HandModel."""
         self.hand_model.update_kinematics(q)
         xyz = torch.zeros((self.N, 3), dtype=torch.float32, device=self.hand_model.device)
         filled = torch.zeros((self.N,), dtype=torch.bool, device=self.hand_model.device)
-        for link_name in self.hand_model.joint_key_points:
-            pts_local = self.hand_model.joint_key_points[link_name]
-            if len(pts_local) == 0:
+        
+        # Map model name to status name if necessary
+        mapper = getattr(self.hand_model, '_map_to_current_status_name', lambda x: x)
+        
+        for link_name, pts_local in self.hand_model.joint_key_points.items():
+            if not pts_local:
                 continue
-            mapped_name = getattr(self.hand_model, '_map_to_current_status_name', lambda x: x)(link_name) or link_name
+            
+            mapped_name = mapper(link_name) or link_name
             if mapped_name not in self.hand_model.current_status:
                 continue
-            kp = self.hand_model.current_status[mapped_name].transform_points(
-                torch.tensor(pts_local, device=self.hand_model.device, dtype=torch.float32)
-            ).expand(self.hand_model.batch_size, -1, -1)
-            kp = torch.bmm(kp, self.hand_model.global_rotation.transpose(1, 2)) + self.hand_model.global_translation.unsqueeze(1)
+                
+            # Transform local points -> world
+            pts_t = torch.tensor(pts_local, device=self.hand_model.device, dtype=torch.float32)
+            kp = self.hand_model.current_status[mapped_name].transform_points(pts_t)
+            # Apply global transform
+            kp = kp.expand(self.hand_model.batch_size, -1, -1)
+            kp = torch.bmm(kp, self.hand_model.global_rotation.transpose(1, 2)) 
+            kp = kp + self.hand_model.global_translation.unsqueeze(1)
             kp = kp * self.hand_model.scale
+            
+            # Fill unique buffer
             idxs = self.link_to_unique.get(link_name, [])
             for k, u in enumerate(idxs):
-                u = int(u)
-                if 0 <= u < self.N and not filled[u]:
-                    xyz[u] = kp[0, k]
-                    filled[u] = True
+                u_idx = int(u)
+                if 0 <= u_idx < self.N and not filled[u_idx]:
+                    xyz[u_idx] = kp[0, k]
+                    filled[u_idx] = True
+                    
         if not torch.all(filled):
-            missing = (~filled).nonzero(as_tuple=False).view(-1)
-            if missing.numel() > 0:
-                xyz[missing] = 0.0
+            xyz[~filled] = 0.0
         return xyz
 
     @torch.no_grad()
     def _build_xyz_from_pose_local(self, q: torch.Tensor) -> torch.Tensor:
+        """Computes keypoints in Local/Canonical Frame (Root aligned)."""
         if q.dim() == 1:
             q = q.unsqueeze(0)
         q = q.to(device=self.hand_model.device, dtype=torch.float32)
+        
+        # Reset rigid pose (Translation=0, Rotation=Identity)
         q_local = q.clone()
         q_local[:, :3] = 0.0
+        
         rot_id = self._rotation_identity(q_local.device)
         rot_dim = rot_id.shape[0]
         rot_start = max(0, q_local.shape[1] - rot_dim)
         if rot_start + rot_dim <= q_local.shape[1]:
             q_local[:, rot_start:rot_start + rot_dim] = rot_id.view(1, -1)
+            
+        # Update kinematics with reset pose
         self.hand_model.update_kinematics(q_local)
+        
+        # (Exact logic copy from _build_xyz_from_pose regarding point filling)
         xyz = torch.zeros((self.N, 3), dtype=torch.float32, device=self.hand_model.device)
         filled = torch.zeros((self.N,), dtype=torch.bool, device=self.hand_model.device)
-        for link_name in self.hand_model.joint_key_points:
-            pts_local = self.hand_model.joint_key_points[link_name]
-            if len(pts_local) == 0:
+        mapper = getattr(self.hand_model, '_map_to_current_status_name', lambda x: x)
+
+        for link_name, pts_local in self.hand_model.joint_key_points.items():
+            if not pts_local:
                 continue
-            mapped_name = getattr(self.hand_model, '_map_to_current_status_name', lambda x: x)(link_name) or link_name
+            mapped_name = mapper(link_name) or link_name
             if mapped_name not in self.hand_model.current_status:
                 continue
-            kp = self.hand_model.current_status[mapped_name].transform_points(
-                torch.tensor(pts_local, device=self.hand_model.device, dtype=torch.float32)
-            ).expand(self.hand_model.batch_size, -1, -1)
+            pts_t = torch.tensor(pts_local, device=self.hand_model.device, dtype=torch.float32)
+            kp = self.hand_model.current_status[mapped_name].transform_points(pts_t)
+            kp = kp.expand(self.hand_model.batch_size, -1, -1)
+            # Note: Global rotation/translation is identity/zero here due to q_local, except scale
             kp = kp * self.hand_model.scale
+            
             idxs = self.link_to_unique.get(link_name, [])
             for k, u in enumerate(idxs):
-                u = int(u)
-                if 0 <= u < self.N and not filled[u]:
-                    xyz[u] = kp[0, k]
-                    filled[u] = True
+                u_idx = int(u)
+                if 0 <= u_idx < self.N and not filled[u_idx]:
+                    xyz[u_idx] = kp[0, k]
+                    filled[u_idx] = True
+
         if not torch.all(filled):
-            missing = (~filled).nonzero(as_tuple=False).view(-1)
-            if missing.numel() > 0:
-                xyz[missing] = 0.0
-        # Anchor translation should still be reflected even when rigid pose is reset
-        anchor_translation = getattr(self.hand_model, 'global_translation', None)
-        if anchor_translation is not None and anchor_translation.numel() >= 3:
-            xyz = xyz + anchor_translation[0].view(1, 3)
+            xyz[~filled] = 0.0
+            
+        # Re-apply anchor translation if it exists (for centering logic)
+        anchor_trans = getattr(self.hand_model, 'global_translation', None)
+        if anchor_trans is not None and anchor_trans.numel() >= 3:
+            xyz = xyz + anchor_trans[0].view(1, 3)
+            
         return xyz
 
     def _normalize_xyz(self, xyz: torch.Tensor) -> torch.Tensor:
-        """Normalize xyz using preloaded bounds to [-1, 1]."""
         if self._norm_xyz_min is None or self._norm_xyz_max is None:
-            raise RuntimeError("Normalization bounds are not initialized.")
+            raise RuntimeError("Normalization bounds not initialized.")
         denom = torch.clamp(self._norm_xyz_max - self._norm_xyz_min, min=self._norm_eps)
         norm = (xyz - self._norm_xyz_min) / denom
-        norm = norm * 2.0 - 1.0
-        return torch.clamp(norm, -1.0, 1.0)
+        return torch.clamp(norm * 2.0 - 1.0, -1.0, 1.0)
 
     def _denormalize_xyz(self, norm_xyz: torch.Tensor) -> torch.Tensor:
-        """Inverse of _normalize_xyz."""
         if self._norm_xyz_min is None or self._norm_xyz_max is None:
-            raise RuntimeError("Normalization bounds are not initialized.")
+            raise RuntimeError("Normalization bounds not initialized.")
         norm = torch.clamp(norm_xyz, -1.0, 1.0)
         unscaled = (norm + 1.0) * 0.5
         denom = torch.clamp(self._norm_xyz_max - self._norm_xyz_min, min=self._norm_eps)
-        xyz = unscaled * denom + self._norm_xyz_min
-        return xyz
+        return unscaled * denom + self._norm_xyz_min
 
     def _xyz_from_cache(self, xyz_local: Any, se3: Any) -> torch.Tensor:
-        if not isinstance(xyz_local, torch.Tensor):
-            xyz_local_t = torch.tensor(xyz_local, dtype=torch.float32)
+        xyz_t = torch.as_tensor(xyz_local, dtype=torch.float32)
+        se3_t = torch.as_tensor(se3, dtype=torch.float32)
+        rot, trans = se3_t[:3, :3], se3_t[:3, 3]
+        return torch.matmul(xyz_t, rot.transpose(0, 1)) + trans.unsqueeze(0)
+
+    def _anchor_offset(self, anchor: str, device: Optional[torch.device] = None) -> torch.Tensor:
+        a = (anchor or "base").lower()
+        if a == "palm_center":
+            off = PALM_CENTER_ANCHOR_TRANSLATION
+        elif a == "mjcf":
+            off = MJCF_ANCHOR_TRANSLATION
         else:
-            xyz_local_t = xyz_local.to(torch.float32)
-        if isinstance(se3, torch.Tensor):
-            se3_t = se3.to(torch.float32)
-        else:
-            se3_t = torch.tensor(se3, dtype=torch.float32)
-        rot = se3_t[:3, :3]
-        trans = se3_t[:3, 3]
-        world = torch.matmul(xyz_local_t, rot.transpose(0, 1)) + trans.unsqueeze(0)
-        return world
+            off = torch.zeros(3, dtype=torch.float32)
+        return off.to(device=device or self.hand_model.device, dtype=torch.float32)
 
     @torch.no_grad()
     def _scene_pc_world_to_local(
@@ -529,243 +528,185 @@ class _HandEncoderPreparedDataset(Dataset):
         t_world: torch.Tensor,
         t_local: torch.Tensor,
     ) -> torch.Tensor:
-        if scene_pc.ndim != 2 or scene_pc.shape[1] < 3:
-            return scene_pc
-        if R_world.ndim != 2 or R_world.shape != (3, 3):
-            return scene_pc
-        if t_world.ndim != 1 or t_world.shape[0] != 3:
-            return scene_pc
-        if t_local.ndim != 1 or t_local.shape[0] != 3:
-            return scene_pc
-        sp = scene_pc.to(dtype=torch.float32)
-        pts = sp[:, :3]
-        t_w = t_world.view(1, 3).to(dtype=torch.float32)
-        t_l = t_local.view(1, 3).to(dtype=torch.float32)
-        R = R_world.to(dtype=torch.float32)
-        # World (object-centric) -> local anchor frame used by _build_xyz_from_pose_local
-        # x_local = (x_world - t_world) @ R_world + t_local
-        local = (pts - t_w) @ R + t_l
+        if scene_pc.ndim != 2 or scene_pc.shape[1] < 3: return scene_pc
+        if R_world.shape != (3, 3) or t_world.shape != (3,) or t_local.shape != (3,): return scene_pc
+
+        pts = scene_pc[:, :3].to(dtype=torch.float32)
+        # Transform: (X_world - T_world) @ R_world + T_local
+        local = (pts - t_world.view(1, 3)) @ R_world.float() + t_local.view(1, 3).float()
+        
         if scene_pc.shape[1] > 3:
-            tail = scene_pc[:, 3:].to(dtype=scene_pc.dtype)
-            return torch.cat([local.to(dtype=scene_pc.dtype), tail], dim=1)
+            return torch.cat([local.to(dtype=scene_pc.dtype), scene_pc[:, 3:]], dim=1)
         return local.to(dtype=scene_pc.dtype)
 
-    def _get_hand_pose_tensor(self, sample: Dict[str, Any]) -> torch.Tensor:
-        hand_pose = sample['hand_model_pose']
-        if not isinstance(hand_pose, torch.Tensor):
-            hand_pose_t = torch.tensor(hand_pose, dtype=torch.float32)
-        else:
-            hand_pose_t = hand_pose.to(torch.float32)
-        return hand_pose_t
-
-    def _get_cached_entries(self, idx: int, sample: Dict[str, Any]) -> Tuple[Any, Any]:
-        cached_xyz = None
-        cached_se3 = None
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sample = self.base[idx]
+        hand_pose_t = torch.as_tensor(sample['hand_model_pose'], dtype=torch.float32)
+        
+        # Retrieve Cache
         if self.cache is not None:
-            cache_sample = self.cache[idx]
-            cached_xyz = cache_sample.get('cached_xyz_local')
-            cached_se3 = cache_sample.get('cached_se3')
+            c_sample = self.cache[idx]
+            cached_xyz, cached_se3 = c_sample.get('cached_xyz_local'), c_sample.get('cached_se3')
         else:
-            cached_xyz = sample.get('cached_xyz_local')
-            cached_se3 = sample.get('cached_se3')
-        return cached_xyz, cached_se3
+            cached_xyz, cached_se3 = sample.get('cached_xyz_local'), sample.get('cached_se3')
 
-    def _get_scene_pc_tensor(self, sample: Dict[str, Any]) -> torch.Tensor:
+        # Handle Scene Point Cloud Input
         scene_pc_raw = sample.get('scene_pc')
-        if isinstance(scene_pc_raw, torch.Tensor):
-            scene_pc = scene_pc_raw.to(torch.float32)
-        elif isinstance(scene_pc_raw, np.ndarray):
-            arr = scene_pc_raw
-            if arr.ndim >= 2 and arr.shape[1] >= 3:
-                scene_pc = torch.from_numpy(arr.astype(np.float32))
-            else:
+        if isinstance(scene_pc_raw, (torch.Tensor, np.ndarray)):
+            scene_pc = torch.as_tensor(scene_pc_raw, dtype=torch.float32)
+            if scene_pc.ndim < 2 or scene_pc.shape[1] < 3:
                 scene_pc = torch.zeros((0, 3), dtype=torch.float32)
         else:
             scene_pc = torch.zeros((0, 3), dtype=torch.float32)
-        return scene_pc
 
-    def _compute_xyz_and_scene_pc(
-        self,
-        hand_pose_t: torch.Tensor,
-        cached_xyz: Any,
-        cached_se3: Any,
-        scene_pc: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Compute XYZ and Scene PC
         if self.use_local_pose_only:
-            q = hand_pose_t.unsqueeze(0).to(self.hand_model.device)
-            # First compute world-frame keypoints to obtain the hand's global SE(3)
-            _ = self._build_xyz_from_pose(q).to(torch.float32)
-            R_world = getattr(self.hand_model, "global_rotation", None)
-            t_world = getattr(self.hand_model, "global_translation", None)
-            # Then build local xyz with rigid pose reset (this call overwrites global_translation to t_local)
-            xyz = self._build_xyz_from_pose_local(q).to(torch.float32)
-            t_local = getattr(self.hand_model, "global_translation", None)
-            if (
-                scene_pc.numel() > 0
-                and isinstance(R_world, torch.Tensor)
-                and isinstance(t_world, torch.Tensor)
-                and isinstance(t_local, torch.Tensor)
-                and R_world.shape[0] > 0
-                and t_world.shape[0] > 0
-                and t_local.shape[0] > 0
-            ):
-                scene_pc = self._scene_pc_world_to_local(scene_pc, R_world[0], t_world[0], t_local[0])
+            xyz = None
+            target_anchor = getattr(self.hand_model, "anchor", "base")
+            stored_anchor = self.cached_stored_anchor or "base"
+            stored_off = self._anchor_offset(stored_anchor, device=self.hand_model.device)
+            target_off = self._anchor_offset(target_anchor, device=self.hand_model.device)
+
+            if cached_xyz is not None:
+                xyz = torch.as_tensor(cached_xyz, dtype=torch.float32, device=self.hand_model.device)
+                xyz = xyz + (stored_off - target_off)
+
+            # Scene point cloud: use cached SE3 if available, otherwise fall back to FK
+            if scene_pc.numel() > 0 and cached_se3 is not None:
+                se3_t = torch.as_tensor(cached_se3, dtype=torch.float32)
+                R_world = se3_t[:3, :3]
+                t_world = se3_t[:3, 3]
+                t_local = (stored_off - target_off)
+                scene_pc = self._scene_pc_world_to_local(scene_pc, R_world, t_world, t_local)
+
+            if xyz is None or (scene_pc.numel() > 0 and cached_se3 is None):
+                q = hand_pose_t.unsqueeze(0).to(self.hand_model.device)
+                _ = self._build_xyz_from_pose(q)
+                R_world = getattr(self.hand_model, "global_rotation", None)
+                t_world = getattr(self.hand_model, "global_translation", None)
+                
+                xyz = self._build_xyz_from_pose_local(q).to(torch.float32)
+                t_local = getattr(self.hand_model, "global_translation", None)
+                
+                if (scene_pc.numel() > 0 and 
+                    all(x is not None and x.numel() > 0 for x in [R_world, t_world, t_local])):
+                    scene_pc = self._scene_pc_world_to_local(scene_pc, R_world[0], t_world[0], t_local[0])
         else:
-            xyz: Optional[torch.Tensor] = None
+            # Global Mode: Use Cache or Compute
             if cached_xyz is not None and cached_se3 is not None:
                 xyz = self._xyz_from_cache(cached_xyz, cached_se3).to(torch.float32)
             elif cached_xyz is not None:
-                xyz = (
-                    cached_xyz
-                    if isinstance(cached_xyz, torch.Tensor)
-                    else torch.tensor(cached_xyz, dtype=torch.float32)
-                ).to(torch.float32)
-            if xyz is None:
+                xyz = torch.as_tensor(cached_xyz, dtype=torch.float32)
+            else:
                 q = hand_pose_t.unsqueeze(0).to(self.hand_model.device)
                 xyz = self._build_xyz_from_pose(q).to(torch.float32)
-        return xyz, scene_pc
 
-    def _build_output(
-        self,
-        sample: Dict[str, Any],
-        hand_pose_t: torch.Tensor,
-        xyz: torch.Tensor,
-        scene_pc: torch.Tensor,
-    ) -> Dict[str, Any]:
-        if self.return_norm:
-            norm_xyz = self._normalize_xyz(xyz)
-        else:
-            norm_xyz = xyz.clone()
+        # Build Output Dictionary
+        xyz_cpu = xyz.cpu()
+        norm_xyz = self._normalize_xyz(xyz).cpu() if self.return_norm else xyz_cpu
+        
+        # Handle Norm Pose (Precomputed or Raw)
         norm_pose = sample.get('norm_pose')
         if norm_pose is not None:
-            if isinstance(norm_pose, np.ndarray):
-                norm_pose = torch.from_numpy(norm_pose)
-            if isinstance(norm_pose, torch.Tensor):
-                norm_pose = norm_pose.cpu()
-        hand_pose_out = hand_pose_t
+            norm_pose = torch.as_tensor(norm_pose).cpu()
+
+        # Handle Local Pose Output
+        out_pose = hand_pose_t
         if self.use_local_pose_only:
             hp = hand_pose_t.clone()
-            if hp.numel() >= 6:  # ensure pose has rigid part
+            if hp.numel() >= 6:
                 hp[:3] = 0.0
-                rot_id = self._rotation_identity(hp.device)
+                rot_id = self._rotation_identity(hp.device).cpu()
                 tail_len = rot_id.shape[0]
                 rot_start = max(0, hp.shape[0] - tail_len)
                 if rot_start + tail_len <= hp.shape[0]:
-                    hp[rot_start:rot_start + tail_len] = rot_id.to(hp.dtype).cpu()
-            hand_pose_out = hp.cpu()
-        out = {
-            'xyz': xyz.cpu(),
-            'norm_xyz': norm_xyz.cpu(),
-            'hand_model_pose': hand_pose_out,
+                    hp[rot_start:rot_start + tail_len] = rot_id.to(hp.dtype)
+            out_pose = hp.cpu()
+
+        result = {
+            'xyz': xyz_cpu,
+            'norm_xyz': norm_xyz,
+            'hand_model_pose': out_pose,
             'norm_pose': norm_pose,
             'obj_code': sample.get('obj_code'),
             'scene_id': sample.get('scene_id'),
         }
+
+        # Process Scene PC Output (Raw/Norm/Both)
         if scene_pc.numel() > 0:
-            # Normalize scene xyz using the same bounds; keep extra features unchanged.
-            norm_scene_pc = None
+            norm_pc = None
             if self.return_norm:
                 xyz_part = scene_pc[:, :3]
-                norm_scene_xyz = self._normalize_xyz(xyz_part)
+                norm_xyz_part = self._normalize_xyz(xyz_part)
                 if scene_pc.shape[1] > 3:
-                    tail = scene_pc[:, 3:]
-                    norm_scene_pc = torch.cat([norm_scene_xyz, tail], dim=1)
+                    norm_pc = torch.cat([norm_xyz_part, scene_pc[:, 3:]], dim=1)
                 else:
-                    norm_scene_pc = norm_scene_xyz
-            mode = self.scene_pc_return_mode
-            if mode in ("raw", "both"):
-                out['scene_pc'] = scene_pc.cpu()
-            if mode in ("norm", "both") and norm_scene_pc is not None:
-                out['norm_scene_pc'] = norm_scene_pc.cpu()
-        return out
+                    norm_pc = norm_xyz_part
+            
+            if self.scene_pc_return_mode in ("raw", "both"):
+                result['scene_pc'] = scene_pc.cpu()
+            if self.scene_pc_return_mode in ("norm", "both") and norm_pc is not None:
+                result['norm_scene_pc'] = norm_pc.cpu()
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        sample = self.base[idx]
-        hand_pose_t = self._get_hand_pose_tensor(sample)
-        cached_xyz, cached_se3 = self._get_cached_entries(idx, sample)
-        scene_pc = self._get_scene_pc_tensor(sample)
-        xyz, scene_pc = self._compute_xyz_and_scene_pc(
-            hand_pose_t=hand_pose_t,
-            cached_xyz=cached_xyz,
-            cached_se3=cached_se3,
-            scene_pc=scene_pc,
-        )
-        return self._build_output(sample, hand_pose_t, xyz, scene_pc)
+        return result
 
 
 def _collate_for_hand_encoder(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not batch:
         return {}
-    xyz = torch.stack([b['xyz'] for b in batch], dim=0)
-    norm_xyz = torch.stack([b['norm_xyz'] for b in batch], dim=0)
-    hand_model_pose = torch.stack([b['hand_model_pose'] for b in batch], dim=0)
-    norm_pose = None
+        
+    # Stack standard tensors
+    out = {
+        'xyz': torch.stack([b['xyz'] for b in batch], dim=0),
+        'norm_xyz': torch.stack([b['norm_xyz'] for b in batch], dim=0),
+        'hand_model_pose': torch.stack([b['hand_model_pose'] for b in batch], dim=0),
+        'obj_code': [b.get('obj_code') for b in batch],
+        'scene_id': [b.get('scene_id') for b in batch],
+    }
+    
     if all(b.get('norm_pose') is not None for b in batch):
-        norm_pose = torch.stack([b['norm_pose'] for b in batch], dim=0)
-    obj_code = [b.get('obj_code') for b in batch]
-    scene_id = [b.get('scene_id') for b in batch]
-    scene_pc = None
-    norm_scene_pc = None
-    scene_list: List[Optional[torch.Tensor]] = []
-    norm_scene_list: List[Optional[torch.Tensor]] = []
-    for b in batch:
-        pc_raw = b.get('scene_pc')
-        npc_raw = b.get('norm_scene_pc')
-        pc_t = None
-        npc_t = None
-        if isinstance(pc_raw, torch.Tensor):
-            pc_t = pc_raw
-        elif isinstance(pc_raw, np.ndarray):
-            pc_t = torch.from_numpy(pc_raw)
-        if isinstance(npc_raw, torch.Tensor):
-            npc_t = npc_raw
-        elif isinstance(npc_raw, np.ndarray):
-            npc_t = torch.from_numpy(npc_raw)
-        scene_list.append(pc_t)
-        norm_scene_list.append(npc_t)
+        out['norm_pose'] = torch.stack([b['norm_pose'] for b in batch], dim=0)
+    else:
+        out['norm_pose'] = None
 
-    if any(pc is not None for pc in scene_list) or any(pc is not None for pc in norm_scene_list):
+    # Handle Variable Length Point Clouds (Padding)
+    pc_keys = []
+    if any('scene_pc' in b for b in batch): pc_keys.append('scene_pc')
+    if any('norm_scene_pc' in b for b in batch): pc_keys.append('norm_scene_pc')
+
+    if pc_keys:
+        # Determine max N and feature dim
         max_n = 0
         feat_dim = None
-        ref_tensor: Optional[torch.Tensor] = None
-        for pc in scene_list + norm_scene_list:
-            if pc is not None and pc.ndim == 2:
-                if ref_tensor is None:
-                    ref_tensor = pc
-                max_n = max(max_n, int(pc.shape[0]))
-                if feat_dim is None and pc.shape[1] > 0:
-                    feat_dim = int(pc.shape[1])
-        if ref_tensor is not None and feat_dim is not None and max_n > 0:
-            dtype = ref_tensor.dtype
-            device = ref_tensor.device
-            batch_size = len(scene_list)
-            if any(pc is not None for pc in scene_list):
-                scene_pc = torch.zeros((batch_size, max_n, feat_dim), dtype=dtype, device=device)
-            if any(pc is not None for pc in norm_scene_list):
-                norm_scene_pc = torch.zeros((batch_size, max_n, feat_dim), dtype=dtype, device=device)
-            for i, pc in enumerate(scene_list):
-                if pc is None or pc.ndim != 2 or scene_pc is None:
-                    continue
-                n_i = min(int(pc.shape[0]), max_n)
-                scene_pc[i, :n_i, :pc.shape[1]] = pc[:n_i]
-            for i, npc in enumerate(norm_scene_list):
-                if npc is None or npc.ndim != 2 or norm_scene_pc is None:
-                    continue
-                n_i = min(int(npc.shape[0]), max_n)
-                norm_scene_pc[i, :n_i, :npc.shape[1]] = npc[:n_i]
-    result: Dict[str, Any] = {
-        'xyz': xyz,
-        'hand_model_pose': hand_model_pose,
-        'norm_xyz': norm_xyz,
-        'norm_pose': norm_pose,
-        'obj_code': obj_code,
-        'scene_id': scene_id,
-    }
-    if scene_pc is not None:
-        result['scene_pc'] = scene_pc
-    if norm_scene_pc is not None:
-        result['norm_scene_pc'] = norm_scene_pc
-    return result
+        ref_device = None
+        ref_dtype = None
+
+        for b in batch:
+            for k in pc_keys:
+                t = b.get(k)
+                if isinstance(t, (torch.Tensor, np.ndarray)):
+                    t = torch.as_tensor(t)
+                    if t.ndim == 2:
+                        max_n = max(max_n, int(t.shape[0]))
+                        if feat_dim is None: 
+                            feat_dim = int(t.shape[1])
+                            ref_device = t.device
+                            ref_dtype = t.dtype
+        
+        if max_n > 0 and feat_dim is not None:
+            batch_size = len(batch)
+            for k in pc_keys:
+                padded = torch.zeros((batch_size, max_n, feat_dim), dtype=ref_dtype, device=ref_device)
+                for i, b in enumerate(batch):
+                    t = b.get(k)
+                    if t is not None:
+                        t = torch.as_tensor(t)
+                        if t.ndim == 2:
+                            n_i = min(int(t.shape[0]), max_n)
+                            padded[i, :n_i, :t.shape[1]] = t[:n_i]
+                out[k] = padded
+
+    return out
 
 
 class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
@@ -798,543 +739,398 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
         cache_show_progress: bool = True,
         prefetch_factor: int = 1,
         persistent_workers: Optional[bool] = None,
-        # Legacy arg ignored
-        data_cfg: Optional[Any] = None,
+        data_cfg: Optional[Any] = None,  # Legacy ignored
         return_norm: bool = False,
         scene_pc_return_mode: Optional[str] = None,
     ) -> None:
-        """
-        Initialize via Hydra instantiation.
-        """
         super().__init__()
-
+        
+        # Basic Config
         self.name = name
         self.mode = str(mode or "dexgraspnet").lower()
         self.batch_size = int(batch_size)
         self.num_workers = int(num_workers)
         self.pin_memory = bool(pin_memory)
-
-        # Dataset kwargs
+        self.prefetch_factor = int(prefetch_factor)
+        self.persistent_workers = bool(persistent_workers) if persistent_workers is not None else (self.num_workers > 0)
+        
+        # Dataset Config
         if OmegaConf is not None and isinstance(dataset_kwargs, DictConfig):  # type: ignore
             dataset_kwargs = OmegaConf.to_container(dataset_kwargs, resolve=True)
         self.dataset_kwargs = dict(dataset_kwargs or {})
-        
-        self.use_cached_keypoints = bool(use_cached_keypoints)
-        self.cache_root = cache_root
-        self.return_norm = bool(return_norm)
-        if scene_pc_return_mode is None:
-            self.scene_pc_return_mode = "norm" if self.return_norm else "raw"
-        else:
-            self.scene_pc_return_mode = str(scene_pc_return_mode).lower()
 
-        # Cache shards parsing
-        def _parse_cache_max(v: Any):
-            if v is None:
-                return None
-            if isinstance(v, str):
-                key = v.strip().lower()
-                if key in ('all', 'full', 'infinite', 'inf', 'max'):
-                    return 'all'
-                try:
-                    return int(v)
-                except Exception:
-                    return None
-            try:
-                return int(v)
-            except Exception:
-                return None
-
-        parsed = _parse_cache_max(cache_max_shards_in_memory)
-        if parsed is None:
-            parsed = _parse_cache_max(cache_max_shards)
-        self.cache_max_shards = parsed if parsed is not None else 2
-
-        self._cache_mode_dir: Optional[Path] = None
-        self._cache_meta_checked = False
-        self.cache_preload_to_ram = bool(cache_preload_to_ram)
-        self.cache_show_progress = bool(cache_show_progress)
-        
-        self.prefetch_factor = int(prefetch_factor)
-        if persistent_workers is None:
-            self.persistent_workers = (self.num_workers > 0)
-        else:
-            self.persistent_workers = bool(persistent_workers)
-
-        # Normalization stats paths
-        norm_stats_path = self.dataset_kwargs.get('normalization_stats_path')
-        if norm_stats_path is not None:
-            self.normalization_stats_path = str(norm_stats_path)
-            self.dataset_kwargs['normalization_stats_path'] = self.normalization_stats_path
-        else:
-            self.normalization_stats_path = None
-
-        self.norm_xyz_stats_path = str(norm_xyz_stats_path) if norm_xyz_stats_path is not None else None
-        self.xyz_per_point_stats_path = (
-            str(xyz_per_point_stats_path) if xyz_per_point_stats_path is not None else None
-        )
-
-        # Hand/rotation config
+        # Hand/Graph Config
         self.rot_type = str(rot_type or 'quat')
         self.trans_anchor = str(trans_anchor or 'palm_center')
         self.hand_scale = float(hand_scale)
         self.urdf_assets_meta_path = urdf_assets_meta_path
-
-        # Graph options
         self.use_palm_star = bool(use_palm_star)
         self.connect_forearm = bool(connect_forearm)
         self.add_middle_distal = bool(add_middle_distal)
+
+        # Caching Config
+        self.use_cached_keypoints = bool(use_cached_keypoints)
+        self.cache_root = cache_root
+        self.cache_preload_to_ram = bool(cache_preload_to_ram)
+        self.cache_show_progress = bool(cache_show_progress)
+        self._cache_mode_dir: Optional[Path] = None
+        self._cache_meta_checked = False
+        self.cache_max_shards = self._parse_cache_max(cache_max_shards_in_memory) or self._parse_cache_max(cache_max_shards) or 2
+        self._cache_usage_logged: bool = False
+        self._cache_meta: Optional[Dict[str, Any]] = None
+
+        # Normalization Config
+        self.return_norm = bool(return_norm)
+        self.use_local_pose_only = bool(use_local_pose_only)
+        self.scene_pc_return_mode = str(scene_pc_return_mode).lower() if scene_pc_return_mode else ("norm" if self.return_norm else "raw")
+        
+        # Stats Paths
+        self.norm_xyz_stats_path = str(norm_xyz_stats_path) if norm_xyz_stats_path else None
+        self.xyz_per_point_stats_path = str(xyz_per_point_stats_path) if xyz_per_point_stats_path else None
+        if self.dataset_kwargs.get('normalization_stats_path'):
+            self.normalization_stats_path = str(self.dataset_kwargs['normalization_stats_path'])
+        else:
+            self.normalization_stats_path = None
 
         # Phases
         self.train_phase = train_phase
         self.val_phase = val_phase
         self.test_phase = test_phase
 
-        self.use_local_pose_only = bool(use_local_pose_only)
-
-        # Datasets placeholders
+        # State State
         self.train_dataset: Optional[Dataset] = None
         self.val_dataset: Optional[Dataset] = None
         self.test_dataset: Optional[Dataset] = None
-
         self._prepared_constants: Optional[Dict[str, Any]] = None
         self._norm_xyz_bounds: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-        self._setup_done_stages: set = set()
+
+    @staticmethod
+    def _parse_cache_max(v: Any) -> Optional[Union[int, str]]:
+        if v is None: return None
+        if isinstance(v, str):
+            if v.strip().lower() in ('all', 'full', 'infinite', 'inf', 'max'):
+                return 'all'
+            try: return int(v)
+            except Exception: return None
+        try: return int(v)
+        except Exception: return None
 
     def prepare_data(self) -> None:
         pass
 
-    def _resolve_stats_path(self, configured_path: Optional[str], default_relpath: Path) -> Path:
+    def _resolve_path(self, configured_path: Optional[str], default_relpath: str) -> Path:
         proj_root = Path(__file__).resolve().parents[2]
-        if configured_path is not None:
-            json_path = Path(configured_path)
-            if not json_path.is_absolute():
-                json_path = proj_root / json_path
-        else:
-            json_path = proj_root / default_relpath
-        return json_path
+        if configured_path:
+            p = Path(configured_path)
+            return p if p.is_absolute() else proj_root / p
+        return proj_root / default_relpath
 
     def _load_handencoder_scene_bounds(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Load unified xyz bounds for hand+scene from precomputed stats JSON."""
-        json_path = self._resolve_stats_path(
-            self.norm_xyz_stats_path,
-            Path("data") / "DexGraspNet" / "handencoder_scene_xyz_bounds.json",
-        )
+        json_path = self._resolve_path(self.norm_xyz_stats_path, "data/DexGraspNet/handencoder_scene_xyz_bounds.json")
         if not json_path.exists():
-            raise RuntimeError(f"Normalization stats file not found: {json_path}")
-        try:
-            with open(json_path, "r") as f:
-                stats_obj = json.load(f)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to read normalization stats from {json_path}: {exc}") from exc
-
-        stats_block = stats_obj.get("stats", {})
-        combined = stats_block.get("combined")
-        if combined is None:
-            raise RuntimeError("Normalization stats missing 'combined' block with min/max.")
-        mins = np.asarray(combined.get("min"), dtype=np.float32).reshape(-1)
-        maxs = np.asarray(combined.get("max"), dtype=np.float32).reshape(-1)
+            raise RuntimeError(f"Norm stats missing: {json_path}")
+        
+        with open(json_path, "r") as f:
+            stats = json.load(f).get("stats", {}).get("combined", {})
+        
+        mins = np.asarray(stats.get("min"), dtype=np.float32).reshape(-1)
+        maxs = np.asarray(stats.get("max"), dtype=np.float32).reshape(-1)
         if mins.shape[0] != 3 or maxs.shape[0] != 3:
-            raise RuntimeError(f"Expected 3D bounds in normalization stats, got {mins.shape}/{maxs.shape}")
-        lo = torch.from_numpy(mins).view(1, 3)
-        hi = torch.from_numpy(maxs).view(1, 3)
-        return lo, hi
+            raise RuntimeError(f"Invalid 3D bounds in {json_path}")
+            
+        return torch.from_numpy(mins).view(1, 3), torch.from_numpy(maxs).view(1, 3)
 
     def _load_handencoder_per_point_stats(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Load per-point canonical xyz and approx std stats from JSON.
-        """
-        json_path = self._resolve_stats_path(
-            self.xyz_per_point_stats_path,
-            Path("data") / "DexGraspNet" / "handencoder_xyz_per_point_stats.json",
-        )
+        json_path = self._resolve_path(self.xyz_per_point_stats_path, "data/DexGraspNet/handencoder_xyz_per_point_stats.json")
         if not json_path.exists():
-            raise RuntimeError(f"Per-point stats file not found: {json_path}")
-        try:
-            with open(json_path, "r") as f:
-                stats_obj = json.load(f)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to read per-point stats from {json_path}: {exc}") from exc
+            raise RuntimeError(f"Per-point stats missing: {json_path}")
 
-        stats_block = stats_obj.get("stats", {})
-        xyz_stats = stats_block.get("xyz_per_point")
-        if xyz_stats is None:
-            raise RuntimeError("Per-point stats missing 'xyz_per_point' block.")
-        per_point = xyz_stats.get("per_point")
-        if per_point is None:
-            raise RuntimeError("Per-point stats missing 'per_point' entries.")
-
-        try:
-            canonical_xyz = torch.tensor(
-                [p["canonical_xyz"] for p in per_point],
-                dtype=torch.float32,
-            )
-            approx_std = torch.tensor(
-                [p["approx_std"] for p in per_point],
-                dtype=torch.float32,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"Failed to parse per-point stats from {json_path}: {exc}") from exc
-
-        return canonical_xyz, approx_std
+        with open(json_path, "r") as f:
+            data = json.load(f).get("stats", {}).get("xyz_per_point", {}).get("per_point", [])
+            
+        if not data:
+            raise RuntimeError("Empty per-point stats data.")
+            
+        can_xyz = torch.tensor([p["canonical_xyz"] for p in data], dtype=torch.float32)
+        approx_std = torch.tensor([p["approx_std"] for p in data], dtype=torch.float32)
+        return can_xyz, approx_std
 
     def _ensure_norm_xyz_bounds(self, device: torch.device) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         if not self.return_norm:
             return None
         if not self.use_local_pose_only or self.trans_anchor != "palm_center":
-            raise RuntimeError(
-                "Normalization is only supported when use_local_pose_only=True and trans_anchor='palm_center'."
-            )
+            raise RuntimeError("Normalization requires use_local_pose_only=True and trans_anchor='palm_center'.")
+            
         if self._norm_xyz_bounds is None:
             lo, hi = self._load_handencoder_scene_bounds()
-            lo = lo.to(device=device, dtype=torch.float32)
-            hi = hi.to(device=device, dtype=torch.float32)
-            self._norm_xyz_bounds = (lo, hi)
-            logger.info("HandEncoderDataModule: loaded norm bounds from handencoder_scene_xyz_bounds.json min=%s max=%s", lo.tolist(), hi.tolist())
+            self._norm_xyz_bounds = (lo.to(device), hi.to(device))
+            logger.info(f"HandEncoderDataModule: Loaded bounds min={lo.tolist()}, max={hi.tolist()}")
         return self._norm_xyz_bounds
 
     def _clone_norm_bounds(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        if self._norm_xyz_bounds is None:
-            return None
-        lo, hi = self._norm_xyz_bounds
-        return (lo.clone(), hi.clone())
+        return (self._norm_xyz_bounds[0].clone(), self._norm_xyz_bounds[1].clone()) if self._norm_xyz_bounds else None
 
     def _load_urdf_assets(self) -> Tuple[str, str]:
         proj_root = Path(__file__).resolve().parents[2]
-        meta_path = Path(self.urdf_assets_meta_path) if self.urdf_assets_meta_path else (proj_root / 'assets' / 'urdf' / 'urdf_assets_meta.json')
+        meta_path = Path(self.urdf_assets_meta_path) if self.urdf_assets_meta_path else proj_root / 'assets/urdf/urdf_assets_meta.json'
+        
         with open(meta_path, 'r') as f:
             meta = json.load(f)
-        urdf_path = proj_root / meta['urdf_path']['shadowhand']
-        meshes_path = proj_root / meta['meshes_path']['shadowhand']
-        return str(urdf_path), str(meshes_path)
+        return str(proj_root / meta['urdf_path']['shadowhand']), str(proj_root / meta['meshes_path']['shadowhand'])
+
+    def _resolve_cache_dir(self) -> Path:
+        if self._cache_mode_dir:
+            return self._cache_mode_dir
+        if not self.cache_root:
+            raise ValueError("cache_root required for use_cached_keypoints=True")
+            
+        base = Path(self.cache_root)
+        base = base if base.is_absolute() else Path.cwd() / base
+        
+        mode_dir = base / (self.mode or 'default')
+        if not mode_dir.exists():
+            mode_dir = base if base.exists() else None
+            
+        if not mode_dir or not mode_dir.exists():
+            raise FileNotFoundError(f"Cache directory not found: {mode_dir or base}")
+            
+        self._cache_mode_dir = mode_dir
+        logger.info(f"HandEncoderDataModule: using cached keypoints from {mode_dir}")
+        return mode_dir
 
     def _make_base_dataset(self, phase: str) -> Dataset:
-        kwargs = dict(self.dataset_kwargs)
-        kwargs['phase'] = phase
-        kwargs['rot_type'] = self.rot_type
-        kwargs['trans_anchor'] = self.trans_anchor
+        kwargs = {**self.dataset_kwargs, 'phase': phase, 'rot_type': self.rot_type, 'trans_anchor': self.trans_anchor}
         if self.mode in ('dexgraspnet', 'dex'):
             return MyDexGraspNet(**kwargs)
-        elif self.mode in ('bodexshadow', 'bodex', 'bodexhshadow'):
+        if self.mode in ('bodexshadow', 'bodex', 'bodexhshadow'):
             return MyBodexShadow(**kwargs)
-        else:
-            raise ValueError(f"Unsupported mode: {self.mode}")
+        raise ValueError(f"Unsupported mode: {self.mode}")
 
     def _make_cached_dataset(self, phase: str) -> Dataset:
         cache_dir = self._resolve_cache_dir()
-        # Prefer HDF5 cache if present: <phase>_cache.h5
         h5_path = cache_dir / f"{phase}_cache.h5"
+        
         if h5_path.exists():
-            dataset = HDF5HandKeypointDataset(
-                file_path=str(h5_path),
-                phase=phase,
-                show_progress=self.cache_show_progress,
-            )
+            ds = HDF5HandKeypointDataset(str(h5_path), phase=phase, show_progress=self.cache_show_progress)
+            logger.info("HandEncoderDataModule: cache enabled (phase=%s) using HDF5 file: %s", phase, h5_path)
+            self._cache_usage_logged = True
         else:
-            # Backward-compat: if deprecated cache_preload_to_ram is True, map to 'all'
-            max_shards_arg: Any = self.cache_max_shards
-            if getattr(self, 'cache_preload_to_ram', False):
-                logger.warning("cache_preload_to_ram is deprecated; use cache_max_shards_in_memory: 'all'. Applying preload.")
-                max_shards_arg = 'all'
-            dataset = CachedHandKeypointDataset(
-                cache_dir=str(cache_dir),
-                phase=phase,
-                max_shards_in_memory=max_shards_arg,
-                show_progress=self.cache_show_progress,
-            )
-        if not self._cache_meta_checked:
-            meta = dataset.meta
-            stored_anchor = meta.get('stored_anchor')
+            # Handle legacy preload argument mapping
+            shards = 'all' if self.cache_preload_to_ram else self.cache_max_shards
+            if self.cache_preload_to_ram:
+                logger.warning("cache_preload_to_ram deprecated; using cache_max_shards_in_memory='all'")
+            ds = CachedHandKeypointDataset(str(cache_dir), phase=phase, max_shards_in_memory=shards, show_progress=self.cache_show_progress)
+            shard_count = None
+            try:
+                shard_count = len(ds.shard_paths)
+            except Exception:
+                shard_count = "unknown"
             logger.info(
-                "HandEncoderDataModule: cache meta=%s",
-                {k: meta.get(k) for k in ('stored_anchor', 'source_anchor', 'hand_scale')},
+                "HandEncoderDataModule: cache enabled (phase=%s) using PT shards in %s (shards=%s, pattern=%s)",
+                phase, cache_dir, shard_count, getattr(ds, "shard_pattern", f"{phase}_cache_*.pt")
             )
-            if stored_anchor is not None and stored_anchor.lower() != 'base':
-                logger.warning(
-                    "Cached keypoints stored with anchor '%s'; expected 'base'.",
-                    stored_anchor,
-                )
-            self._cache_meta_checked = True
-        return dataset
+            self._cache_usage_logged = True
 
-    def _resolve_cache_dir(self) -> Path:
-        if self._cache_mode_dir is not None:
-            return self._cache_mode_dir
-        if not self.cache_root:
-            raise ValueError("cache_root must be set when use_cached_keypoints=True")
-        base = Path(self.cache_root)
-        if not base.is_absolute():
-            base = Path.cwd() / base
-        mode_dir = base / (self.mode or 'default')
-        if not mode_dir.exists():
-            if base.exists():
-                mode_dir = base
-            else:
-                raise FileNotFoundError(f"Cache root directory not found: {base}")
-        if not mode_dir.exists():
-            raise FileNotFoundError(f"Cache directory not found: {mode_dir}")
-        self._cache_mode_dir = mode_dir
-        logger.info("HandEncoderDataModule: using cached keypoints from %s", mode_dir)
-        return mode_dir
+        if not self._cache_meta_checked:
+            meta = ds.meta
+            anchor = meta.get('stored_anchor')
+            logger.info(f"Cache Meta: { {k: meta.get(k) for k in ('stored_anchor', 'source_anchor', 'hand_scale')} }")
+            if anchor and anchor.lower() != 'base':
+                logger.warning(f"Cache stored with anchor '{anchor}', expected 'base'.")
+            self._cache_meta_checked = True
+            self._cache_meta = meta
+        return ds
 
     @torch.no_grad()
     def _build_canonical(self, hand_model: HandModel) -> Dict[str, Any]:
-        if self.rot_type == 'quat':
-            rot_tail = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=hand_model.device)
-        elif self.rot_type == 'r6d':
-            rot_tail = torch.tensor([[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]], device=hand_model.device)
-        elif self.rot_type in ('euler', 'axis'):
-            rot_tail = torch.zeros((1, 3), device=hand_model.device)
-        else:
-            raise ValueError(f"Unsupported rot_type: {self.rot_type}")
-        POSE_DIM = 3 + 24 + int(rot_tail.shape[1])
-        q_rest = torch.zeros((1, POSE_DIM), device=hand_model.device)
-        q_rest[:, 27:27 + rot_tail.shape[1]] = rot_tail
+        """Constructs the canonical graph structure using the HandModel."""
+        # Setup Identity Rest Pose
+        rot_len = 6 if self.rot_type == 'r6d' else (3 if self.rot_type in ('euler', 'axis') else 4)
+        rot_tail = torch.tensor([1.0, 0.0, 0.0, 0.0] if rot_len == 4 else [1.0, 0.0, 0.0, 0.0, 1.0, 0.0] if rot_len == 6 else [0.0]*3, device=hand_model.device).unsqueeze(0)
+        
+        q_rest = torch.zeros((1, 3 + 24 + rot_len), device=hand_model.device)
+        if rot_len > 3:
+            q_rest[:, 27:27 + rot_len] = rot_tail
+
+        # Extract Topology
         xyz_u, link_to_unique = hand_model.get_joint_keypoints_unique(q=q_rest)
         link_order = [lk for lk in hand_model.joint_key_points.keys() if lk in link_to_unique]
         names, primary = _build_unique_names_and_primary_map(link_to_unique, link_order)
-        finger_ids_np, joint_ids_np, num_fingers, num_joint_types = _build_ids_from_primary(primary, len(names))
-        edge_index_np, edge_type_np = _build_rigid_edges_unique(
-            link_to_unique,
-            use_palm_star=self.use_palm_star,
-            connect_forearm=self.connect_forearm,
-            add_middle_distal=self.add_middle_distal,
+        f_ids, j_ids, n_fing, n_joint = _build_ids_from_primary(primary, len(names))
+        
+        edge_idx, edge_typ = _build_rigid_edges_unique(
+            link_to_unique, 
+            use_palm_star=self.use_palm_star, 
+            connect_forearm=self.connect_forearm, 
+            add_middle_distal=self.add_middle_distal
         )
-        device = hand_model.device
-        edge_index_t = torch.from_numpy(edge_index_np).to(device=device, dtype=torch.long)
-        edge_type_t = torch.from_numpy(edge_type_np).to(device=device, dtype=torch.long)
-        rest_lengths_t = _compute_rest_lengths(hand_model, edge_index_t, q_rest).to(dtype=torch.float32)
-        finger_ids_t = torch.from_numpy(finger_ids_np).to(device=device, dtype=torch.long)
-        joint_ids_t = torch.from_numpy(joint_ids_np).to(device=device, dtype=torch.long)
-        template_xyz = xyz_u.squeeze(0).to(device=device, dtype=torch.float32)
-        rigid_groups = _build_manual_rigid_groups_by_index(len(names))
+
+        # To Tensor
+        dev = hand_model.device
         return {
             'link_to_unique': link_to_unique,
-            'finger_ids': finger_ids_t,
-            'joint_type_ids': joint_ids_t,
-            'edge_index': edge_index_t,
-            'edge_type': edge_type_t,
-            'edge_rest_lengths': rest_lengths_t,
-            'template_xyz': template_xyz,
-            'rigid_groups': rigid_groups,
-            'num_fingers': num_fingers,
-            'num_joint_types': num_joint_types,
-            'N': int(finger_ids_t.shape[0]),
-            'E': int(edge_index_t.shape[1]),
+            'finger_ids': torch.from_numpy(f_ids).to(dev, dtype=torch.long),
+            'joint_type_ids': torch.from_numpy(j_ids).to(dev, dtype=torch.long),
+            'edge_index': torch.from_numpy(edge_idx).to(dev, dtype=torch.long),
+            'edge_type': torch.from_numpy(edge_typ).to(dev, dtype=torch.long),
+            'edge_rest_lengths': _compute_rest_lengths(hand_model, torch.from_numpy(edge_idx).to(dev), q_rest).float(),
+            'template_xyz': xyz_u.squeeze(0).float(),
+            'rigid_groups': _build_manual_rigid_groups_by_index(len(names)),
+            'num_fingers': n_fing, 'num_joint_types': n_joint,
+            'N': int(f_ids.shape[0]), 'E': int(edge_idx.shape[1]),
         }
 
-    def _ensure_prepared_constants_and_norm_bounds(self) -> None:
-        # Build constants and hand_model once
-        if self._prepared_constants is None:
-            urdf_path, meshes_path = self._load_urdf_assets()
-            device = torch.device('cpu')
-            hand_model = HandModel(
-                robot_name='shadowhand',
-                urdf_filename=urdf_path,
-                mesh_path=meshes_path,
-                batch_size=1,
-                device=device,
-                hand_scale=self.hand_scale,
-                rot_type=self.rot_type,
-                anchor=self.trans_anchor,
-                mesh_source='urdf',
-            )
-            canon = self._build_canonical(hand_model)
-            canonical_xyz_stats, approx_std_stats = self._load_handencoder_per_point_stats()
-            canonical_xyz_stats = canonical_xyz_stats.to(device=device, dtype=torch.float32)
-            approx_std_stats = approx_std_stats.to(device=device, dtype=torch.float32)
-            N = canon['finger_ids'].shape[0]
-            if canonical_xyz_stats.shape[0] != N or approx_std_stats.shape[0] != N:
-                raise RuntimeError(
-                    f"Per-point stats length mismatch: got canonical={canonical_xyz_stats.shape[0]}, "
-                    f"approx_std={approx_std_stats.shape[0]}, expected {N}."
-                )
-            self._prepared_constants = {
-                'hand_model': hand_model,
-                **canon,
-                'canonical_xyz': canonical_xyz_stats,
-                'approx_std': approx_std_stats,
-            }
-        else:
-            device = self._prepared_constants['hand_model'].device
+    def _ensure_prepared_constants(self) -> None:
+        if self._prepared_constants is not None:
+            return
+
+        urdf, meshes = self._load_urdf_assets()
+        device = torch.device('cpu')
+        
+        hand_model = HandModel(
+            robot_name='shadowhand', urdf_filename=urdf, mesh_path=meshes, 
+            batch_size=1, device=device, hand_scale=self.hand_scale, 
+            rot_type=self.rot_type, anchor=self.trans_anchor, mesh_source='urdf'
+        )
+        
+        canon = self._build_canonical(hand_model)
+        c_xyz, c_std = self._load_handencoder_per_point_stats()
+        
+        if c_xyz.shape[0] != canon['N']:
+            raise RuntimeError(f"Stats mismatch: expected {canon['N']} points, got {c_xyz.shape[0]}")
+
+        self._prepared_constants = {
+            'hand_model': hand_model,
+            **canon,
+            'canonical_xyz': c_xyz.to(device),
+            'approx_std': c_std.to(device),
+        }
         self._ensure_norm_xyz_bounds(device)
 
     def setup(self, stage: Optional[str] = None) -> None:
-        self._ensure_prepared_constants_and_norm_bounds()
-        # Resolve what to (ensure) build for this stage
-        want_train = (stage is None) or (stage == 'fit')
-        want_val = ((stage is None) or (stage in ('fit', 'validate'))) and (self.val_phase is not None)
-        want_test = ((stage is None) or (stage == 'test')) and (self.test_phase is not None)
+        self._ensure_prepared_constants()
+        hm = self._prepared_constants['hand_model']
+        c = self._prepared_constants
+        
+        logger.info(
+            "HandEncoderDataModule setup: mode=%s, rot_type=%s, trans_anchor=%s, "
+            "batch_size=%d, num_workers=%d, pin_memory=%s, prefetch_factor=%d, persistent_workers=%s, "
+            "use_local_pose_only=%s, return_norm=%s, scene_pc_mode=%s, use_cached_keypoints=%s",
+            self.mode, self.rot_type, self.trans_anchor,
+            self.batch_size, self.num_workers, self.pin_memory, self.prefetch_factor, self.persistent_workers,
+            self.use_local_pose_only, self.return_norm, self.scene_pc_return_mode, self.use_cached_keypoints,
+        )
+        if not self.use_cached_keypoints and not self._cache_usage_logged:
+            logger.info("HandEncoderDataModule: cache disabled (use_cached_keypoints=False); computing keypoints on the fly.")
+            self._cache_usage_logged = True
 
-        hand_model = self._prepared_constants['hand_model']
-        canon = self._prepared_constants
+        common_args = dict(
+            hand_model=hm, canonical_link_to_unique=c['link_to_unique'],
+            finger_ids=c['finger_ids'], joint_type_ids=c['joint_type_ids'],
+            edge_index=c['edge_index'], edge_type=c['edge_type'],
+            edge_rest_lengths=c['edge_rest_lengths'], scale=self.hand_scale,
+            norm_xyz_bounds=self._clone_norm_bounds(), use_local_pose_only=self.use_local_pose_only,
+            return_norm=self.return_norm, scene_pc_return_mode=self.scene_pc_return_mode
+        )
 
-        # Train dataset
-        if want_train and self.train_dataset is None:
-            train_phase = self.train_phase or self.dataset_kwargs.get('phase', 'all')
-            base_train = self._make_base_dataset(phase=train_phase)
-            base_len = len(base_train)
-            if base_len == 0:
-                logger.error(
-                    "HandEncoderDataModule: base training dataset is empty "
-                    "(asset_dir=%s, phase=%s). Check DexGraspNet debug files and split JSON.",
-                    self.dataset_kwargs.get('asset_dir', 'unknown'),
-                    train_phase,
-                )
-                raise RuntimeError(
-                    "HandEncoderDataModule: training dataset has zero samples. "
-                    "This typically indicates a mismatch between the DexGraspNet "
-                    "split file and the .pt data, or missing debug assets."
-                )
-            cache_train: Optional[Dataset] = None
-            if self.use_cached_keypoints:
-                cache_train = self._make_cached_dataset(phase=train_phase)
+        # Train
+        if stage in (None, 'fit') and self.train_dataset is None:
+            ph = self.train_phase or self.dataset_kwargs.get('phase', 'all')
+            base = self._make_base_dataset(ph)
+            if len(base) == 0:
+                raise RuntimeError(f"Training dataset empty for phase {ph}. Check split files/assets.")
+            cache = self._make_cached_dataset(ph) if self.use_cached_keypoints else None
+            cache_anchor = None
+            if cache is not None:
+                try:
+                    cache_anchor = cache.meta.get('stored_anchor')
+                except Exception:
+                    cache_anchor = None
             self.train_dataset = _HandEncoderPreparedDataset(
-                base_train,
-                hand_model,
-                canon['link_to_unique'],
-                canon['finger_ids'],
-                canon['joint_type_ids'],
-                canon['edge_index'],
-                canon['edge_type'],
-                canon['edge_rest_lengths'],
-                scale=self.hand_scale,
-                norm_xyz_bounds=self._clone_norm_bounds(),
-                use_local_pose_only=self.use_local_pose_only,
-                return_norm=self.return_norm,
-                scene_pc_return_mode=self.scene_pc_return_mode,
-                cache_dataset=cache_train,
+                base, cache_dataset=cache, cached_stored_anchor=cache_anchor, **common_args
+            )
+            logger.info(
+                "Train dataset: phase=%s, size=%d", ph, len(base)
+            )
+            logger.info(
+                "Train DataLoader: batch_size=%d, num_workers=%d, pin_memory=%s, prefetch_factor=%d, "
+                "persistent_workers=%s, drop_last=%s",
+                self.batch_size, self.num_workers, self.pin_memory, self.prefetch_factor,
+                self.persistent_workers, (len(base) > self.batch_size),
             )
 
-        # Validation dataset
-        if want_val and self.val_dataset is None:
-            base_val = self._make_base_dataset(phase=self.val_phase)
-            cache_val: Optional[Dataset] = None
-            if self.use_cached_keypoints:
-                cache_val = self._make_cached_dataset(phase=self.val_phase)
+        # Validation
+        if stage in (None, 'fit', 'validate') and self.val_phase and self.val_dataset is None:
+            base = self._make_base_dataset(self.val_phase)
+            cache = self._make_cached_dataset(self.val_phase) if self.use_cached_keypoints else None
+            cache_anchor = None
+            if cache is not None:
+                try:
+                    cache_anchor = cache.meta.get('stored_anchor')
+                except Exception:
+                    cache_anchor = None
             self.val_dataset = _HandEncoderPreparedDataset(
-                base_val,
-                hand_model,
-                canon['link_to_unique'],
-                canon['finger_ids'],
-                canon['joint_type_ids'],
-                canon['edge_index'],
-                canon['edge_type'],
-                canon['edge_rest_lengths'],
-                scale=self.hand_scale,
-                norm_xyz_bounds=self._clone_norm_bounds(),
-                use_local_pose_only=self.use_local_pose_only,
-                return_norm=self.return_norm,
-                scene_pc_return_mode=self.scene_pc_return_mode,
-                cache_dataset=cache_val,
+                base, cache_dataset=cache, cached_stored_anchor=cache_anchor, **common_args
+            )
+            logger.info(
+                "Val dataset: phase=%s, size=%d", self.val_phase, len(base)
             )
 
-        # Test dataset
-        if want_test and self.test_dataset is None:
-            base_test = self._make_base_dataset(phase=self.test_phase)
-            cache_test: Optional[Dataset] = None
-            if self.use_cached_keypoints:
-                cache_test = self._make_cached_dataset(phase=self.test_phase)
+        # Test
+        if stage in (None, 'test') and self.test_phase and self.test_dataset is None:
+            base = self._make_base_dataset(self.test_phase)
+            cache = self._make_cached_dataset(self.test_phase) if self.use_cached_keypoints else None
+            cache_anchor = None
+            if cache is not None:
+                try:
+                    cache_anchor = cache.meta.get('stored_anchor')
+                except Exception:
+                    cache_anchor = None
             self.test_dataset = _HandEncoderPreparedDataset(
-                base_test,
-                hand_model,
-                canon['link_to_unique'],
-                canon['finger_ids'],
-                canon['joint_type_ids'],
-                canon['edge_index'],
-                canon['edge_type'],
-                canon['edge_rest_lengths'],
-                scale=self.hand_scale,
-                norm_xyz_bounds=self._clone_norm_bounds(),
-                use_local_pose_only=self.use_local_pose_only,
-                return_norm=self.return_norm,
-                scene_pc_return_mode=self.scene_pc_return_mode,
-                cache_dataset=cache_test,
+                base, cache_dataset=cache, cached_stored_anchor=cache_anchor, **common_args
+            )
+            logger.info(
+                "Test dataset: phase=%s, size=%d", self.test_phase, len(base)
             )
 
     def get_graph_constants(self) -> Dict[str, torch.Tensor]:
         if self._prepared_constants is None:
-            raise RuntimeError("HandEncoderDataModule.setup must be called before accessing graph constants")
-        tensor_keys = ['finger_ids', 'joint_type_ids', 'edge_index', 'edge_type', 'edge_rest_lengths']
-        consts: Dict[str, Any] = {}
-        for key in tensor_keys:
-            tensor = self._prepared_constants.get(key)
-            if tensor is None:
-                raise KeyError(f"Missing graph constant '{key}' in prepared constants")
-            if not isinstance(tensor, torch.Tensor):
-                tensor = torch.tensor(tensor)
-            consts[key] = tensor.detach().cpu()
+            raise RuntimeError("Setup must be called before accessing graph constants.")
+            
+        c = self._prepared_constants
+        consts = {
+            k: c[k].detach().cpu() 
+            for k in ['finger_ids', 'joint_type_ids', 'edge_index', 'edge_type', 'edge_rest_lengths', 
+                      'template_xyz', 'canonical_xyz', 'approx_std']
+        }
+        
+        if self._norm_xyz_bounds:
+            consts['norm_min'] = self._norm_xyz_bounds[0].detach().cpu().view(1, 1, 3)
+            consts['norm_max'] = self._norm_xyz_bounds[1].detach().cpu().view(1, 1, 3)
 
-        template_xyz = self._prepared_constants.get('template_xyz')
-        if template_xyz is None:
-            raise KeyError("Missing 'template_xyz' in prepared constants")
-        consts['template_xyz'] = template_xyz.detach().cpu()
-
-        canonical_xyz = self._prepared_constants.get('canonical_xyz')
-        if canonical_xyz is None:
-            raise KeyError("Missing 'canonical_xyz' in prepared constants")
-        consts['canonical_xyz'] = canonical_xyz.detach().cpu()
-
-        approx_std = self._prepared_constants.get('approx_std')
-        if approx_std is None:
-            raise KeyError("Missing 'approx_std' in prepared constants")
-        consts['approx_std'] = approx_std.detach().cpu()
-
-        if self._norm_xyz_bounds is not None:
-            lo, hi = self._norm_xyz_bounds
-            consts['norm_min'] = lo.detach().cpu().view(1, 1, 3)
-            consts['norm_max'] = hi.detach().cpu().view(1, 1, 3)
-
-        rigid_groups_raw = self._prepared_constants.get('rigid_groups', []) or []
         consts['rigid_groups'] = [
-            (grp.clone().detach().long() if isinstance(grp, torch.Tensor)
-             else torch.tensor(grp, dtype=torch.long))
-            for grp in rigid_groups_raw
-            if grp is not None and len(grp) > 0
+            (g.clone().detach().long() if isinstance(g, torch.Tensor) else torch.tensor(g, dtype=torch.long))
+            for g in c.get('rigid_groups', []) if g is not None and len(g) > 0
         ]
-
+        
         return consts
+
+    def _dataloader(self, ds: Dataset, shuffle: bool = False) -> DataLoader:
+        return DataLoader(
+            ds, batch_size=self.batch_size, shuffle=shuffle,
+            num_workers=self.num_workers, pin_memory=self.pin_memory,
+            collate_fn=_collate_for_hand_encoder,
+            persistent_workers=self.persistent_workers,
+            prefetch_factor=self.prefetch_factor if self.num_workers > 0 else None,
+            drop_last=(shuffle and len(ds) > self.batch_size)
+        )
 
     def train_dataloader(self) -> DataLoader:
         assert self.train_dataset is not None
-        _kwargs = dict(
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            collate_fn=_collate_for_hand_encoder,
-            drop_last=True,
-            persistent_workers=self.persistent_workers if self.num_workers > 0 else False,
-        )
-        if self.num_workers > 0 and self.prefetch_factor is not None:
-            _kwargs['prefetch_factor'] = int(self.prefetch_factor)
-        return DataLoader(self.train_dataset, **_kwargs)
+        return self._dataloader(self.train_dataset, shuffle=True)
 
     def val_dataloader(self) -> Optional[DataLoader]:
-        if self.val_dataset is None:
-            return None
-        _kwargs = dict(
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            collate_fn=_collate_for_hand_encoder,
-            persistent_workers=self.persistent_workers if self.num_workers > 0 else False,
-        )
-        if self.num_workers > 0 and self.prefetch_factor is not None:
-            _kwargs['prefetch_factor'] = int(self.prefetch_factor)
-        return DataLoader(self.val_dataset, **_kwargs)
+        return self._dataloader(self.val_dataset, shuffle=False) if self.val_dataset else None
 
     def test_dataloader(self) -> Optional[DataLoader]:
-        if self.test_dataset is None:
-            return None
-        _kwargs = dict(
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            collate_fn=_collate_for_hand_encoder,
-            persistent_workers=self.persistent_workers if self.num_workers > 0 else False,
-        )
-        if self.num_workers > 0 and self.prefetch_factor is not None:
-            _kwargs['prefetch_factor'] = int(self.prefetch_factor)
-        return DataLoader(self.test_dataset, **_kwargs)
+        return self._dataloader(self.test_dataset, shuffle=False) if self.test_dataset else None

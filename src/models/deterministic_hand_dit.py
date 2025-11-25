@@ -15,7 +15,7 @@ from .components.hand_encoder import build_hand_encoder
 from .components.graph_dit import build_dit
 from .backbone import build_backbone
 from .components.graph_config import GraphConfig
-from .components.losses import HandValidationMetricManager
+from .components.losses import HandValidationMetricManager, DeterministicRegressionLoss
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +111,15 @@ class HandDeterministicDiT(L.LightningModule):
         # Filter rigid groups containing only fixed points
         self.rigid_groups_active = [g for g in self.rigid_groups if not fixed_mask[g].all()]
 
+    def _safe_register_buffer(self, name: str, tensor: torch.Tensor, persistent: bool = True) -> None:
+        if hasattr(self, name):
+            if name in self._buffers:
+                self._buffers[name] = tensor
+                return
+            else:
+                delattr(self, name)
+        self.register_buffer(name, tensor, persistent=persistent)
+
     def _setup_normalization(self, graph_consts: Dict[str, torch.Tensor]) -> None:
         """Apply affine transformation to graph constants if normalization is enabled."""
         norm_min = getattr(self, "norm_min", None)
@@ -142,12 +151,12 @@ class HandDeterministicDiT(L.LightningModule):
                 if name == "template_xyz":
                     tensor.copy_(normed)
                 else:
-                    self.register_buffer(f"norm_{name}", normed.float(), persistent=True)
+                    self._safe_register_buffer(f"norm_{name}", normed.float(), persistent=True)
 
         # 2. Normalize Standard Deviation (Scale only)
         if hasattr(self, "approx_std"):
             s = scale.view(1, 1, 3) if self.approx_std.dim() == 3 else scale.view(1, 3)
-            self.register_buffer("norm_approx_std", (self.approx_std * s).float(), persistent=True)
+            self._safe_register_buffer("norm_approx_std", (self.approx_std * s).float(), persistent=True)
 
         # 3. Recompute Edge Lengths in Normalized Space
         # This ensures the bone length loss works correctly in the [-1, 1] space
@@ -175,17 +184,29 @@ class HandDeterministicDiT(L.LightningModule):
 
     def _setup_loss_and_metrics(self, loss_cfg: Optional[DictConfig]):
         """Parse loss weights and setup metrics."""
-        cfg = OmegaConf.to_container(loss_cfg, resolve=True) if loss_cfg else {}
-        
+        if isinstance(loss_cfg, DictConfig):
+            cfg = OmegaConf.to_container(loss_cfg, resolve=True)
+        elif isinstance(loss_cfg, dict):
+            cfg = deepcopy(loss_cfg)
+        else:
+            cfg = {}
+
+        # Backwards-compatible scalar weights & collision config
         self.lambda_pos = float(cfg.get("lambda_pos", 1.0))
         self.lambda_bone = float(cfg.get("lambda_bone", 0.0))
         self.lambda_collision = float(cfg.get("lambda_collision", 0.0))
         self.collision_margin = float(cfg.get("collision_margin", 0.0))
-        
+
         max_pts = int(cfg.get("collision_max_scene_points", 0))
         self.collision_max_scene_points = max_pts if max_pts > 0 else None
 
-        # Validation Metrics
+        # Deterministic regression loss manager (reuses recon components)
+        self.loss_manager = DeterministicRegressionLoss(
+            edge_index=self.edge_index,
+            config=cfg,
+        )
+
+        # Validation Metrics (can be disabled via loss_cfg.val_metrics)
         val_cfg = cfg.get("val_metrics", None)
         self.val_metric_manager = (
             HandValidationMetricManager(self.edge_index, val_cfg) if val_cfg else None
@@ -314,10 +335,12 @@ class HandDeterministicDiT(L.LightningModule):
 
     @torch.no_grad()
     def sample(
-        self, 
-        scene_pc: torch.Tensor, 
-        return_trajectory: bool = False, 
-        **kwargs
+        self,
+        scene_pc: torch.Tensor,
+        num_steps: Optional[int] = None,
+        return_trajectory: bool = False,
+        trajectory_indices: Optional[Sequence[int]] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[Dict]]]:
         """
         Interface compatible with diffusion samplers.
@@ -344,65 +367,6 @@ class HandDeterministicDiT(L.LightningModule):
             {"step": 1, "t": 1.0, "xyz": pred_final.cpu()},
         ]
         return pred_final, traj
-
-    # =========================================================================
-    # Loss Functions
-    # =========================================================================
-
-    def _compute_bone_loss(self, xyz: torch.Tensor) -> torch.Tensor:
-        if self.lambda_bone <= 0 or self.edge_index is None:
-            return torch.tensor(0.0, device=xyz.device)
-
-        i, j = self.edge_index
-        # Calculate current lengths
-        lengths = torch.linalg.norm(xyz[:, i] - xyz[:, j], dim=-1)
-        # Compare to rest lengths (already normalized if needed)
-        target = self.edge_rest_lengths.view(1, -1)
-        
-        rel_err = (lengths - target) / (target + 1e-6)
-        
-        if hasattr(self, "active_edge_mask"):
-            rel_err = rel_err[:, self.active_edge_mask]
-            
-        return rel_err.pow(2).mean()
-
-    def _compute_collision_loss(self, pred_xyz: torch.Tensor, scene_pc: torch.Tensor) -> torch.Tensor:
-        """Penalize hand points that are too close to scene points."""
-        if self.lambda_collision <= 0 or scene_pc is None or scene_pc.shape[1] == 0:
-            return torch.tensor(0.0, device=pred_xyz.device)
-
-        # Work in World Space for physical margin
-        pred_w = self._denorm_xyz(pred_xyz) if self.use_norm_data else pred_xyz
-        scene_w = self._denorm_xyz(scene_pc) if self.use_norm_data else scene_pc
-
-        # Subsample scene if too large
-        if self.collision_max_scene_points and scene_w.shape[1] > self.collision_max_scene_points:
-            perm = torch.randperm(scene_w.shape[1], device=scene_w.device)
-            scene_w = scene_w[:, perm[: self.collision_max_scene_points]]
-
-        # Calc distances: (B, N, P)
-        dists = torch.cdist(pred_w, scene_w, p=2)
-        min_dists, _ = dists.min(dim=-1) # (B, N)
-        
-        # Penalty: max(0, margin - dist)
-        return torch.relu(self.collision_margin - min_dists).mean()
-
-    def _compute_total_loss(self, pred: torch.Tensor, target: torch.Tensor, scene: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
-        l_pos = F.l1_loss(pred, target)
-        l_bone = self._compute_bone_loss(pred)
-        l_coll = self._compute_collision_loss(pred, scene)
-        
-        total = (
-            self.lambda_pos * l_pos +
-            self.lambda_bone * l_bone +
-            self.lambda_collision * l_coll
-        )
-        
-        return total, {
-            "loss_pos": l_pos.detach(),
-            "loss_bone": l_bone.detach(),
-            "loss_collision": l_coll.detach()
-        }
 
     # =========================================================================
     # Lightning Hooks (Train/Val)
@@ -433,7 +397,17 @@ class HandDeterministicDiT(L.LightningModule):
         target, _, scene = self._extract_batch(batch, "train")
         
         pred = self.predict_hand_xyz(scene)
-        loss, logs = self._compute_total_loss(pred, target, scene)
+        denorm_fn = self._denorm_xyz if self.use_norm_data else None
+        loss, components = self.loss_manager(
+            pred_xyz=pred,
+            gt_xyz=target,
+            edge_rest_lengths=self.edge_rest_lengths,
+            active_edge_mask=getattr(self, "active_edge_mask", None),
+            scene_pc=scene,
+            denorm_fn=denorm_fn,
+        )
+
+        logs = {f"loss_{k}": v.detach() for k, v in components.items()}
 
         if not torch.isfinite(loss):
             self.log("train/nan_loss", 1.0, on_step=True)
@@ -442,20 +416,44 @@ class HandDeterministicDiT(L.LightningModule):
         # Log main loss and components
         self.log("train/loss", loss, prog_bar=False)
         for k, v in logs.items():
-            self.log(f"train/{k}", v, prog_bar=(k == "loss_pos"))
+            # self.log(f"train/{k}", v, prog_bar=(k == "loss_smooth_l1"))
+            self.log(f"train/{k}", v, prog_bar=False)
             
         return loss
 
+    def on_validation_epoch_start(self) -> None:
+        """Reset validation loss buffer each epoch for summary callback."""
+        self._val_step_losses = []
+
     def validation_step(self, batch: Dict[str, Any], batch_idx: int) -> None:
         target, raw_target, scene = self._extract_batch(batch, "val")
+        batch_size = int(target.size(0))
         
         pred = self.predict_hand_xyz(scene)
-        loss, logs = self._compute_total_loss(pred, target, scene)
+        denorm_fn = self._denorm_xyz if self.use_norm_data else None
+        loss, components = self.loss_manager(
+            pred_xyz=pred,
+            gt_xyz=target,
+            edge_rest_lengths=self.edge_rest_lengths,
+            active_edge_mask=getattr(self, "active_edge_mask", None),
+            scene_pc=scene,
+            denorm_fn=denorm_fn,
+        )
 
-        # Basic Logging
-        self.log("val/loss", loss, sync_dist=True)
+        logs = {f"loss_{k}": v.detach() for k, v in components.items()}
+
+        # Buffer per-batch loss for ValidationSummaryCallback
+        if torch.isfinite(loss):
+            self._val_step_losses.append(loss.detach())
+        else:
+            self.log("val/nan_loss", 1.0, on_step=False, on_epoch=True, batch_size=batch_size)
+            return
+
+        # Basic Logging (+ alias for callbacks expecting 'val_loss')
+        self.log("val/loss", loss, sync_dist=True, on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log("val_loss", loss, sync_dist=True, on_step=False, on_epoch=True, batch_size=batch_size)
         for k, v in logs.items():
-            self.log(f"val/{k}", v, sync_dist=True)
+            self.log(f"val/{k}", v, sync_dist=True, batch_size=batch_size)
 
         # Bone Length Error (Physical Metric)
         # Always compute on Denormalized/World coordinates for interpretability
@@ -489,14 +487,22 @@ class HandDeterministicDiT(L.LightningModule):
         if not sched_cfg:
             return optimizer
 
-        scheduler = hydra_instantiate(DictConfig(sched_cfg), optimizer=optimizer)
+        # Remove Lightning-only keys that should not be passed to the builder
+        if isinstance(sched_cfg, DictConfig):
+            sched_cfg = OmegaConf.to_container(sched_cfg, resolve=True)  # type: ignore
+        sched_cfg_clean = dict(sched_cfg or {})
+        for k in ("interval", "frequency", "monitor"):
+            if k in sched_cfg_clean:
+                sched_cfg_clean.pop(k, None)
+
+        scheduler = hydra_instantiate(DictConfig(sched_cfg_clean), optimizer=optimizer)
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": sched_cfg.get("interval", "epoch"),
-                "frequency": sched_cfg.get("frequency", 1),
-                "monitor": sched_cfg.get("monitor", "val/loss"),
+                "interval": (sched_cfg.get("interval") if isinstance(sched_cfg, dict) else None) or "epoch",
+                "frequency": (sched_cfg.get("frequency") if isinstance(sched_cfg, dict) else None) or 1,
+                "monitor": (sched_cfg.get("monitor") if isinstance(sched_cfg, dict) else None) or "val/loss",
             },
         }
 

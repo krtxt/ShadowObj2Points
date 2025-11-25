@@ -245,7 +245,7 @@ class MyDexGraspNet(Dataset):
             tmin = trans_all.min().item() if trans_all.numel() > 0 else 0.0
             tmax = trans_all.max().item() if trans_all.numel() > 0 else 0.0
             tmean = trans_all.float().mean().item() if trans_all.numel() > 0 else 0.0
-            logger.info("MyDexGraspNet: trans range -> min=%.4f max=%.4f mean=%.4f", tmin, tmax, tmean)
+            # logger.info("MyDexGraspNet: trans range -> min=%.4f max=%.4f mean=%.4f", tmin, tmax, tmean)
         except Exception as _e:
             logger.debug("MyDexGraspNet: failed to log dataset statistics: %s", _e)
 

@@ -462,6 +462,9 @@ class HandFlowMatchingDiT(L.LightningModule):
             timesteps=timesteps,
             hand_tokens_out=hand_tokens_out,
         )
+        # Anchor fixed points by zeroing their velocity to prevent drift during integration
+        if hasattr(self, "fixed_point_indices") and self.fixed_point_indices.numel() > 0:
+            velocity[:, self.fixed_point_indices, :] = 0
         return velocity
 
     def _construct_flow_path(

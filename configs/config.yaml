@@ -4,12 +4,12 @@
 # defaults list
 defaults:
   - datamodule: handencoder_dm_dex_debug
-  - model: flow_matching_hand_dit
+  - model: flow_matching_hand_dit # deterministic_hand_dit | flow_matching_hand_dit
   - backbone: ptv3_sparse
   - hand_encoder: transformer_bias
   - dit: graph_dit_default
   - velocity_strategy: group_rigid
-  - loss: flow_matching
+  - loss: flow_matching # deterministic_regression | flow_matching
   - optimizer: adamw
   - trainer: default
   - logger: tensorboard   # tensorboard
@@ -25,6 +25,7 @@ seed: 42
 auto_scale_batch_size: false # Set to true to find the largest batch size
 auto_lr_find: false          # Set to true to find the optimal learning rate
 auto_resume: false           # Set to true to resume from the last checkpoint in the experiment folder
+auto_resume_config: false
 
 # Common hyperparameters (可被其他配置引用)
 batch_size: 128

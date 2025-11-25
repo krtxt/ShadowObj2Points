@@ -35,6 +35,47 @@ if str(PROJECT_ROOT / "src") not in sys.path:
 torch.set_float32_matmul_precision("high")
 
 
+class RankZeroLogger:
+    """Thin wrapper to ensure logs only emit on rank zero."""
+
+    def __init__(self, logger: logging.Logger) -> None:
+        self._logger = logger
+
+    @rank_zero_only
+    def info(self, *args, **kwargs):
+        return self._logger.info(*args, **kwargs)
+
+    @rank_zero_only
+    def warning(self, *args, **kwargs):
+        return self._logger.warning(*args, **kwargs)
+
+    @rank_zero_only
+    def error(self, *args, **kwargs):
+        return self._logger.error(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._logger, name)
+
+
+class RankZeroConsole:
+    """Console wrapper that only prints on rank zero."""
+
+    def __init__(self, console: Console) -> None:
+        self._console = console
+
+    @rank_zero_only
+    def print(self, *args, **kwargs):
+        return self._console.print(*args, **kwargs)
+
+    @rank_zero_only
+    def rule(self, *args, **kwargs):
+        return self._console.rule(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._console, name)
+
+
+
 def setup_callbacks(cfg: DictConfig) -> List[Callback]:
     """Instantiate callbacks from Hydra config."""
     callbacks: List[Callback] = []
@@ -112,6 +153,73 @@ def log_trainer_summary(trainer: Trainer, cfg: DictConfig, log: logging.Logger) 
     log.info(f" Max epochs: [bold]{cfg.trainer.max_epochs}[/]")
 
 
+def _resolve_resume_config_path(cfg: DictConfig) -> Optional[Path]:
+    p = cfg.get("resume_config") or cfg.get("resume_run_dir")
+    if not p:
+        return None
+    cand = Path(to_absolute_path(str(p)))
+    if cand.is_dir():
+        file = cand / ".hydra" / "config.yaml"
+        return file if file.exists() else None
+    if cand.is_file():
+        return cand
+    return None
+
+
+def maybe_apply_resume_config(cfg: DictConfig, log: logging.Logger) -> DictConfig:
+    path = _resolve_resume_config_path(cfg)
+    if not path:
+        # Try auto from last checkpoint if requested
+        if cfg.get("auto_resume_config", False):
+            run_dir: Optional[Path] = None
+            # Prefer explicit ckpt_path if provided
+            ckpt_path = cfg.get("ckpt_path")
+            if ckpt_path:
+                ckpt = Path(to_absolute_path(str(ckpt_path)))
+                if ckpt.exists():
+                    run_dir = ckpt.parent.parent
+            # Otherwise, try to auto-locate last.ckpt using same logic as training
+            if run_dir is None:
+                last = find_last_checkpoint(cfg, log)
+                if last:
+                    run_dir = Path(last).parent.parent
+            # Finally, if still none, scan experiment dir for latest run (independent of auto_resume flag)
+            if run_dir is None and cfg.get("paths", {}).get("output_dir"):
+                current_output_dir = Path(to_absolute_path(str(cfg.paths.output_dir)))
+                experiment_dir = current_output_dir.parent
+                if experiment_dir.exists():
+                    runs = sorted(
+                        [d for d in experiment_dir.iterdir() if d.is_dir() and d != current_output_dir],
+                        key=lambda x: x.name,
+                    )
+                    if runs:
+                        run_dir = runs[-1]
+            if run_dir is not None:
+                cand = run_dir / ".hydra" / "config.yaml"
+                if cand.exists():
+                    path = cand
+        if not path:
+            return cfg
+    try:
+        prev = OmegaConf.load(str(path))
+    except Exception as e:
+        log.warning(f"Resume-config load failed: {e}")
+        return cfg
+
+    keep = {
+        "paths": OmegaConf.select(cfg, "paths"),
+        "hydra": OmegaConf.select(cfg, "hydra"),
+    }
+    if cfg.get("ckpt_path") is not None:
+        keep["ckpt_path"] = cfg.ckpt_path
+    if cfg.get("auto_resume") is not None:
+        keep["auto_resume"] = cfg.auto_resume
+
+    merged = OmegaConf.merge(prev, keep)
+    log.info(f"Applied resume config from: [bold]{path}[/]")
+    return merged
+
+
 def log_best_checkpoint(trainer: Trainer, log: logging.Logger) -> None:
     if (cb := getattr(trainer, "checkpoint_callback", None)) and hasattr(cb, "best_model_path"):
         if best_path := cb.best_model_path:
@@ -184,8 +292,9 @@ def run_auto_tuner(trainer: Trainer, model: L.LightningModule, datamodule: L.Lig
 def main(cfg: DictConfig) -> None:
     """Train the Flow Matching Hand DiT model using Hydra configuration."""
     setup_rich_logging()
-    console = Console()
-    log = logging.getLogger("train_flow_matching")
+    console = RankZeroConsole(Console())
+    log = RankZeroLogger(logging.getLogger("train_flow_matching"))
+    cfg = maybe_apply_resume_config(cfg, log)
     validate_core_config(cfg)
     
     # log.info(f"{'=' * 80}\n[bold italic #FF33AA]Training Configuration:[/]\n{'=' * 80}")

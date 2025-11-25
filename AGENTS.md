@@ -9,7 +9,7 @@
 - `notebooks/`, `docs/`, `benchmark_sampling_speed.py`: exploratory analysis, docs, and perf checks.
 
 ## Build, Test, and Development Commands
-- Install (dev): `python -m pip install -e ".[dev]"` from repo root for editable package + lint/test tooling.
+- 使用source ~/.bashrc && conda activate cure激活环境
 - Run training: `python train.py model=flow_matching_hand_dit backbone=ptv3_sparse datamodule=handencoder_dm_dex experiment_name=my_run` (override configs as needed; outputs to `outputs/<name>/<timestamp>`).
 - Profile variants: use `experiments=profiler` override; resume via `auto_resume=true` in config.
 - Tests: `pytest` or `pytest tests/test_xyz.py -k keyword` to target subsets.

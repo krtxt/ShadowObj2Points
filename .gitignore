@@ -14,6 +14,7 @@ testsba/
 lightning_logs/
 assets/
 third_party/
+pytorch3d/
 3rd_party/
 __pycache__/
 *.pyc

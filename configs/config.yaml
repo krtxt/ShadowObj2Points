@@ -26,6 +26,7 @@ auto_scale_batch_size: false # Set to true to find the largest batch size
 auto_lr_find: false          # Set to true to find the optimal learning rate
 auto_resume: false           # Set to true to resume from the last checkpoint in the experiment folder
 auto_resume_config: false
+validate_checkpoint: true    # Validate checkpoint integrity before resuming
 
 # Common hyperparameters (可被其他配置引用)
 batch_size: 128

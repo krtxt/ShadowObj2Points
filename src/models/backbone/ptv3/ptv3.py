@@ -240,9 +240,22 @@ class PointSequential(PointModule):
             # Spconv module
             elif spconv.modules.is_spconv_module(module):
                 if isinstance(input, Point):
-                    input.sparse_conv_feat = module(input.sparse_conv_feat)
+                    # Fix mixed precision issue: ensure features dtype matches weight dtype
+                    # to avoid "can't find suitable algorithm" error in eval mode
+                    sparse_feat = input.sparse_conv_feat
+                    weight_dtype = module.weight.dtype
+                    if sparse_feat.features.dtype != weight_dtype:
+                        sparse_feat = sparse_feat.replace_feature(
+                            sparse_feat.features.to(weight_dtype)
+                        )
+                    input.sparse_conv_feat = module(sparse_feat)
                     input.feat = input.sparse_conv_feat.features
                 else:
+                    # Handle direct SparseConvTensor input
+                    if hasattr(module, 'weight'):
+                        weight_dtype = module.weight.dtype
+                        if input.features.dtype != weight_dtype:
+                            input = input.replace_feature(input.features.to(weight_dtype))
                     input = module(input)
             # PyTorch module
             else:
@@ -630,7 +643,17 @@ class Block(PointModule):
 
     def forward(self, point: Point):
         shortcut = point.feat
-        point = self.cpe(point)
+        if not self.training and torch.is_autocast_enabled():
+            # spconv tuner在eval+autocast(fp16输入、fp32权重)下缺算法，强制用fp32跑CPE
+            if point.sparse_conv_feat is not None and point.sparse_conv_feat.features.dtype == torch.float16:
+                point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(
+                    point.sparse_conv_feat.features.float()
+                )
+                shortcut = shortcut.float()
+            with torch.autocast(device_type=shortcut.device.type, enabled=False):
+                point = self.cpe(point)
+        else:
+            point = self.cpe(point)
         point.feat = shortcut + point.feat
         shortcut = point.feat
         if self.pre_norm:

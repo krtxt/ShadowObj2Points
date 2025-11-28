@@ -405,7 +405,9 @@ class HandFlowMatchingDiT(L.LightningModule):
                     scene_tokens = scene_tokens.permute(0, 2, 1)
         else:
             raise TypeError(f"Unsupported backbone output type: {type(backbone_out)}")
-        return scene_tokens
+        # Ensure consistent dtype for DiT input to avoid torch.compile recompilation
+        # between training (fp16 from autocast) and validation (fp32)
+        return scene_tokens.float()
 
     def encode_hand_tokens(self, keypoints: torch.Tensor) -> torch.Tensor:
         """Encode hand keypoints into per-point tokens.
@@ -510,19 +512,63 @@ class HandFlowMatchingDiT(L.LightningModule):
         Returns:
             Training loss
         """
+        logger = logging.getLogger(__name__)
         try:
             target, _, scene_pc = self._prepare_batch_data(batch, stage="train")
             batch_size = int(target.size(0))
 
             loss, loss_dict = self._compute_step_loss(target, scene_pc)
 
-            if not torch.isfinite(loss):
-                self.log("train/nan_loss", 1.0, prog_bar=True, on_step=True, on_epoch=True, batch_size=batch_size)
-                return None
+            # Log BEFORE NaN check for debugging
+            self.log(
+                "train/loss",
+                loss.detach(),
+                prog_bar=False,
+                on_step=True,
+                on_epoch=True,
+                batch_size=batch_size,
+                sync_dist=True,
+            )
+            self.log(
+                "train/loss_fm",
+                loss_dict["loss_fm"].detach(),
+                prog_bar=False,
+                on_step=True,
+                on_epoch=True,
+                batch_size=batch_size,
+                sync_dist=True,
+            )
+            self.log(
+                "train/loss_tangent",
+                loss_dict["loss_tangent"].detach(),
+                prog_bar=False,
+                on_step=True,
+                on_epoch=True,
+                batch_size=batch_size,
+                sync_dist=True,
+            )
 
-            self.log("train/loss", loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=batch_size)
-            self.log("train/loss_fm", loss_dict["loss_fm"], prog_bar=False, on_step=True, on_epoch=True, batch_size=batch_size)
-            self.log("train/loss_tangent", loss_dict["loss_tangent"], prog_bar=False, on_step=True, on_epoch=True, batch_size=batch_size)
+            if not torch.isfinite(loss):
+                # Log which components are NaN/Inf for debugging
+                nan_components = [k for k, v in loss_dict.items() if not torch.isfinite(v)]
+                self.log("train/nan_loss", 1.0, prog_bar=True, on_step=True, on_epoch=True, batch_size=batch_size)
+                logger.error(
+                    f"NaN/Inf loss detected at batch {batch_idx}! "
+                    f"Total loss: {loss.item():.6f}, NaN components: {nan_components}"
+                )
+                for k, v in loss_dict.items():
+                    logger.error(f"  {k}: {v.item():.6f} (finite={torch.isfinite(v).item()})")
+                
+                # Option 1: Clean NaN values and continue (less aggressive)
+                # loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
+                # return loss
+                
+                # Option 2: Raise error immediately for faster debugging (recommended)
+                raise RuntimeError(
+                    f"NaN/Inf loss detected at batch {batch_idx}. "
+                    f"Components: {nan_components}. Check gradient clipping and input data."
+                )
+
             return loss
         except Exception as e:
             self.log("train/error_flag", 1.0, prog_bar=True, on_step=True, on_epoch=False)
@@ -677,6 +723,7 @@ class HandFlowMatchingDiT(L.LightningModule):
             batch: Dictionary containing 'xyz' (B, N, 3) and optionally 'scene_pc' (B, P, 3)
             batch_idx: Batch index
         """
+        logger = logging.getLogger(__name__)
         try:
             target, raw_target, scene_pc = self._prepare_batch_data(batch, stage="val")
             batch_size = int(target.size(0))
@@ -684,7 +731,13 @@ class HandFlowMatchingDiT(L.LightningModule):
             loss, loss_dict = self._compute_step_loss(target, scene_pc)
             
             if not torch.isfinite(loss):
+                # Log detailed NaN info for debugging
+                nan_components = [k for k, v in loss_dict.items() if not torch.isfinite(v)]
                 self.log("val/nan_loss", 1.0, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size)
+                logger.warning(
+                    f"NaN/Inf validation loss at batch {batch_idx}. "
+                    f"NaN components: {nan_components}"
+                )
                 return
 
             self._val_step_losses.append(loss.detach())
@@ -699,6 +752,7 @@ class HandFlowMatchingDiT(L.LightningModule):
                 on_step=False,
                 on_epoch=True,
                 sync_dist=True,
+                batch_size=batch_size,
             )
             
             with torch.no_grad():
@@ -984,5 +1038,3 @@ class HandFlowMatchingDiT(L.LightningModule):
         if monitor:
             scheduler_dict["monitor"] = monitor
         return {"optimizer": optimizer, "lr_scheduler": scheduler_dict}
-# /home/xiantuo/v2rayN/v2rayN-linux-64/bin/xray/xray run -config /home/xiantuo/v2rayN/v2rayN-linux-64/bin/xray/config.json 
-# droid --resume 6ec32519-2d3c-4eb2-883e-ebd7f2dc7e08

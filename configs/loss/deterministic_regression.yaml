@@ -1,6 +1,7 @@
 lambda_pos: 1.0
-lambda_bone: 1.0
+lambda_bone: 0.1
 lambda_collision: 0.25
+# lambda_collision: 0.0
 
 # Collision-related hyperparameters (same units as world coordinates)
 collision_margin: 0.002

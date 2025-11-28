@@ -14,6 +14,7 @@ scheduler:
   total_epochs: ${trainer.max_epochs}
   eta_min: 1.0e-6
   warmup_start_factor: 1.0e-3
+  skip_warmup_on_resume: true  # Skip warmup when resuming past warmup phase
   interval: epoch
   frequency: 1
   monitor: val/loss

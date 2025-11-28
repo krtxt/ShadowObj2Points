@@ -272,7 +272,9 @@ class HandDeterministicDiT(L.LightningModule):
         if tokens.shape[1] == self.hparams.d_model and tokens.shape[2] != self.hparams.d_model:
             tokens = tokens.permute(0, 2, 1)
 
-        return tokens
+        # Ensure consistent dtype for DiT input to avoid torch.compile recompilation
+        # between training (fp16 from autocast) and validation (fp32)
+        return tokens.float()
 
     # =========================================================================
     # Forward Pass & Prediction
@@ -395,6 +397,7 @@ class HandDeterministicDiT(L.LightningModule):
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         target, _, scene = self._extract_batch(batch, "train")
+        batch_size = int(target.size(0))
         
         pred = self.predict_hand_xyz(scene)
         denorm_fn = self._denorm_xyz if self.use_norm_data else None
@@ -409,15 +412,31 @@ class HandDeterministicDiT(L.LightningModule):
 
         logs = {f"loss_{k}": v.detach() for k, v in components.items()}
 
-        if not torch.isfinite(loss):
-            self.log("train/nan_loss", 1.0, on_step=True)
-            return None
-
-        # Log main loss and components
-        self.log("train/loss", loss, prog_bar=False)
+        # Log main loss and components BEFORE NaN check for debugging
+        self.log("train/loss", loss.detach(), prog_bar=False, batch_size=batch_size)
         for k, v in logs.items():
-            # self.log(f"train/{k}", v, prog_bar=(k == "loss_smooth_l1"))
-            self.log(f"train/{k}", v, prog_bar=False)
+            self.log(f"train/{k}", v, prog_bar=False, batch_size=batch_size)
+
+        if not torch.isfinite(loss):
+            # Log which components are NaN/Inf for debugging
+            nan_components = [k for k, v in components.items() if not torch.isfinite(v)]
+            self.log("train/nan_loss", 1.0, on_step=True, batch_size=batch_size)
+            logger.error(
+                f"NaN/Inf loss detected at batch {batch_idx}! "
+                f"Total loss: {loss.item():.6f}, NaN components: {nan_components}"
+            )
+            for k, v in components.items():
+                logger.error(f"  {k}: {v.item():.6f} (finite={torch.isfinite(v).item()})")
+            
+            # Option 1: Clean NaN values and continue (less aggressive)
+            # loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
+            # return loss
+            
+            # Option 2: Raise error immediately for faster debugging (recommended)
+            raise RuntimeError(
+                f"NaN/Inf loss detected at batch {batch_idx}. "
+                f"Components: {nan_components}. Check gradient clipping and input data."
+            )
             
         return loss
 
@@ -446,12 +465,18 @@ class HandDeterministicDiT(L.LightningModule):
         if torch.isfinite(loss):
             self._val_step_losses.append(loss.detach())
         else:
+            # Log detailed NaN info for debugging
+            nan_components = [k for k, v in components.items() if not torch.isfinite(v)]
             self.log("val/nan_loss", 1.0, on_step=False, on_epoch=True, batch_size=batch_size)
+            logger.warning(
+                f"NaN/Inf validation loss at batch {batch_idx}. "
+                f"NaN components: {nan_components}"
+            )
             return
 
         # Basic Logging (+ alias for callbacks expecting 'val_loss')
         self.log("val/loss", loss, sync_dist=True, on_step=False, on_epoch=True, batch_size=batch_size)
-        self.log("val_loss", loss, sync_dist=True, on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log("val_loss", loss, sync_dist=True, on_step=False, on_epoch=True, batch_size=batch_size, prog_bar=True)
         for k, v in logs.items():
             self.log(f"val/{k}", v, sync_dist=True, batch_size=batch_size)
 

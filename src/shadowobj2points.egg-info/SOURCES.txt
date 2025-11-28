@@ -5,6 +5,7 @@ src/datamodules/MyBodexShadow.py
 src/datamodules/MyDexGraspNet.py
 src/datamodules/__init__.py
 src/models/__init__.py
+src/models/deterministic_hand_dit.py
 src/models/flow_matching_hand_dit.py
 src/models/backbone/__init__.py
 src/models/backbone/point_patch_embedding copy.py
@@ -30,15 +31,6 @@ src/models/backbone/functional/interpolatation.py
 src/models/backbone/functional/loss.py
 src/models/backbone/functional/sampling.py
 src/models/backbone/functional/voxelization.py
-src/models/backbone/functional copy/__init__.py
-src/models/backbone/functional copy/backend.py
-src/models/backbone/functional copy/ball_query.py
-src/models/backbone/functional copy/devoxelization.py
-src/models/backbone/functional copy/grouping.py
-src/models/backbone/functional copy/interpolatation.py
-src/models/backbone/functional copy/loss.py
-src/models/backbone/functional copy/sampling.py
-src/models/backbone/functional copy/voxelization.py
 src/models/backbone/sonata/__init__.py
 src/models/backbone/sonata/data.py
 src/models/backbone/sonata/model.py
@@ -53,23 +45,23 @@ src/models/backbone/sonata/serialization/hilbert.py
 src/models/backbone/sonata/serialization/z_order.py
 src/models/components/__init__.py
 src/models/components/embeddings.py
+src/models/components/graph_config.py
 src/models/components/graph_dit.py
 src/models/components/hand_encoder.py
 src/models/components/losses.py
+src/models/components/sampling_config.py
 src/models/components/schedulers.py
+src/models/components/solvers.py
+src/models/components/time_schedules.py
+src/models/components/velocity_strategies.py
 src/shadowobj2points.egg-info/PKG-INFO
 src/shadowobj2points.egg-info/SOURCES.txt
 src/shadowobj2points.egg-info/dependency_links.txt
 src/shadowobj2points.egg-info/requires.txt
 src/shadowobj2points.egg-info/top_level.txt
 src/utils/__init__.py
-src/utils/anchor_config.py
-src/utils/hand_constants.py
-src/utils/hand_helper.py
-src/utils/hand_pose_config.py
-src/utils/hand_types.py
+src/utils/logging_utils.py
 src/utils/rot6d.py
-src/utils/rotation_spec copy.py
 src/utils/rotation_spec.py
-src/utils/shadow_hand_adapter.py
 src/utils/shadown_hand_model.py
+tests/test_1122_norm_stat.py

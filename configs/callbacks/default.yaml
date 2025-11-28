@@ -91,3 +91,32 @@ validation_summary:
 # grad_norm:
 #   _target_: callbacks.grad_norm_logger.GradNormLogger
 #   norm_type: 2.0
+
+# Gradient Health Monitor - NaN/Inf detection and emergency alerts
+# Enabled by default for safety; set to null to disable
+gradient_monitor:
+  _target_: callbacks.gradient_monitor.GradientMonitor
+  check_nan: true
+  check_inf: true
+  halt_on_nan: false          # Set true to stop immediately on NaN
+  halt_on_inf: false          # Set true to stop immediately on Inf
+  max_consecutive_bad_batches: 10  # Stop after N consecutive bad batches (-1 to disable)
+  log_param_names: true       # Log which parameters have bad gradients
+  log_every_n_steps: 0        # Log gradient stats every N steps (0 to disable)
+  raise_exception: false      # Raise exception instead of stopping trainer
+
+# Training ETA - Estimated time of arrival and progress tracking
+training_eta:
+  _target_: callbacks.training_eta.TrainingETACallback
+  log_every_n_epochs: 5       # Log ETA every N epochs
+  log_every_n_steps: 0        # Log step timing (0 to disable)
+  show_epoch_time: true       # Show average epoch time
+  datetime_format: "%Y-%m-%d %H:%M:%S"
+
+# Checkpoint Validator - Verify checkpoint integrity
+checkpoint_validator:
+  _target_: callbacks.checkpoint_validator.CheckpointValidator
+  validate_on_save: true      # Validate after each checkpoint save
+  validate_state_dict: true   # Check for NaN/Inf in saved weights
+  validate_loadable: false    # Actually try loading (slower but thorough)
+  log_checkpoint_size: true   # Log checkpoint file size

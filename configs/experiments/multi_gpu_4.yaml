@@ -1,0 +1,37 @@
+# @package _global_
+
+# 4-GPU Multi-GPU Training Configuration
+# Usage: python train.py experiments=multi_gpu_4
+
+defaults:
+  - override /trainer: default
+
+# Experiment Metadata
+experiment_name: multi_gpu_4_training
+tags: ["multi-gpu", "4gpu", "ddp"]
+
+# Trainer Configuration for 4 GPUs
+trainer:
+  devices: 4
+  strategy: ddp_find_unused_parameters_true
+  precision: 16-mixed
+  benchmark: true
+  sync_batchnorm: true  # 多卡时同步BatchNorm
+  max_epochs: 1000
+
+# Optimizer Configuration
+# 4 GPU 线性缩放学习率: base_lr * num_gpus = 1e-4 * 4 = 4e-4
+optimizer:
+  lr: 2.0e-4
+  scheduler:
+    warmup_epochs: 20
+
+# Batch size per GPU (effective batch = batch_size * num_gpus)
+batch_size: 800
+
+# DataModule settings for multi-GPU
+datamodule:
+  num_workers: 8
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: true

@@ -23,17 +23,38 @@ trainer:
   precision: 32             # Use FP32 for accurate profiling (avoid spconv auto-tune noise)
   benchmark: true           # Enable cuDNN benchmark
 
+  # Enable PyTorchProfiler alongside the advanced profiler to capture GPU kernel-level traces.
+  # This will write a trace file next to fit-profile_report.txt under the same output dir.
+  # NOTE: Lightning uses only one profiler at runtime; we keep the main flag as "advanced"
+  # and attach a secondary PyTorchProfiler via callbacks for GPU analysis.
+  callbacks:
+    gpu_profiler:
+      _target_: lightning.pytorch.profilers.PyTorchProfiler
+      dirpath: ${paths.output_dir}/profiler
+      filename: fit-gpu-trace
+      export_to_chrome: true
+      record_module_names: true
+      profile_memory: true
+      with_stack: false
+      schedule:
+        _target_: torch.profiler.schedule
+        skip_first: 10
+        wait: 1
+        warmup: 1
+        active: 3
+        repeat: 1
+
 # Disable Auto-Tuning (Profiling needs fixed settings)
 auto_scale_batch_size: false
 auto_lr_find: false
 auto_resume: false
 
-compile: true
+compile: false
 
 # Data Settings (Ensure fast loading for profiling)
 batch_size: 256
 datamodule:
-  num_workers: 8            # Ensure enough workers
+  num_workers: 8          # Ensure enough workers
   prefetch_factor: 2
   pin_memory: true
 

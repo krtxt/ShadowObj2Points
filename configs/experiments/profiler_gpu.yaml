@@ -1,0 +1,58 @@
+# @package _global_
+
+# GPU Profiler Experiment Configuration
+# Usage: python train.py experiment=profiler_gpu
+
+defaults:
+  - override /trainer: default
+
+experiment_name: profiler_analysis_gpu
+tags: ["profiler", "debug", "performance", "gpu"]
+
+trainer:
+  # Use PyTorchProfiler to capture both CPU and CUDA kernel traces.
+  profiler:
+    _target_: lightning.pytorch.profilers.PyTorchProfiler
+    dirpath: ${paths.output_dir}/profiler
+    filename: fit-gpu-trace
+    sort_by_key: cuda_time_total  # sort report by CUDA time descending
+    row_limit: 50                 # only keep top rows in text report
+    export_to_chrome: true
+    record_module_names: true
+    profile_memory: true
+    with_stack: false
+    schedule:
+      _target_: torch.profiler.schedule
+      skip_first: 10
+      wait: 1
+      warmup: 1
+      active: 3
+      repeat: 1
+
+  max_epochs: 3
+  check_val_every_n_epoch: 1
+  limit_train_batches: 100
+  limit_val_batches: 50
+  num_sanity_val_steps: 0
+  log_every_n_steps: 1
+  precision: 32
+  benchmark: true
+
+auto_scale_batch_size: false
+auto_lr_find: false
+auto_resume: false
+
+compile: false
+
+batch_size: 512
+datamodule:
+  num_workers: 32
+  prefetch_factor: 2
+  pin_memory: true
+
+logger:
+  _target_: lightning.pytorch.loggers.TensorBoardLogger
+  save_dir: ${paths.output_dir}/tensorboard
+  name: null
+  version: null
+  default_hp_metric: false

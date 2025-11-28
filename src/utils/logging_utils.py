@@ -26,12 +26,20 @@ def setup_rich_logging(level: int = logging.INFO) -> None:
         date_format = "%m/%d/%y %H:%M:%S"
 
         install_rich_traceback(show_locals=False)
+        level_styles = {
+            "debug": "dim cyan",
+            "info": "bold bright_blue",
+            "warning": "bold yellow",
+            "error": "bold red",
+            "critical": "bold reverse red",
+        }
         handler = RichHandler(
             rich_tracebacks=True,
             markup=True,
             show_time=False,
-            show_level=False,
+            show_level=True,
             show_path=False,
+            level_styles=level_styles,
         )
         handler.setFormatter(logging.Formatter(log_format, datefmt=date_format))
         
@@ -240,7 +248,7 @@ def log_validation_summary(epoch: int,
         console.print(Align.center(diversity_table))
 
     # --- Footer Rule ---
-    console.rule("[good]✔️ === Validation Summary Complete ===[/good]", style="green")
+    console.rule("[good]✔️  Validation Summary Complete [/good]", style="green")
 
     # --- Debug Info ---
     if not isinstance(val_detailed_loss, dict):

@@ -200,14 +200,25 @@ class FlowMatchingLoss(nn.Module):
     
     Formula:
         L_total = ||v_pred - v_target||^2 + λ * ||(v_pred_rel · y_curr_rel)||^2
+    
+    Args:
+        edge_index: Graph edge indices of shape (2, E).
+        lambda_tangent: Weight for tangent regularization loss.
+        loss_clamp: Maximum value for individual loss terms to prevent gradient explosion.
     """
-    def __init__(self, edge_index: torch.Tensor, lambda_tangent: float = 1.0) -> None:
+    def __init__(
+        self, 
+        edge_index: torch.Tensor, 
+        lambda_tangent: float = 1.0,
+        loss_clamp: float = 100.0,
+    ) -> None:
         super().__init__()
         if edge_index.dim() != 2 or edge_index.size(0) != 2:
             raise ValueError(f"edge_index shape mismatch. Expected (2, E), got {edge_index.shape}")
             
         self.register_buffer("edge_index", edge_index.long(), persistent=False)
         self.lambda_tangent = float(lambda_tangent)
+        self.loss_clamp = float(loss_clamp)
 
     def forward(
         self, 
@@ -218,11 +229,13 @@ class FlowMatchingLoss(nn.Module):
         if v_hat.shape != v_star.shape or v_hat.shape != y_tau.shape:
             raise ValueError(f"Shape mismatch: v_hat={v_hat.shape}, v_star={v_star.shape}, y_tau={y_tau.shape}")
 
-        # 1. Flow Matching MSE
+        # 1. Flow Matching MSE with numerical stability
         loss_fm = F.mse_loss(v_hat, v_star)
+        # Clamp to prevent gradient explosion
+        loss_fm = torch.clamp(loss_fm, max=self.loss_clamp)
 
         # 2. Tangent Regularization (vectorized)
-        loss_tan = torch.tensor(0.0, device=v_hat.device)
+        loss_tan = torch.tensor(0.0, device=v_hat.device, dtype=v_hat.dtype)
         if self.lambda_tangent > 0.0:
             i, j = self.edge_index
             # Relative positions and velocities along edges
@@ -233,6 +246,8 @@ class FlowMatchingLoss(nn.Module):
             # Dot product along the last dim
             orthogonality = (diff_y * diff_v).sum(dim=-1)
             loss_tan = (orthogonality ** 2).mean()
+            # Clamp to prevent gradient explosion
+            loss_tan = torch.clamp(loss_tan, max=self.loss_clamp)
 
         total_loss = loss_fm + self.lambda_tangent * loss_tan
         
@@ -713,6 +728,16 @@ class DeterministicRegressionLoss(nn.Module):
 
         faces_cache: Dict[Tuple[str, torch.dtype, int], torch.Tensor] = {}
 
+        # Pre-generate random indices for all batches at once (avoid per-sample randperm)
+        num_scene_pts = scene_w.shape[1]
+        sample_indices = None
+        if self.collision_max_scene_points and num_scene_pts > self.collision_max_scene_points:
+            sample_indices = torch.randint(
+                0, num_scene_pts,
+                (batch_size, self.collision_max_scene_points),
+                device=pred_w.device
+            )
+
         losses: List[torch.Tensor] = []
         if static_active_edges is not None:
             active_edges = static_active_edges
@@ -744,16 +769,11 @@ class DeterministicRegressionLoss(nn.Module):
                 if scene_pts.shape[0] == 0:
                     continue
 
-                if (
-                    self.collision_max_scene_points
-                    and scene_pts.shape[0] > self.collision_max_scene_points
-                ):
-                    perm = torch.randperm(scene_pts.shape[0], device=scene_pts.device)
-                    scene_pts = scene_pts[perm[: self.collision_max_scene_points]]
+                if sample_indices is not None:
+                    scene_pts = scene_pts[sample_indices[b]]
 
                 vertices = verts_all[b].reshape(-1, 3)
-                faces = base_faces + (b * num_edges * num_vertices)
-                face_vertices = index_vertices_by_faces(vertices, faces)
+                face_vertices = index_vertices_by_faces(vertices, base_faces)
 
                 sdf, dist_sign, _, _ = compute_sdf(scene_pts, face_vertices)
                 signed_dist = sdf * dist_sign.sign().to(sdf.dtype)
@@ -775,12 +795,8 @@ class DeterministicRegressionLoss(nn.Module):
                 if scene_pts.shape[0] == 0:
                     continue
 
-                if (
-                    self.collision_max_scene_points
-                    and scene_pts.shape[0] > self.collision_max_scene_points
-                ):
-                    perm = torch.randperm(scene_pts.shape[0], device=scene_pts.device)
-                    scene_pts = scene_pts[perm[: self.collision_max_scene_points]]
+                if sample_indices is not None:
+                    scene_pts = scene_pts[sample_indices[b]]
 
                 starts = pred_w[b, i[active_edges]]
                 ends = pred_w[b, j[active_edges]]

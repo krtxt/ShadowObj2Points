@@ -120,3 +120,23 @@ checkpoint_validator:
   validate_state_dict: true   # Check for NaN/Inf in saved weights
   validate_loadable: false    # Actually try loading (slower but thorough)
   log_checkpoint_size: true   # Log checkpoint file size
+
+# DDP Watchdog - Deadlock detection and zombie process cleanup (for multi-GPU)
+# Enable in multi-GPU experiments or via experiments=multi_gpu_4
+ddp_watchdog: null
+# ddp_watchdog:
+#   _target_: callbacks.ddp_watchdog.DDPWatchdog
+#   step_timeout: 300.0         # Max seconds per step before warning
+#   heartbeat_interval: 60.0    # Heartbeat check interval
+#   max_consecutive_timeouts: 3 # Stop after N consecutive timeouts
+#   barrier_timeout: 1800.0     # DDP barrier timeout
+#   kill_zombies: true          # Cleanup zombie processes
+#   save_on_timeout: true       # Save emergency checkpoint
+#   log_gpu_memory: true        # Log GPU status on timeout
+
+# DDP Barrier Monitor - Monitor barrier operations for deadlocks (for multi-GPU)
+ddp_barrier_monitor: null
+# ddp_barrier_monitor:
+#   _target_: callbacks.ddp_watchdog.DDPBarrierMonitor
+#   barrier_timeout: 600.0
+#   check_interval: 30.0

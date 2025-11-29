@@ -1,0 +1,77 @@
+# @package _global_
+
+# Multi-GPU Training Configuration
+# Usage: python train.py experiments=multi_gpu trainer.devices=2
+#        python train.py experiments=multi_gpu trainer.devices=4
+
+defaults:
+  - override /trainer: default
+
+# Experiment Metadata
+experiment_name: multi_gpu_training
+tags: ["multi-gpu", "ddp"]
+
+# Trainer Configuration for Multi-GPU
+# 通过命令行覆盖 trainer.devices=N 来指定GPU数量
+trainer:
+  devices: auto  # 自动检测可用GPU数量，或通过命令行覆盖
+  precision: bf16-mixed
+  benchmark: true
+  sync_batchnorm: true  # 多卡时同步BatchNorm
+  max_epochs: 1000
+  
+  # DDP Strategy with timeout to prevent deadlocks
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    timeout:
+      _target_: datetime.timedelta
+      seconds: 1800  # 30分钟超时，防止DDP死锁
+    find_unused_parameters: true  # 设为true如果有unused parameters警告
+    static_graph: false  # 静态图优化，如果模型结构固定可设为true
+    gradient_as_bucket_view: true  # 减少显存碎片（PyTorch 1.7+）
+
+# DDP Watchdog Callbacks - 死锁检测和僵尸进程处理
+callbacks:
+  ddp_watchdog:
+    _target_: callbacks.ddp_watchdog.DDPWatchdog
+    step_timeout: 300.0         # 单步超过5分钟警告
+    heartbeat_interval: 60.0    # 每分钟心跳检测
+    max_consecutive_timeouts: 3 # 连续3次超时后停止训练
+    barrier_timeout: 1800.0     # barrier超时30分钟
+    kill_zombies: true          # 清理僵尸进程
+    save_on_timeout: true       # 超时时保存紧急checkpoint
+    log_gpu_memory: true        # 超时时记录GPU状态
+  
+  ddp_barrier_monitor:
+    _target_: callbacks.ddp_watchdog.DDPBarrierMonitor
+    barrier_timeout: 600.0      # barrier超时10分钟
+    check_interval: 30.0        # 每30秒检查一次
+
+  # 覆盖默认的LearningRateMonitor，使用step级别监控                                            
+  lr_monitor:                                                                                  
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor                                  
+    logging_interval: step      # 每step记录，更适合多卡大batch训练                            
+    log_momentum: true          # 同时记录momentum
+
+  gradient_monitor:
+    halt_on_nan: true
+    halt_on_inf: true
+    max_consecutive_bad_batches: 1
+    raise_exception: true
+
+# Optimizer Configuration
+# 多卡训练建议线性缩放学习率: base_lr * num_gpus
+optimizer:
+  lr: 1.0e-4  # 基础学习率，可根据GPU数量调整
+  scheduler:
+    warmup_epochs: 20
+
+# Batch size per GPU (effective batch = batch_size * num_gpus)
+batch_size: 800
+
+# DataModule settings for multi-GPU
+datamodule:
+  num_workers: 8
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: true

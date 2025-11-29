@@ -26,20 +26,12 @@ def setup_rich_logging(level: int = logging.INFO) -> None:
         date_format = "%m/%d/%y %H:%M:%S"
 
         install_rich_traceback(show_locals=False)
-        level_styles = {
-            "debug": "dim cyan",
-            "info": "bold bright_blue",
-            "warning": "bold yellow",
-            "error": "bold red",
-            "critical": "bold reverse red",
-        }
         handler = RichHandler(
             rich_tracebacks=True,
             markup=True,
             show_time=False,
-            show_level=True,
+            show_level=False,
             show_path=False,
-            level_styles=level_styles,
         )
         handler.setFormatter(logging.Formatter(log_format, datefmt=date_format))
         

@@ -20,11 +20,11 @@ def r6d_to_rotation(r6d: torch.Tensor) -> torch.Tensor:
     if rotation_6d_to_matrix is not None:
         return rotation_6d_to_matrix(r6d)
     
-    # Local implementation fallback
+    # Local implementation fallback with bf16-safe eps
     a1 = r6d[..., 0:3]
     a2 = r6d[..., 3:6]
-    b1 = F.normalize(a1, dim=-1, eps=1e-9)
-    b2 = F.normalize(a2 - (b1 * a2).sum(-1, keepdim=True) * b1, dim=-1, eps=1e-9)
+    b1 = F.normalize(a1, dim=-1, eps=1e-5)
+    b2 = F.normalize(a2 - (b1 * a2).sum(-1, keepdim=True) * b1, dim=-1, eps=1e-5)
     b3 = torch.cross(b1, b2, dim=-1)
     R = torch.stack([b1, b2, b3], dim=-1)
     return R
@@ -491,34 +491,44 @@ class GroupRigidParamVelocityStrategy(VelocityStrategyBase):
             g_tokens_list.append(hand_tokens_out[:, g.to(device), :].mean(dim=1))
             
         g_tokens = torch.stack(g_tokens_list, dim=1)  # (B, G, D)
-        params = self.group_head(g_tokens)            # (B, G, 9)
         
-        r6d = params[..., :6]
-        t = params[..., 6:]      # (B, G, 3)
-        R = r6d_to_rotation(r6d) # (B, G, 3, 3)
+        orig_dtype = hand_tokens_out.dtype
+        
+        # Use float32 for numerical stability in rotation computation and velocity
+        with torch.cuda.amp.autocast(enabled=False):
+            g_tokens_f32 = g_tokens.float()
+            params = self.group_head(g_tokens_f32)    # (B, G, 9)
+            # Clamp to prevent extreme values in bf16-mixed training
+            params = params.clamp(-10.0, 10.0)
+            
+            r6d = params[..., :6]
+            t = params[..., 6:]      # (B, G, 3)
+            R = r6d_to_rotation(r6d) # (B, G, 3, 3)
 
-        template = self.template.to(device)
-        out = torch.zeros(B, N, 3, device=device, dtype=hand_tokens_out.dtype)
-        counts = torch.zeros(B, N, 1, device=device, dtype=hand_tokens_out.dtype)
-        
-        for gi, g in enumerate(self.groups):
-            idx = g.to(device)
-            Yg = template[idx].unsqueeze(0).expand(B, -1, -1)
+            template = self.template.to(device).float()
+            out = torch.zeros(B, N, 3, device=device, dtype=torch.float32)
+            counts = torch.zeros(B, N, 1, device=device, dtype=torch.float32)
             
-            # Apply predicted transform: R * Y + t
-            # Yg is (B, M, 3), R is (B, 3, 3) (slice for this group)
-            # (R @ Yg.T).T + t
-            Xg = (R[:, gi] @ Yg.transpose(1,2)).transpose(1,2) + t[:, gi].unsqueeze(1)
+            for gi, g in enumerate(self.groups):
+                idx = g.to(device)
+                Yg = template[idx].unsqueeze(0).expand(B, -1, -1)
+                
+                # Apply predicted transform: R * Y + t
+                # Yg is (B, M, 3), R is (B, 3, 3) (slice for this group)
+                # (R @ Yg.T).T + t
+                Xg = (R[:, gi] @ Yg.transpose(1,2)).transpose(1,2) + t[:, gi].unsqueeze(1)
+                
+                out[:, idx, :] += Xg
+                counts[:, idx, :] += 1.0
+                
+            x_goal = out / counts.clamp_min(1.0)
             
-            out[:, idx, :] += Xg
-            counts[:, idx, :] += 1.0
+            tau = self._tau(timesteps)
+            keypoints_f32 = keypoints.float()
+            v = (x_goal - keypoints_f32) / tau
+            v = self.apply_tangent_projection(v, keypoints_f32)
             
-        x_goal = out / counts.clamp_min(1.0)
-        
-        tau = self._tau(timesteps)
-        v = (x_goal - keypoints) / tau
-        v = self.apply_tangent_projection(v, keypoints)
-        return v
+        return v.to(orig_dtype)
 
 
 class PBDCorrectedVelocityStrategy(VelocityStrategyBase):

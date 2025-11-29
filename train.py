@@ -17,12 +17,15 @@ if (src := str(PROJECT_ROOT / "src")) not in sys.path:
 
 import atexit
 import logging
+import os
 import signal
+from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import hydra
 import lightning.pytorch as L
 import torch
+import torch.distributed as dist
 from hydra.utils import instantiate as hydra_instantiate, to_absolute_path
 from lightning.pytorch import Trainer, seed_everything
 from lightning.pytorch.callbacks import Callback
@@ -115,6 +118,7 @@ class GracefulExitManager:
     def _handle(self, signum: int, frame: Any) -> None:
         if self._interrupted:
             self._log and self._log.warning("Force exit requested.")
+            self._cleanup_distributed()
             sys.exit(1)
 
         self._interrupted = True
@@ -127,6 +131,16 @@ class GracefulExitManager:
         self._log and self._log.warning(f"Interrupted by {sig_name}, saving checkpoint...")
         self._trainer and setattr(self._trainer, "should_stop", True)
         self._save_emergency()
+        self._cleanup_distributed()
+
+    def _cleanup_distributed(self) -> None:
+        """Clean up distributed training resources to prevent zombie processes."""
+        try:
+            if dist.is_initialized():
+                self._log and self._log.info("Destroying distributed process group...")
+                dist.destroy_process_group()
+        except Exception as e:
+            self._log and self._log.debug(f"Error cleaning up distributed: {e}")
 
     def _save_emergency(self, suffix: str = "interrupt") -> None:
         if not (self._trainer and self._cfg):
@@ -301,6 +315,10 @@ def build_trainer(cfg: DictConfig, callbacks: List[Callback], logger: Optional[L
     trainer_cbs = instantiate_callbacks(kwargs.pop("callbacks", None), "trainer.callbacks", log)
     for cb in trainer_cbs:
         log.info(f" [bold]{cb.__class__.__name__}[/]")
+
+    # Handle strategy
+    if isinstance(strategy := kwargs.get("strategy"), (DictConfig, dict)) and "_target_" in strategy:
+        kwargs["strategy"] = hydra_instantiate(strategy)
 
     # Handle profiler
     if isinstance(prof := kwargs.get("profiler"), (DictConfig, dict)) and "_target_" in prof:

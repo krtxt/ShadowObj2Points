@@ -1,7 +1,7 @@
 # PyTorch Lightning Trainer Configuration
 accelerator: gpu
 devices: 1
-precision: 32  # 16-mixed | 32 | 64 | bf16-mixed
+precision: 32  # 16-mixed | 32 | 64 |   
 max_epochs: 500
 # strategy: ddp_find_unused_parameters_true
 

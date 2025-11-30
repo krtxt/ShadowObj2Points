@@ -12,6 +12,26 @@ from rich.traceback import install as install_rich_traceback
 from lightning.pytorch.utilities import rank_zero_only
 
 
+class ColoredLevelFormatter(logging.Formatter):
+    """Custom formatter that adds Rich color markup to log level names."""
+
+    LEVEL_COLORS = {
+        logging.DEBUG: "dim",
+        logging.INFO: "green",
+        logging.WARNING: "yellow",
+        logging.ERROR: "red",
+        logging.CRITICAL: "bold red",
+    }
+
+    def format(self, record):
+        original_levelname = record.levelname
+        color = self.LEVEL_COLORS.get(record.levelno, "white")
+        record.levelname = f"[{color}]{original_levelname}[/{color}]"
+        result = super().format(record)
+        record.levelname = original_levelname
+        return result
+
+
 def setup_rich_logging(level: int = logging.INFO) -> None:
     """Configure rich logging for cleaner console output."""
     # Suppress logging on non-zero ranks by default
@@ -33,7 +53,7 @@ def setup_rich_logging(level: int = logging.INFO) -> None:
             show_level=False,
             show_path=False,
         )
-        handler.setFormatter(logging.Formatter(log_format, datefmt=date_format))
+        handler.setFormatter(ColoredLevelFormatter(log_format, datefmt=date_format))
         
         # Get current root logger handlers (typically includes Hydra's FileHandler)
         root_logger = logging.getLogger()

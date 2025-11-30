@@ -127,8 +127,18 @@ class TrainingETACallback(Callback):
         log.info(" | ".join(msg_parts))
         
         # Also log to trainer's logger for tensorboard/wandb
-        pl_module.log("train/eta_remaining_hours", remaining / 3600, on_epoch=True, logger=True)
-        pl_module.log("train/elapsed_hours", elapsed / 3600, on_epoch=True, logger=True)
+        pl_module.log(
+            "train/eta_remaining_hours",
+            remaining / 3600,
+            on_epoch=True,
+            logger=True,
+        )
+        pl_module.log(
+            "train/elapsed_hours",
+            elapsed / 3600,
+            on_epoch=True,
+            logger=True,
+        )
 
     def on_train_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         """Record training start time."""

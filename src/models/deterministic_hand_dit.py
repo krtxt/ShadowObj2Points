@@ -211,7 +211,7 @@ class HandDeterministicDiT(L.LightningModule):
         self.val_metric_manager = (
             HandValidationMetricManager(self.edge_index, val_cfg) if val_cfg else None
         )
-        self._val_step_losses = []
+        self._val_step_losses: List[float] = []  # Store scalars, not tensors
 
     # =========================================================================
     # Data Processing Utilities
@@ -395,10 +395,24 @@ class HandDeterministicDiT(L.LightningModule):
 
         return target, raw_target, scene
 
+    def on_train_epoch_start(self) -> None:
+        """Update loss scheduler with current epoch and log weights."""
+        epoch = self.current_epoch
+        self.loss_manager.set_epoch(epoch)
+
+        # Log current loss weights for monitoring curriculum progress
+        weights = self.loss_manager.get_current_weights()
+        for name, weight in weights.items():
+            self.log(f"loss_weight/{name}", weight, on_step=False, on_epoch=True, sync_dist=True)
+
+        stage = self.loss_manager.scheduler.get_current_stage_name()
+        if stage:
+            logger.info(f"Epoch {epoch}: Curriculum stage = {stage}")
+
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         target, _, scene = self._extract_batch(batch, "train")
         batch_size = int(target.size(0))
-        
+
         pred = self.predict_hand_xyz(scene)
         denorm_fn = self._denorm_xyz if self.use_norm_data else None
         loss, components = self.loss_manager(
@@ -408,6 +422,7 @@ class HandDeterministicDiT(L.LightningModule):
             active_edge_mask=getattr(self, "active_edge_mask", None),
             scene_pc=scene,
             denorm_fn=denorm_fn,
+            epoch=self.current_epoch,
         )
 
         logs = {f"loss_{k}": v.detach() for k, v in components.items()}
@@ -447,7 +462,7 @@ class HandDeterministicDiT(L.LightningModule):
     def validation_step(self, batch: Dict[str, Any], batch_idx: int) -> None:
         target, raw_target, scene = self._extract_batch(batch, "val")
         batch_size = int(target.size(0))
-        
+
         pred = self.predict_hand_xyz(scene)
         denorm_fn = self._denorm_xyz if self.use_norm_data else None
         loss, components = self.loss_manager(
@@ -457,13 +472,14 @@ class HandDeterministicDiT(L.LightningModule):
             active_edge_mask=getattr(self, "active_edge_mask", None),
             scene_pc=scene,
             denorm_fn=denorm_fn,
+            epoch=self.current_epoch,
         )
 
         logs = {f"loss_{k}": v.detach() for k, v in components.items()}
 
         # Buffer per-batch loss for ValidationSummaryCallback
         if torch.isfinite(loss):
-            self._val_step_losses.append(loss.detach())
+            self._val_step_losses.append(float(loss.detach().item()))  # Store scalar, not tensor
         else:
             # Log detailed NaN info for debugging
             nan_components = [k for k, v in components.items() if not torch.isfinite(v)]

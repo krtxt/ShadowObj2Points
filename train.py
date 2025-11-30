@@ -264,47 +264,94 @@ def validate_checkpoint(path: str, log: logging.Logger, load: bool = True) -> Tu
         return False, None
 
 
+def resolve_resume_run_dir(cfg: DictConfig, log: logging.Logger) -> Tuple[Optional[Path], Optional[str]]:
+    """Resolve resume_run_dir to (run_dir, ckpt_path). Supports absolute/relative paths."""
+    if not (resume_dir := cfg.get("resume_run_dir")):
+        return None, None
+
+    run_dir = Path(resume_dir) if Path(resume_dir).is_absolute() else PROJECT_ROOT / resume_dir
+    if not run_dir.is_dir():
+        log.warning(f"resume_run_dir invalid: {resume_dir}")
+        return None, None
+
+    ckpt_path = next(
+        (str(run_dir / "checkpoints" / n) for n in ("last.ckpt", "last-v1.ckpt", "last-v2.ckpt")
+         if (run_dir / "checkpoints" / n).exists()),
+        None,
+    )
+    if not ckpt_path:
+        log.warning(f"No checkpoint in {run_dir / 'checkpoints'}")
+
+    return run_dir, ckpt_path
+
+
 def resolve_resume_config(cfg: DictConfig, log: logging.Logger) -> DictConfig:
-    """Merge previous run config for resuming."""
-    path = None
+    """Merge previous run config. Priority: CLI > resume config > defaults."""
+    from hydra.core.hydra_config import HydraConfig
 
-    if p := cfg.get("resume_config") or cfg.get("resume_run_dir"):
-        cand = Path(to_absolute_path(str(p)))
-        path = (cand / ".hydra" / "config.yaml") if cand.is_dir() else cand if cand.is_file() else None
+    run_dir, auto_ckpt = resolve_resume_run_dir(cfg, log)
+    config_path = None
 
-    if not path and cfg.get("auto_resume_config"):
-        run_dir = None
-        if ckpt := cfg.get("ckpt_path"):
-            if (p := Path(to_absolute_path(str(ckpt)))).exists():
-                run_dir = p.parent.parent
-        if not run_dir:
-            if last := find_last_checkpoint(cfg, log):
-                run_dir = Path(last).parent.parent
-        if not run_dir and cfg.get("paths", {}).get("output_dir"):
-            exp_dir = Path(to_absolute_path(str(cfg.paths.output_dir))).parent
+    # Find config: resume_run_dir > resume_config > auto_resume_config
+    if run_dir and (cand := run_dir / ".hydra" / "config.yaml").exists():
+        config_path = cand
+        log.info(f"[bold #55FF55]Resume run dir[/]: {run_dir}")
+    elif (p := cfg.get("resume_config")) and (cand := Path(to_absolute_path(str(p)))).is_file():
+        config_path = cand
+    elif cfg.get("auto_resume_config"):
+        fallback = None
+        if (ckpt := cfg.get("ckpt_path")) and (p := Path(to_absolute_path(str(ckpt)))).exists():
+            fallback = p.parent.parent
+        elif last := find_last_checkpoint(cfg, log):
+            fallback = Path(last).parent.parent
+        elif (out := cfg.get("paths", {}).get("output_dir")):
+            exp_dir = Path(to_absolute_path(str(out))).parent
             if exp_dir.exists():
                 runs = sorted([d for d in exp_dir.iterdir() if d.is_dir()], key=lambda x: x.name)
-                run_dir = runs[-1] if runs else None
-        if run_dir and (cand := run_dir / ".hydra" / "config.yaml").exists():
-            path = cand
+                fallback = runs[-1] if runs else None
+        if fallback and (cand := fallback / ".hydra" / "config.yaml").exists():
+            config_path = cand
 
-    if not path:
-        return cfg
+    # Merge previous config
+    if config_path:
+        try:
+            prev = OmegaConf.load(str(config_path))
+        except Exception as e:
+            log.warning(f"Failed to load resume config: {e}")
+            return cfg
 
-    try:
-        prev = OmegaConf.load(str(path))
-    except Exception as e:
-        log.warning(f"Failed to load resume config: {e}")
-        return cfg
+        cli_keys = set()
+        try:
+            for ov in HydraConfig.get().overrides.task:
+                if "=" in ov and (k := ov.split("=", 1)[0]) != "resume_run_dir":
+                    cli_keys.add(k)
+            log.info(f"CLI overrides: {list(cli_keys)}")
+        except Exception:
+            pass
 
-    keep = {"paths": OmegaConf.select(cfg, "paths"), "hydra": OmegaConf.select(cfg, "hydra")}
-    if cfg.get("ckpt_path") is not None:
-        keep["ckpt_path"] = cfg.ckpt_path
-    if cfg.get("auto_resume") is not None:
-        keep["auto_resume"] = cfg.auto_resume
+        merged = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+        for key, value in OmegaConf.to_container(prev, resolve=False).items():
+            if key in ("paths", "hydra") or key in cli_keys:
+                continue
+            nested = [k for k in cli_keys if k.startswith(f"{key}.")]
+            OmegaConf.update(merged, key, value, merge=True)
+            for nk in nested:
+                if (nv := OmegaConf.select(cfg, nk)) is not None:
+                    OmegaConf.update(merged, nk, nv, merge=False)
 
-    log.info(f"Applied resume config: [bold]{path}[/]")
-    return OmegaConf.merge(prev, keep)
+        log.info(f"Applied resume config: [bold]{config_path}[/]")
+        cfg = merged
+
+    # Auto-set ckpt_path and handle resume_in_place
+    if auto_ckpt and not cfg.get("ckpt_path"):
+        cfg = OmegaConf.merge(cfg, {"ckpt_path": auto_ckpt})
+        log.info(f"[bold #55FF55]Auto checkpoint[/]: {auto_ckpt}")
+
+    if run_dir and cfg.get("resume_in_place", False):
+        OmegaConf.update(cfg, "paths.output_dir", str(run_dir), merge=False)
+        log.info(f"[bold #FFAA33]Resume in place[/]: {run_dir}")
+
+    return cfg
 
 
 def build_trainer(cfg: DictConfig, callbacks: List[Callback], logger: Optional[Logger], log: logging.Logger) -> Trainer:

@@ -119,7 +119,7 @@ checkpoint_validator:
   validate_on_save: true      # Validate after each checkpoint save
   validate_state_dict: true   # Check for NaN/Inf in saved weights
   validate_loadable: false    # Actually try loading (slower but thorough)
-  log_checkpoint_size: true   # Log checkpoint file size
+  log_checkpoint: false   # Log checkpoint file size
 
 # DDP Watchdog - Deadlock detection and zombie process cleanup (for multi-GPU)
 # Enable in multi-GPU experiments or via experiments=multi_gpu_4

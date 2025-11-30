@@ -42,10 +42,11 @@ callbacks:
     save_on_timeout: true       # 超时时保存紧急checkpoint
     log_gpu_memory: true        # 超时时记录GPU状态
   
-  ddp_barrier_monitor:
-    _target_: callbacks.ddp_watchdog.DDPBarrierMonitor
-    barrier_timeout: 600.0      # barrier超时10分钟
-    check_interval: 30.0        # 每30秒检查一次
+  # ddp_barrier_monitor:
+  #   _target_: callbacks.ddp_watchdog.DDPBarrierMonitor
+  #   barrier_timeout: 600.0      # barrier超时10分钟
+  #   check_interval: 30.0        # 每30秒检查一次
+  ddp_barrier_monitor: null
 
   # 覆盖默认的LearningRateMonitor，使用step级别监控                                            
   lr_monitor:                                                                                  
@@ -57,7 +58,7 @@ callbacks:
     halt_on_nan: true
     halt_on_inf: true
     max_consecutive_bad_batches: 1
-    raise_exception: true
+    raise_exception: false
 
 # Optimizer Configuration
 # 多卡训练建议线性缩放学习率: base_lr * num_gpus

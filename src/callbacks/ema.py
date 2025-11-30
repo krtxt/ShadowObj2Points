@@ -1,4 +1,5 @@
 import copy
+import logging
 from typing import Optional, Dict, Any
 
 import torch
@@ -7,10 +8,15 @@ import lightning.pytorch as L
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.utilities import rank_zero_only
 
+logger = logging.getLogger(__name__)
+
+
 class ModelEma(Callback):
     """
     Maintains an Exponential Moving Average (EMA) of the model parameters.
     Swaps weights during validation and testing to evaluate the EMA model.
+    
+    Memory-safe implementation with proper cleanup on exceptions.
     """
     def __init__(
         self,
@@ -25,6 +31,7 @@ class ModelEma(Callback):
         
         self.ema_model: Optional[nn.Module] = None
         self._backup_params: Optional[Dict[str, torch.Tensor]] = None
+        self._is_swapped: bool = False  # Track swap state to prevent leaks
 
     def on_fit_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         """Initialize EMA model copy."""
@@ -93,32 +100,76 @@ class ModelEma(Callback):
     def on_validation_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         """Swap model weights with EMA weights for validation."""
         if self.ema_model is not None:
-            self._swap_weights(pl_module)
+            self._safe_swap_weights(pl_module)
 
     def on_validation_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         """Restore original model weights after validation."""
         if self.ema_model is not None:
-            self._restore_weights(pl_module)
+            self._safe_restore_weights(pl_module)
 
     def on_test_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         """Swap model weights with EMA weights for testing."""
         if self.ema_model is not None:
-            self._swap_weights(pl_module)
+            self._safe_swap_weights(pl_module)
 
     def on_test_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         """Restore original model weights after testing."""
         if self.ema_model is not None:
+            self._safe_restore_weights(pl_module)
+    
+    def on_exception(self, trainer: L.Trainer, pl_module: L.LightningModule, exception: BaseException) -> None:
+        """Ensure weights are restored on exception to prevent memory leaks."""
+        if self._is_swapped:
+            logger.warning("EMA: Exception caught, restoring original weights to prevent leak")
+            self._safe_restore_weights(pl_module)
+
+    def _safe_swap_weights(self, pl_module: L.LightningModule) -> None:
+        """Safely swap weights with state tracking."""
+        if self._is_swapped:
+            logger.warning("EMA: Already swapped, skipping duplicate swap")
+            return
+        try:
+            self._swap_weights(pl_module)
+            self._is_swapped = True
+        except Exception as e:
+            logger.error(f"EMA: Failed to swap weights: {e}")
+            self._cleanup_backup()
+            raise
+
+    def _safe_restore_weights(self, pl_module: L.LightningModule) -> None:
+        """Safely restore weights with guaranteed cleanup."""
+        if not self._is_swapped:
+            # Not swapped, just ensure cleanup
+            self._cleanup_backup()
+            return
+        try:
             self._restore_weights(pl_module)
+        except Exception as e:
+            logger.error(f"EMA: Failed to restore weights: {e}")
+            raise
+        finally:
+            # Always cleanup, even on failure
+            self._is_swapped = False
+            self._cleanup_backup()
+
+    def _cleanup_backup(self) -> None:
+        """Explicitly release backup params memory."""
+        if self._backup_params is not None:
+            # Clear each tensor explicitly
+            for k in list(self._backup_params.keys()):
+                del self._backup_params[k]
+            self._backup_params = None
 
     @torch.no_grad()
     def _swap_weights(self, pl_module: L.LightningModule) -> None:
         """Store current weights and load EMA weights into pl_module."""
-        self._backup_params = {
-            k: v.detach().clone() for k, v in pl_module.state_dict().items()
-        }
+        # Only clone if we don't already have a backup
+        if self._backup_params is None:
+            self._backup_params = {
+                k: v.detach().clone() for k, v in pl_module.state_dict().items()
+            }
         
         # Load EMA state into pl_module
-        # Note: strict=False to allow for slight mismatches if any (though shouldn't happen with deepcopy)
         pl_module.load_state_dict(self.ema_model.state_dict(), strict=False)
 
     @torch.no_grad()
@@ -127,7 +178,6 @@ class ModelEma(Callback):
         if self._backup_params is None:
             return
         pl_module.load_state_dict(self._backup_params, strict=False)
-        self._backup_params = None
 
     def state_dict(self) -> Dict[str, Any]:
         """Save EMA state to checkpoint."""

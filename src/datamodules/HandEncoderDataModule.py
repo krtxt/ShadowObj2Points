@@ -20,7 +20,7 @@ except ImportError:  # pragma: no cover
 # Internal imports (Project specific)
 from .MyDexGraspNet import MyDexGraspNet
 from .MyBodexShadow import MyBodexShadow
-from .CachedHandKeypointDataset import CachedHandKeypointDataset, HDF5HandKeypointDataset
+from .CachedHandKeypointDataset import HDF5HandKeypointDataset, HDF5PointCloudCache
 from utils.shadown_hand_model import (
     HandModel,
     PALM_CENTER_ANCHOR_TRANSLATION,
@@ -742,6 +742,11 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
         data_cfg: Optional[Any] = None,  # Legacy ignored
         return_norm: bool = False,
         scene_pc_return_mode: Optional[str] = None,
+        # New options for cache-only mode
+        cache_only_mode: bool = False,
+        point_cloud_hdf5_path: Optional[str] = None,
+        point_cloud_max_cache_size: int = 200,
+        max_points: int = 4096,
     ) -> None:
         super().__init__()
         
@@ -778,6 +783,13 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
         self.cache_max_shards = self._parse_cache_max(cache_max_shards_in_memory) or self._parse_cache_max(cache_max_shards) or 2
         self._cache_usage_logged: bool = False
         self._cache_meta: Optional[Dict[str, Any]] = None
+        
+        # Cache-only mode config (no base dataset dependency)
+        self.cache_only_mode = bool(cache_only_mode)
+        self.point_cloud_hdf5_path = str(point_cloud_hdf5_path) if point_cloud_hdf5_path else None
+        self.point_cloud_max_cache_size = int(point_cloud_max_cache_size)
+        self.max_points = int(max_points)
+        self._point_cloud_cache = None  # Lazy initialized
 
         # Normalization Config
         self.return_norm = bool(return_norm)
@@ -906,30 +918,51 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
             return MyBodexShadow(**kwargs)
         raise ValueError(f"Unsupported mode: {self.mode}")
 
+    def _get_point_cloud_cache(self) -> Optional[HDF5PointCloudCache]:
+        """Get or create point cloud cache (lazy initialization)."""
+        if self._point_cloud_cache is not None:
+            return self._point_cloud_cache
+        
+        if not self.point_cloud_hdf5_path:
+            return None
+        
+        pc_path = Path(self.point_cloud_hdf5_path)
+        if not pc_path.is_absolute():
+            proj_root = Path(__file__).resolve().parents[2]
+            pc_path = proj_root / pc_path
+        
+        if not pc_path.exists():
+            logger.warning(f"Point cloud HDF5 not found: {pc_path}")
+            return None
+        
+        self._point_cloud_cache = HDF5PointCloudCache(
+            str(pc_path),
+            max_cache_size=self.point_cloud_max_cache_size,
+            max_points=self.max_points,
+        )
+        logger.info(f"HandEncoderDataModule: point cloud cache enabled from {pc_path}")
+        return self._point_cloud_cache
+
     def _make_cached_dataset(self, phase: str) -> Dataset:
         cache_dir = self._resolve_cache_dir()
         h5_path = cache_dir / f"{phase}_cache.h5"
         
-        if h5_path.exists():
-            ds = HDF5HandKeypointDataset(str(h5_path), phase=phase, show_progress=self.cache_show_progress)
-            logger.info("HandEncoderDataModule: cache enabled (phase=%s) using HDF5 file: %s", phase, h5_path)
-            self._cache_usage_logged = True
-        else:
-            # Handle legacy preload argument mapping
-            shards = 'all' if self.cache_preload_to_ram else self.cache_max_shards
-            if self.cache_preload_to_ram:
-                logger.warning("cache_preload_to_ram deprecated; using cache_max_shards_in_memory='all'")
-            ds = CachedHandKeypointDataset(str(cache_dir), phase=phase, max_shards_in_memory=shards, show_progress=self.cache_show_progress)
-            shard_count = None
-            try:
-                shard_count = len(ds.shard_paths)
-            except Exception:
-                shard_count = "unknown"
-            logger.info(
-                "HandEncoderDataModule: cache enabled (phase=%s) using PT shards in %s (shards=%s, pattern=%s)",
-                phase, cache_dir, shard_count, getattr(ds, "shard_pattern", f"{phase}_cache_*.pt")
+        if not h5_path.exists():
+            raise FileNotFoundError(
+                f"HDF5 cache file not found for phase '{phase}': {h5_path}"
             )
-            self._cache_usage_logged = True
+        
+        # Get point cloud cache if configured
+        pc_cache = self._get_point_cloud_cache() if self.cache_only_mode else None
+        
+        ds = HDF5HandKeypointDataset(
+            str(h5_path),
+            phase=phase,
+            show_progress=self.cache_show_progress,
+            point_cloud_cache=pc_cache,
+        )
+        logger.info("HandEncoderDataModule: cache enabled (phase=%s) using HDF5 file: %s", phase, h5_path)
+        self._cache_usage_logged = True
 
         if not self._cache_meta_checked:
             meta = ds.meta
@@ -1015,14 +1048,18 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
         logger.info(
             "HandEncoderDataModule setup: mode=%s, rot_type=%s, trans_anchor=%s, "
             "batch_size=%d, num_workers=%d, pin_memory=%s, prefetch_factor=%d, persistent_workers=%s, "
-            "use_local_pose_only=%s, return_norm=%s, scene_pc_mode=%s, use_cached_keypoints=%s",
+            "use_local_pose_only=%s, return_norm=%s, scene_pc_mode=%s, use_cached_keypoints=%s, cache_only_mode=%s",
             self.mode, self.rot_type, self.trans_anchor,
             self.batch_size, self.num_workers, self.pin_memory, self.prefetch_factor, self.persistent_workers,
             self.use_local_pose_only, self.return_norm, self.scene_pc_return_mode, self.use_cached_keypoints,
+            self.cache_only_mode,
         )
         if not self.use_cached_keypoints and not self._cache_usage_logged:
             logger.info("HandEncoderDataModule: cache disabled (use_cached_keypoints=False); computing keypoints on the fly.")
             self._cache_usage_logged = True
+        
+        if self.cache_only_mode:
+            logger.info("HandEncoderDataModule: CACHE-ONLY MODE - no base dataset dependency")
 
         common_args = dict(
             hand_model=hm, canonical_link_to_unique=c['link_to_unique'],
@@ -1036,62 +1073,86 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
         # Train
         if stage in (None, 'fit') and self.train_dataset is None:
             ph = self.train_phase or self.dataset_kwargs.get('phase', 'all')
-            base = self._make_base_dataset(ph)
-            if len(base) == 0:
-                raise RuntimeError(f"Training dataset empty for phase {ph}. Check split files/assets.")
-            cache = self._make_cached_dataset(ph) if self.use_cached_keypoints else None
-            cache_anchor = None
-            if cache is not None:
-                try:
-                    cache_anchor = cache.meta.get('stored_anchor')
-                except Exception:
-                    cache_anchor = None
-            self.train_dataset = _HandEncoderPreparedDataset(
-                base, cache_dataset=cache, cached_stored_anchor=cache_anchor, **common_args
-            )
-            logger.info(
-                "Train dataset: phase=%s, size=%d", ph, len(base)
-            )
+            
+            if self.cache_only_mode:
+                # Cache-only mode: use cache as the primary dataset
+                cache = self._make_cached_dataset(ph)
+                if len(cache) == 0:
+                    raise RuntimeError(f"Training cache empty for phase {ph}.")
+                cache_anchor = cache.meta.get('stored_anchor') if hasattr(cache, 'meta') else None
+                self.train_dataset = _HandEncoderPreparedDataset(
+                    cache, cache_dataset=None, cached_stored_anchor=cache_anchor, **common_args
+                )
+                logger.info("Train dataset (cache-only): phase=%s, size=%d", ph, len(cache))
+            else:
+                # Normal mode: base + optional cache
+                base = self._make_base_dataset(ph)
+                if len(base) == 0:
+                    raise RuntimeError(f"Training dataset empty for phase {ph}. Check split files/assets.")
+                cache = self._make_cached_dataset(ph) if self.use_cached_keypoints else None
+                cache_anchor = None
+                if cache is not None:
+                    try:
+                        cache_anchor = cache.meta.get('stored_anchor')
+                    except Exception:
+                        cache_anchor = None
+                self.train_dataset = _HandEncoderPreparedDataset(
+                    base, cache_dataset=cache, cached_stored_anchor=cache_anchor, **common_args
+                )
+                logger.info("Train dataset: phase=%s, size=%d", ph, len(base))
+            
             logger.info(
                 "Train DataLoader: batch_size=%d, num_workers=%d, pin_memory=%s, prefetch_factor=%d, "
                 "persistent_workers=%s, drop_last=%s",
                 self.batch_size, self.num_workers, self.pin_memory, self.prefetch_factor,
-                self.persistent_workers, (len(base) > self.batch_size),
+                self.persistent_workers, (len(self.train_dataset) > self.batch_size),
             )
 
         # Validation
         if stage in (None, 'fit', 'validate') and self.val_phase and self.val_dataset is None:
-            base = self._make_base_dataset(self.val_phase)
-            cache = self._make_cached_dataset(self.val_phase) if self.use_cached_keypoints else None
-            cache_anchor = None
-            if cache is not None:
-                try:
-                    cache_anchor = cache.meta.get('stored_anchor')
-                except Exception:
-                    cache_anchor = None
-            self.val_dataset = _HandEncoderPreparedDataset(
-                base, cache_dataset=cache, cached_stored_anchor=cache_anchor, **common_args
-            )
-            logger.info(
-                "Val dataset: phase=%s, size=%d", self.val_phase, len(base)
-            )
+            if self.cache_only_mode:
+                cache = self._make_cached_dataset(self.val_phase)
+                cache_anchor = cache.meta.get('stored_anchor') if hasattr(cache, 'meta') else None
+                self.val_dataset = _HandEncoderPreparedDataset(
+                    cache, cache_dataset=None, cached_stored_anchor=cache_anchor, **common_args
+                )
+                logger.info("Val dataset (cache-only): phase=%s, size=%d", self.val_phase, len(cache))
+            else:
+                base = self._make_base_dataset(self.val_phase)
+                cache = self._make_cached_dataset(self.val_phase) if self.use_cached_keypoints else None
+                cache_anchor = None
+                if cache is not None:
+                    try:
+                        cache_anchor = cache.meta.get('stored_anchor')
+                    except Exception:
+                        cache_anchor = None
+                self.val_dataset = _HandEncoderPreparedDataset(
+                    base, cache_dataset=cache, cached_stored_anchor=cache_anchor, **common_args
+                )
+                logger.info("Val dataset: phase=%s, size=%d", self.val_phase, len(base))
 
         # Test
         if stage in (None, 'test') and self.test_phase and self.test_dataset is None:
-            base = self._make_base_dataset(self.test_phase)
-            cache = self._make_cached_dataset(self.test_phase) if self.use_cached_keypoints else None
-            cache_anchor = None
-            if cache is not None:
-                try:
-                    cache_anchor = cache.meta.get('stored_anchor')
-                except Exception:
-                    cache_anchor = None
-            self.test_dataset = _HandEncoderPreparedDataset(
-                base, cache_dataset=cache, cached_stored_anchor=cache_anchor, **common_args
-            )
-            logger.info(
-                "Test dataset: phase=%s, size=%d", self.test_phase, len(base)
-            )
+            if self.cache_only_mode:
+                cache = self._make_cached_dataset(self.test_phase)
+                cache_anchor = cache.meta.get('stored_anchor') if hasattr(cache, 'meta') else None
+                self.test_dataset = _HandEncoderPreparedDataset(
+                    cache, cache_dataset=None, cached_stored_anchor=cache_anchor, **common_args
+                )
+                logger.info("Test dataset (cache-only): phase=%s, size=%d", self.test_phase, len(cache))
+            else:
+                base = self._make_base_dataset(self.test_phase)
+                cache = self._make_cached_dataset(self.test_phase) if self.use_cached_keypoints else None
+                cache_anchor = None
+                if cache is not None:
+                    try:
+                        cache_anchor = cache.meta.get('stored_anchor')
+                    except Exception:
+                        cache_anchor = None
+                self.test_dataset = _HandEncoderPreparedDataset(
+                    base, cache_dataset=cache, cached_stored_anchor=cache_anchor, **common_args
+                )
+                logger.info("Test dataset: phase=%s, size=%d", self.test_phase, len(base))
 
     def get_graph_constants(self) -> Dict[str, torch.Tensor]:
         if self._prepared_constants is None:

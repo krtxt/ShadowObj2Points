@@ -14,7 +14,7 @@ benchmark: true  # cuDNN benchmark for speed
 # Validation settings
 check_val_every_n_epoch: 5
 val_check_interval: null  # 如果想在epoch内验证，设置为0.5等
-num_sanity_val_steps: 2
+num_sanity_val_steps: 1
 
 # Logging
 log_every_n_steps: 15

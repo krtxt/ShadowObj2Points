@@ -1,37 +1,102 @@
-lambda_pos: 1.0
-lambda_bone: 0.1
-lambda_collision: 0.25
-# lambda_collision: 0.0
+# Deterministic Regression Loss Configuration
+# ============================================
+#
+# Loss Terms Explained:
+# - smooth_l1: Position regression (Huber-like, robust to outliers) - Core reconstruction signal
+# - chamfer: Bidirectional point cloud distance for global shape consistency
+# - direction: Cosine similarity of edge directions - Ensures correct bone orientations
+# - edge_len: Relative edge length error - Maintains skeleton proportions
+# - bone: Bone length deviation from template - Structural regularization
+# - collision: Penetration depth penalty - Prevents hand-object intersection
+#
+# Two Configuration Modes:
+# 1. Simple mode (curriculum.enabled: false): Uses weights section directly
+# 2. Curriculum mode (curriculum.enabled: true): Uses multi-stage scheduling
 
-# Collision-related hyperparameters (same units as world coordinates)
-collision_margin: 0.002
-collision_max_scene_points: 2048
-collision_capsule_radius: 0.008
-collision_capsule_circle_segments: 8
-collision_capsule_cap_segments: 3
+# =============================================================================
+# Default Weights (used when curriculum is disabled)
+# =============================================================================
+weights:
+  smooth_l1: 2.0      # Primary position loss - high weight for accurate keypoint positions
+  chamfer: 1.0        # Shape distribution matching
+  direction: 1.0      # Bone orientation consistency
+  edge_len: 1.0       # Skeleton proportion maintenance
+  bone: 0.0           # Template bone length regularization (often redundant with edge_len)
+  collision: 0.25     # Penetration avoidance (set to 0.0 to disable)
 
-# Reconstruction-style loss terms used by DeterministicRegressionLoss
+# =============================================================================
+# Curriculum Learning Configuration
+# =============================================================================
+curriculum:
+  enabled: true       # Set to true to enable multi-stage training
+  warmup_epochs: 5     # Smooth transition epochs between stages
+
+  # Training Stages:
+  # Stage 1: Learn basic point positions with reconstruction losses
+  # Stage 2: Refine with skeletal structure constraints
+  # Stage 3: Add physics-based collision avoidance
+  stages:
+    - name: reconstruction
+      epochs: [0, 30]
+      weights:
+        smooth_l1: 2.0
+        chamfer: 1.0
+        direction: 0.0    # Lower weight initially - focus on positions first
+        edge_len: 0.0
+        bone: 0.0
+        collision: 0.0    # No collision penalty yet
+
+    - name: structure
+      epochs: [30, 60]
+      weights:
+        smooth_l1: 2.0
+        chamfer: 1.0
+        direction: 1.0    # Full weight for orientation
+        edge_len: 1.0     # Full weight for proportions
+        bone: 0.5         # Introduce bone regularization
+        collision: 0.0    # Still no collision
+
+    - name: physics
+      epochs: [60, null]  # null means until end of training
+      weights:
+        smooth_l1: 2.0
+        chamfer: 1.0
+        direction: 1.0
+        edge_len: 1.0
+        bone: 1.0
+        collision: 0.25   # Finally add collision avoidance
+
+# =============================================================================
+# Reconstruction Loss Sub-configs (enable/disable individual terms)
+# =============================================================================
 recon:
   enabled: true
   smooth_l1:
     enabled: true
-    weight: 1.0
-    beta: 0.01
+    beta: 0.01          # Huber loss transition point
   chamfer:
     enabled: true
-    weight: 1.0
     use_pytorch3d: true
   direction:
     enabled: true
-    weight: 1.0
-    mode: cos
+    mode: cos           # 'cos' or 'l2'
     eps: 1.0e-06
   edge_len:
     enabled: true
-    weight: 1.0
     eps: 1.0e-06
 
-# Validation metrics configuration (can be disabled independently of training loss)
+# =============================================================================
+# Collision Loss Hyperparameters
+# =============================================================================
+collision_margin: 0.002           # Minimum clearance distance (meters)
+collision_max_scene_points: 2048  # Max scene points for collision check
+collision_capsule_radius: 0.008   # Finger capsule radius (meters)
+collision_capsule_circle_segments: 8
+collision_capsule_cap_segments: 3
+
+# =============================================================================
+# Validation Metrics (independent of training loss)
+# =============================================================================
 val_metrics:
   flow:
     enabled: false

@@ -25,7 +25,7 @@ class CheckpointValidator(Callback):
         validate_on_save: Validate checkpoint immediately after saving.
         validate_state_dict: Check state_dict keys and tensor shapes.
         validate_loadable: Actually try to load the checkpoint (slower but thorough).
-        log_checkpoint_size: Log the size of saved checkpoints.
+        log_checkpoint: Log the size of saved checkpoints.
         required_keys: List of keys that must exist in the checkpoint.
     """
 
@@ -34,14 +34,14 @@ class CheckpointValidator(Callback):
         validate_on_save: bool = True,
         validate_state_dict: bool = True,
         validate_loadable: bool = False,
-        log_checkpoint_size: bool = True,
+        log_checkpoint: bool = True,
         required_keys: Optional[list] = None,
     ) -> None:
         super().__init__()
         self.validate_on_save = validate_on_save
         self.validate_state_dict = validate_state_dict
         self.validate_loadable = validate_loadable
-        self.log_checkpoint_size = log_checkpoint_size
+        self.log_checkpoint = log_checkpoint
         self.required_keys = required_keys or ["state_dict", "epoch", "global_step"]
         
         self._last_checkpoint_path: Optional[str] = None
@@ -100,7 +100,7 @@ class CheckpointValidator(Callback):
         if file_size == 0:
             return False, ["Checkpoint file is empty (0 bytes)"]
         
-        if self.log_checkpoint_size:
+        if self.log_checkpoint:
             log.info(f"Checkpoint size: {self._format_size(file_size)}")
         
         try:
@@ -118,9 +118,9 @@ class CheckpointValidator(Callback):
                 errors.extend(state_errors)
             
             # Log checkpoint info
-            if "epoch" in checkpoint:
+            if "epoch" in checkpoint and self.log_checkpoint:
                 log.info(f"Checkpoint epoch: {checkpoint['epoch']}")
-            if "global_step" in checkpoint:
+            if "global_step" in checkpoint and self.log_checkpoint:
                 log.info(f"Checkpoint global_step: {checkpoint['global_step']}")
                 
         except Exception as e:
@@ -171,7 +171,8 @@ class CheckpointValidator(Callback):
             if ckpt_path and Path(ckpt_path).exists():
                 is_valid, errors = self._validate_checkpoint_file(ckpt_path)
                 if is_valid:
-                    log.info(f"Checkpoint ({ckpt_type}) validated successfully: {ckpt_path}")
+                    if self.log_checkpoint:
+                        log.info(f"Checkpoint ({ckpt_type}) validated successfully: {ckpt_path}")
                 else:
                     log.error(f"Checkpoint ({ckpt_type}) validation failed: {errors}")
                     self._validation_errors.extend(errors)

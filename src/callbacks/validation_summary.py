@@ -1,11 +1,19 @@
+import gc
 import math
 from typing import Any, Dict, Optional
 
 import lightning.pytorch as L
 import torch
 from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.utilities.rank_zero import rank_zero_only
 
 from utils.logging_utils import log_validation_summary, console
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
 
 class ValidationSummaryCallback(Callback):
@@ -19,31 +27,80 @@ class ValidationSummaryCallback(Callback):
       - "val/recon_*" for reconstruction metrics
     """
 
+    @rank_zero_only
+    def _log_memory_usage(self, epoch: int) -> Dict[str, float]:
+        """Log memory usage for debugging memory leaks."""
+        mem_info = {}
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # CPU/RAM usage
+        if HAS_PSUTIL:
+            process = psutil.Process()
+            mem_gb = process.memory_info().rss / 1024**3
+            mem_info["ram_gb"] = mem_gb
+            console.print(f"[bold cyan][Memory][/] Epoch {epoch} | RAM: {mem_gb:.2f} GB")
+        
+        # GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            for i in range(torch.cuda.device_count()):
+                allocated = torch.cuda.memory_allocated(i) / 1024**3
+                reserved = torch.cuda.memory_reserved(i) / 1024**3
+                mem_info[f"gpu{i}_allocated_gb"] = allocated
+                mem_info[f"gpu{i}_reserved_gb"] = reserved
+                if HAS_PSUTIL:
+                    console.print(
+                        f"[bold cyan][Memory][/] GPU {i} | "
+                        f"Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB"
+                    )
+        
+        return mem_info
+
     def on_validation_epoch_end(
         self,
         trainer: "L.Trainer",
         pl_module: "L.LightningModule",
     ) -> None:
+        epoch = int(getattr(trainer, "current_epoch", 0))
+        
+        # Log memory usage at the start of validation summary
+        mem_info = self._log_memory_usage(epoch)
+        for key, value in (mem_info or {}).items():
+            pl_module.log(f"memory/{key}", value, on_epoch=True, sync_dist=False)
+        
         # Aggregate basic loss statistics from per-step losses, if available
-        losses_tensor: Optional[torch.Tensor] = None
+        # Supports both List[float] (memory-efficient) and List[Tensor] (legacy)
+        avg_loss = float("nan")
+        loss_std = float("nan")
+        loss_min = float("nan")
+        loss_max = float("nan")
+        num_batches = 0
+        
         if hasattr(pl_module, "_val_step_losses") and pl_module._val_step_losses:
+            losses = pl_module._val_step_losses
             try:
-                losses_tensor = torch.stack(list(pl_module._val_step_losses)).float().detach().cpu()
+                # Check if it's a list of floats or tensors
+                if isinstance(losses[0], (int, float)):
+                    # List of scalars (memory-efficient)
+                    import numpy as np
+                    losses_arr = np.array(losses, dtype=np.float32)
+                    avg_loss = float(np.mean(losses_arr))
+                    loss_std = float(np.std(losses_arr))
+                    loss_min = float(np.min(losses_arr))
+                    loss_max = float(np.max(losses_arr))
+                    num_batches = len(losses_arr)
+                else:
+                    # List of tensors (legacy)
+                    losses_tensor = torch.stack(list(losses)).float().detach().cpu()
+                    avg_loss = float(losses_tensor.mean().item())
+                    loss_std = float(losses_tensor.std(unbiased=False).item())
+                    loss_min = float(losses_tensor.min().item())
+                    loss_max = float(losses_tensor.max().item())
+                    num_batches = int(losses_tensor.numel())
             except Exception:
-                losses_tensor = None
-
-        if losses_tensor is not None and losses_tensor.numel() > 0:
-            avg_loss = float(losses_tensor.mean().item())
-            loss_std = float(losses_tensor.std(unbiased=False).item())
-            loss_min = float(losses_tensor.min().item())
-            loss_max = float(losses_tensor.max().item())
-            num_batches = int(losses_tensor.numel())
-        else:
-            avg_loss = float("nan")
-            loss_std = float("nan")
-            loss_min = float("nan")
-            loss_max = float("nan")
-            num_batches = 0
+                pass
 
         metrics: Dict[str, Any] = dict(trainer.callback_metrics)
 
@@ -115,8 +172,6 @@ class ValidationSummaryCallback(Callback):
         # Currently we do not track set/diversity metrics here
         val_set_metrics: Dict[str, float] = {}
         val_diversity_metrics: Dict[str, float] = {}
-
-        epoch = int(getattr(trainer, "current_epoch", 0))
 
         run_meta = getattr(pl_module, "run_meta", None)
         if getattr(trainer, "is_global_zero", True):

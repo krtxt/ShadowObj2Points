@@ -564,6 +564,9 @@ def _compute_recon_components(
 
     Used both by HandValidationMetricManager and deterministic regression loss
     to avoid code duplication.
+
+    Returns individual loss values WITHOUT weighting - caller is responsible
+    for applying weights via LossScheduler or config.
     """
 
     if not recon_enabled:
@@ -573,56 +576,47 @@ def _compute_recon_components(
 
     device = pred_xyz.device
     metrics: Dict[str, torch.Tensor] = {}
-    total = torch.tensor(0.0, device=device)
 
-    # 1. Smooth L1
+    # 1. Smooth L1 - Primary position regression (robust to outliers)
     if cfg_smooth.get("enabled", True):
         val = F.smooth_l1_loss(pred_xyz, gt_xyz, beta=cfg_smooth.get("beta", 0.01))
         metrics["smooth_l1"] = val
-        total += val * cfg_smooth.get("weight", 1.0)
 
-    # 2. Chamfer
+    # 2. Chamfer - Bidirectional point cloud distance for global shape
     if cfg_chamfer.get("enabled", True):
-        w = cfg_chamfer.get("weight", 1.0)
         if _PYTORCH3D_AVAILABLE and cfg_chamfer.get("use_pytorch3d", True):
             val, _ = chamfer_distance(pred_xyz, gt_xyz, point_reduction="mean", batch_reduction="mean")
             metrics["chamfer"] = val
-            total += val * w
         else:
             metrics["chamfer"] = torch.tensor(float("nan"), device=device)
 
-    # 3. Edge Direction
+    # 3. Edge Direction - Bone orientation consistency
     if cfg_dir.get("enabled", True):
-        w = cfg_dir.get("weight", 1.0)
         eps = cfg_dir.get("eps", 1e-6)
         edges = edge_index.to(device)
-        
+
         v_gt = F.normalize(gt_xyz[:, edges[1]] - gt_xyz[:, edges[0]] + eps, dim=-1)
         v_pd = F.normalize(pred_xyz[:, edges[1]] - pred_xyz[:, edges[0]] + eps, dim=-1)
-        
+
         if cfg_dir.get("mode", "cos") == "l2":
             val = (v_pd - v_gt).norm(p=2, dim=-1).mean()
         else:
             cos_sim = (v_gt * v_pd).sum(dim=-1).clamp(-1, 1)
             val = (1.0 - cos_sim).mean()
-        
-        metrics["direction"] = val
-        total += val * w
 
-    # 4. Edge Length
+        metrics["direction"] = val
+
+    # 4. Edge Length - Skeleton proportion consistency
     if cfg_edge.get("enabled", True):
-        w = cfg_edge.get("weight", 1.0)
         eps = cfg_edge.get("eps", 1e-6)
         edges = edge_index.to(device)
-        
+
         len_gt = (gt_xyz[:, edges[0]] - gt_xyz[:, edges[1]]).norm(dim=-1)
         len_pd = (pred_xyz[:, edges[0]] - pred_xyz[:, edges[1]]).norm(dim=-1)
-        
-        val = ((len_pd - len_gt).abs() / (len_gt + eps)).mean()
-        metrics["edge_len_err"] = val
-        total += val * w
 
-    metrics["total"] = total
+        val = ((len_pd - len_gt).abs() / (len_gt + eps)).mean()
+        metrics["edge_len"] = val
+
     return metrics
 
 
@@ -632,6 +626,19 @@ class DeterministicRegressionLoss(nn.Module):
     Combines reconstruction-style terms (Smooth L1, Chamfer, edge direction,
     and edge length) with optional bone-length regularization and collision
     penalty against the scene point cloud.
+
+    Supports curriculum learning via LossScheduler for multi-stage training:
+    - Stage 1 (Reconstruction): Focus on position regression (smooth_l1, chamfer)
+    - Stage 2 (Structure): Add skeletal constraints (direction, edge_len, bone)
+    - Stage 3 (Physics): Add collision avoidance
+
+    Loss Terms:
+    - smooth_l1: Position regression (Huber-like, robust to outliers)
+    - chamfer: Bidirectional point cloud distance for global shape consistency
+    - direction: Edge direction alignment for correct bone orientations
+    - edge_len: Edge length consistency for skeleton proportions
+    - bone: Bone length regularization vs template
+    - collision: Penetration penalty against scene geometry
     """
 
     def __init__(self, edge_index: torch.Tensor, config: Optional[Dict] = None) -> None:
@@ -643,7 +650,7 @@ class DeterministicRegressionLoss(nn.Module):
 
         cfg = config or {}
 
-        # Recon-style loss configuration (mirrors HandValidationMetricManager)
+        # Recon-style loss configuration
         self.recon = cfg.get("recon", {})
         self.recon_enabled = self.recon.get("enabled", True)
 
@@ -652,15 +659,7 @@ class DeterministicRegressionLoss(nn.Module):
         self.cfg_dir = dict(self.recon.get("direction", {}))
         self.cfg_edge = dict(self.recon.get("edge_len", {}))
 
-        # Backwards-compat: allow a top-level lambda_pos to scale SmoothL1
-        lambda_pos = float(cfg.get("lambda_pos", 1.0))
-        if lambda_pos != 1.0:
-            base_w = float(self.cfg_smooth.get("weight", 1.0))
-            self.cfg_smooth["weight"] = base_w * lambda_pos
-
-        # Structural / collision terms
-        self.lambda_bone = float(cfg.get("lambda_bone", 0.0))
-        self.lambda_collision = float(cfg.get("lambda_collision", 0.0))
+        # Collision hyperparameters
         self.collision_margin = float(cfg.get("collision_margin", 0.0))
         self.collision_capsule_radius = float(cfg.get("collision_capsule_radius", 0.008))
         self.collision_capsule_circle_segments = int(cfg.get("collision_capsule_circle_segments", 8))
@@ -669,13 +668,54 @@ class DeterministicRegressionLoss(nn.Module):
         max_pts = int(cfg.get("collision_max_scene_points", 0))
         self.collision_max_scene_points = max_pts if max_pts > 0 else None
 
+        # Initialize LossScheduler for curriculum learning
+        from .loss_scheduler import LossScheduler, DEFAULT_WEIGHTS
+
+        curriculum_cfg = cfg.get("curriculum", {})
+        curriculum_enabled = curriculum_cfg.get("enabled", False)
+
+        # Build default weights from config (for non-curriculum mode)
+        default_weights = DEFAULT_WEIGHTS.copy()
+        # Override with legacy config values if present
+        if "lambda_pos" in cfg:
+            default_weights["smooth_l1"] = float(cfg["lambda_pos"]) * default_weights["smooth_l1"]
+        if "lambda_bone" in cfg:
+            default_weights["bone"] = float(cfg["lambda_bone"])
+        if "lambda_collision" in cfg:
+            default_weights["collision"] = float(cfg["lambda_collision"])
+        # Override with explicit weights section if present
+        if "weights" in cfg:
+            for k, v in cfg["weights"].items():
+                if k in default_weights:
+                    default_weights[k] = float(v)
+
+        self.scheduler = LossScheduler(
+            enabled=curriculum_enabled,
+            stages=curriculum_cfg.get("stages", None),
+            warmup_epochs=curriculum_cfg.get("warmup_epochs", 5),
+            default_weights=default_weights,
+        )
+
+        self._current_epoch = 0
+        logger.info(f"DeterministicRegressionLoss initialized: {self.scheduler}")
+
+    def set_epoch(self, epoch: int) -> None:
+        """Update current epoch for curriculum scheduling."""
+        self._current_epoch = epoch
+        self.scheduler.set_epoch(epoch)
+
+    def get_current_weights(self) -> Dict[str, float]:
+        """Get current loss weights based on training progress."""
+        return self.scheduler.get_weights()
+
     def _compute_bone_loss(
         self,
         pred_xyz: torch.Tensor,
         edge_rest_lengths: Optional[torch.Tensor],
         active_edge_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.lambda_bone <= 0.0 or edge_rest_lengths is None:
+        """Compute bone length regularization loss (unweighted)."""
+        if edge_rest_lengths is None:
             return torch.tensor(0.0, device=pred_xyz.device)
 
         i, j = self.edge_index
@@ -695,11 +735,8 @@ class DeterministicRegressionLoss(nn.Module):
         denorm_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         active_edge_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if (
-            self.lambda_collision <= 0.0
-            or scene_pc is None
-            or scene_pc.shape[1] == 0
-        ):
+        """Compute penetration loss against scene geometry (unweighted)."""
+        if scene_pc is None or scene_pc.shape[1] == 0:
             return torch.tensor(0.0, device=pred_xyz.device)
 
         # Work in world space for physical margin if denorm_fn is provided
@@ -840,6 +877,7 @@ class DeterministicRegressionLoss(nn.Module):
         active_edge_mask: Optional[torch.Tensor] = None,
         scene_pc: Optional[torch.Tensor] = None,
         denorm_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        epoch: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Compute total deterministic regression loss and its components.
 
@@ -851,8 +889,20 @@ class DeterministicRegressionLoss(nn.Module):
             scene_pc: Scene point cloud (B, P, 3) in same space as pred_xyz.
             denorm_fn: Optional function mapping normalized coords -> world coords
                 for collision loss when working in normalized space.
-        """
+            epoch: Current training epoch for curriculum scheduling.
 
+        Returns:
+            total: Weighted sum of all loss terms.
+            components: Dictionary of unweighted individual loss values.
+        """
+        # Update epoch if provided
+        if epoch is not None:
+            self.set_epoch(epoch)
+
+        # Get current weights from scheduler
+        weights = self.scheduler.get_weights()
+
+        # Compute reconstruction-style losses (unweighted values)
         recon_metrics = _compute_recon_components(
             edge_index=self.edge_index,
             pred_xyz=pred_xyz,
@@ -867,12 +917,13 @@ class DeterministicRegressionLoss(nn.Module):
         device = pred_xyz.device
         zero = torch.tensor(0.0, device=device)
 
-        smooth = recon_metrics.get("smooth_l1", zero)
+        # Extract individual loss values
+        smooth_l1 = recon_metrics.get("smooth_l1", zero)
         chamfer = recon_metrics.get("chamfer", zero)
         direction = recon_metrics.get("direction", zero)
-        edge_len_err = recon_metrics.get("edge_len_err", zero)
-        recon_total = recon_metrics.get("total", zero)
+        edge_len = recon_metrics.get("edge_len", zero)
 
+        # Compute structural/physics losses (unweighted)
         bone = self._compute_bone_loss(pred_xyz, edge_rest_lengths, active_edge_mask)
         collision = self._compute_collision_loss(
             pred_xyz,
@@ -881,16 +932,24 @@ class DeterministicRegressionLoss(nn.Module):
             active_edge_mask=active_edge_mask,
         )
 
-        total = recon_total + self.lambda_bone * bone + self.lambda_collision * collision
+        # Apply weights and sum
+        total = (
+            weights["smooth_l1"] * smooth_l1
+            + weights["chamfer"] * chamfer
+            + weights["direction"] * direction
+            + weights["edge_len"] * edge_len
+            + weights["bone"] * bone
+            + weights["collision"] * collision
+        )
 
+        # Return unweighted components for logging/analysis
         components: Dict[str, torch.Tensor] = {
-            "smooth_l1": smooth,
+            "smooth_l1": smooth_l1,
             "chamfer": chamfer,
             "direction": direction,
-            "edge_len_err": edge_len_err,
+            "edge_len": edge_len,
             "bone": bone,
             "collision": collision,
-            "recon_total": recon_total,
         }
 
         return total, components

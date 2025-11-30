@@ -28,6 +28,13 @@ auto_resume: false           # Set to true to resume from the last checkpoint in
 auto_resume_config: false
 validate_checkpoint: true    # Validate checkpoint integrity before resuming
 
+# Resume from a specific run directory (supports relative paths from project root)
+# Example: resume_run_dir=outputs/exp_xxx/2025-11-29_21-31-51
+# This will load last.ckpt and .hydra/config.yaml from the specified directory
+resume_run_dir: null
+# If true, resume training in the original directory (keeps checkpoint paths consistent)
+resume_in_place: false
+
 # Common hyperparameters (可被其他配置引用)
 batch_size: 128
 rot_type: r6d  # 'quat' | 'r6d' | 'euler' | 'axis'

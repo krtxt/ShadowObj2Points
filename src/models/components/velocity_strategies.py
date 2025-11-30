@@ -495,7 +495,7 @@ class GroupRigidParamVelocityStrategy(VelocityStrategyBase):
         orig_dtype = hand_tokens_out.dtype
         
         # Use float32 for numerical stability in rotation computation and velocity
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast(device_type="cuda", enabled=False):
             g_tokens_f32 = g_tokens.float()
             params = self.group_head(g_tokens_f32)    # (B, G, 9)
             # Clamp to prevent extreme values in bf16-mixed training

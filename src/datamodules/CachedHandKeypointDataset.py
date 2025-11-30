@@ -1,5 +1,6 @@
 import bisect
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -12,8 +13,125 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 
 
+class HDF5PointCloudCache:
+    """Lazy-loading point cloud cache from HDF5 file.
+    
+    This class provides efficient point cloud access with:
+    - Lazy file opening (only opens when first accessed)
+    - Per-object caching with configurable cache size
+    - Scale extraction from scene_id
+    """
+    
+    def __init__(
+        self,
+        file_path: str,
+        max_cache_size: int = 100,
+        max_points: int = 4096,
+    ) -> None:
+        self.file_path = Path(file_path)
+        self.max_cache_size = max_cache_size
+        self.max_points = max_points
+        self._file: Optional[h5py.File] = None
+        self._cache: Dict[str, np.ndarray] = {}
+        self._cache_order: List[str] = []
+        self._available_objects: Optional[set] = None
+    
+    def _ensure_open(self) -> h5py.File:
+        if self._file is None:
+            if not self.file_path.exists():
+                raise FileNotFoundError(f"Point cloud HDF5 not found: {self.file_path}")
+            self._file = h5py.File(self.file_path, "r")
+            if "point_clouds" not in self._file:
+                raise KeyError(f"HDF5 missing 'point_clouds' group: {self.file_path}")
+            self._available_objects = set(self._file["point_clouds"].keys())
+        return self._file
+    
+    def _extract_scale(self, scene_id: str) -> float:
+        """Extract scale from scene_id format: '{obj_code}_scale{value}'"""
+        match = re.search(r"_scale([\d.]+)$", scene_id)
+        return float(match.group(1)) if match else 1.0
+    
+    def get(self, obj_code: str, scene_id: str) -> Optional[torch.Tensor]:
+        """Get point cloud for object, applying scale from scene_id.
+        
+        Returns only XYZ coordinates (first 3 columns), shape (N, 3).
+        """
+        f = self._ensure_open()
+        
+        if obj_code not in self._available_objects:
+            return None
+        
+        # Check cache
+        cache_key = f"{obj_code}_{scene_id}"
+        if cache_key in self._cache:
+            return torch.from_numpy(self._cache[cache_key].copy())
+        
+        # Load from HDF5
+        try:
+            pc = f["point_clouds"][obj_code][:]
+            scale = self._extract_scale(scene_id)
+            
+            # Apply scale to XYZ (first 3 columns)
+            pc = pc.astype(np.float32)
+            pc[:, :3] *= scale
+            
+            # Subsample if needed
+            valid_mask = np.any(pc[:, :3] != 0, axis=1)
+            pc = pc[valid_mask]
+            
+            if len(pc) > self.max_points:
+                indices = np.random.permutation(len(pc))[:self.max_points]
+                pc = pc[indices]
+            
+            # Only keep XYZ (first 3 columns)
+            pc = pc[:, :3]
+            
+            # Update cache with LRU eviction
+            if len(self._cache) >= self.max_cache_size:
+                oldest = self._cache_order.pop(0)
+                self._cache.pop(oldest, None)
+            
+            self._cache[cache_key] = pc
+            self._cache_order.append(cache_key)
+            
+            return torch.from_numpy(pc.copy())
+        except Exception as e:
+            logger.warning(f"Failed to load point cloud for {obj_code}: {e}")
+            return None
+    
+    def clear_cache(self) -> None:
+        """Explicitly clear the LRU cache to free memory."""
+        self._cache.clear()
+        self._cache_order.clear()
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Return cache statistics for monitoring."""
+        return {
+            "cache_size": len(self._cache),
+            "max_cache_size": self.max_cache_size,
+            "cache_memory_mb": sum(pc.nbytes for pc in self._cache.values()) / 1024 / 1024,
+        }
+    
+    def close(self) -> None:
+        """Close file and clear cache."""
+        self.clear_cache()
+        if self._file is not None:
+            try:
+                self._file.close()
+            except Exception:
+                pass
+            self._file = None
+    
+    def __del__(self) -> None:
+        self.close()
+
+
 class CachedHandKeypointDataset(Dataset):
-    """Dataset that streams precomputed hand keypoint caches from disk."""
+    """Deprecated PT-shard based cache dataset.
+
+    This class is kept for backward compatibility but is no longer supported.
+    Only HDF5HandKeypointDataset should be used for hand keypoint caches.
+    """
 
     def __init__(
         self,
@@ -24,207 +142,10 @@ class CachedHandKeypointDataset(Dataset):
         show_progress: bool = True,
     ) -> None:
         super().__init__()
-        self.cache_dir = Path(cache_dir)
-        self.phase = phase
-        self.shard_pattern = shard_pattern or f"{phase}_cache_*.pt"
-        self._max_shards_arg = max_shards_in_memory
-        self.max_shards_in_memory = 2  # finalized after shard scan param parse
-        self.show_progress = bool(show_progress)
-        self.preload_all = False
-
-        if not self.cache_dir.exists():
-            raise FileNotFoundError(f"Cache directory not found: {self.cache_dir}")
-
-        self.shard_paths = sorted(self.cache_dir.glob(self.shard_pattern))
-        if not self.shard_paths:
-            raise FileNotFoundError(
-                f"No cache shards matching '{self.shard_pattern}' in {self.cache_dir}"
-            )
-        # finalize memory policy from max_shards_in_memory argument
-        arg = self._max_shards_arg
-        if isinstance(arg, str):
-            key = arg.strip().lower()
-            if key in ("all", "full", "infinite", "inf", "max"):
-                self.preload_all = True
-                self.max_shards_in_memory = len(self.shard_paths)
-            else:
-                try:
-                    self.max_shards_in_memory = max(1, int(arg))
-                except Exception:
-                    self.max_shards_in_memory = 2
-        else:
-            try:
-                v = int(arg)
-                if v <= 0:
-                    self.preload_all = True
-                    self.max_shards_in_memory = len(self.shard_paths)
-                else:
-                    self.max_shards_in_memory = max(1, v)
-            except Exception:
-                self.max_shards_in_memory = 2
-
-        self._meta: Optional[Dict[str, Any]] = None
-        self._shard_lengths: List[int] = []
-        self._cumulative: List[int] = []
-        total = 0
-        self._in_memory_samples: Optional[List[Dict[str, Any]]] = None
-
-        def _is_main_proc() -> bool:
-            try:
-                return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
-            except Exception:
-                return True
-
-        use_progress = self.show_progress and _is_main_proc()
-        progress_iter = None
-        if self.preload_all and use_progress:
-            try:
-                from rich.progress import Progress, BarColumn, TimeElapsedColumn, TimeRemainingColumn
-                progress = Progress(
-                    "[bold blue]Scanning cache shards",
-                    BarColumn(),
-                    "[progress.percentage]{task.percentage:>3.0f}%",
-                    "•",
-                    TimeElapsedColumn(),
-                    "|",
-                    TimeRemainingColumn(),
-                    transient=True,
-                    refresh_per_second=5,
-                )
-                with progress:
-                    task = progress.add_task(f"{self.phase}: {len(self.shard_paths)} shards", total=len(self.shard_paths))
-                    self._in_memory_samples = []
-                    for idx, path in enumerate(self.shard_paths):
-                        payload = torch.load(path, map_location="cpu")
-                        samples: Sequence[Dict[str, Any]] = payload.get("samples", [])
-                        length = len(samples)
-                        self._shard_lengths.append(length)
-                        total += length
-                        self._cumulative.append(total)
-                        if self._meta is None:
-                            self._meta = payload.get("meta", {})
-                        # Normalize keys upfront for speed parity with lazy path
-                        for s in samples:
-                            if 'xyz_local' in s and 'cached_xyz_local' not in s:
-                                s['cached_xyz_local'] = s.pop('xyz_local')
-                            if 'se3' in s and 'cached_se3' not in s:
-                                s['cached_se3'] = s.pop('se3')
-                            self._in_memory_samples.append(s)
-                        del samples
-                        del payload
-                        progress.advance(task)
-            except Exception:
-                # Fallback to simple logging
-                self._in_memory_samples = []
-                for idx, path in enumerate(self.shard_paths):
-                    payload = torch.load(path, map_location="cpu")
-                    samples: Sequence[Dict[str, Any]] = payload.get("samples", [])
-                    length = len(samples)
-                    self._shard_lengths.append(length)
-                    total += length
-                    self._cumulative.append(total)
-                    if self._meta is None:
-                        self._meta = payload.get("meta", {})
-                    for s in samples:
-                        if 'xyz_local' in s and 'cached_xyz_local' not in s:
-                            s['cached_xyz_local'] = s.pop('xyz_local')
-                        if 'se3' in s and 'cached_se3' not in s:
-                            s['cached_se3'] = s.pop('se3')
-                        self._in_memory_samples.append(s)
-                    del samples
-                    del payload
-                    if (idx + 1) % 25 == 0:
-                        logger.info("Scanning cache shards %d/%d... (cum=%d)", idx + 1, len(self.shard_paths), total)
-        else:
-            for idx, path in enumerate(self.shard_paths):
-                payload = torch.load(path, map_location="cpu")
-                samples: Sequence[Dict[str, Any]] = payload.get("samples", [])
-                length = len(samples)
-                self._shard_lengths.append(length)
-                total += length
-                self._cumulative.append(total)
-                if self._meta is None:
-                    self._meta = payload.get("meta", {})
-                if self.preload_all:
-                    if self._in_memory_samples is None:
-                        self._in_memory_samples = []
-                    for s in samples:
-                        if 'xyz_local' in s and 'cached_xyz_local' not in s:
-                            s['cached_xyz_local'] = s.pop('xyz_local')
-                        if 'se3' in s and 'cached_se3' not in s:
-                            s['cached_se3'] = s.pop('se3')
-                        self._in_memory_samples.append(s)
-                del samples
-                del payload
-                if self.show_progress and (idx + 1) % 50 == 0:
-                    logger.info("Scanning cache shards %d/%d... (cum=%d)", idx + 1, len(self.shard_paths), total)
-
-        if total == 0:
-            raise RuntimeError(
-                f"Cache directory {self.cache_dir} does not contain any samples for phase '{phase}'."
-            )
-
-        self._total = total
-        self._loaded_shards: Dict[int, List[Dict[str, Any]]] = {}
-        self._lru: List[int] = []
-        if self.preload_all:
-            logger.info(
-                "CachedHandKeypointDataset initialized: phase=%s, shards=%d, total_samples=%d (preloaded to RAM)",
-                phase,
-                len(self.shard_paths),
-                self._total,
-            )
-        else:
-            logger.info(
-                "CachedHandKeypointDataset initialized: phase=%s, shards=%d, total_samples=%d",
-                phase,
-                len(self.shard_paths),
-                self._total,
-            )
-
-    @property
-    def meta(self) -> Dict[str, Any]:
-        return dict(self._meta or {})
-
-    def __len__(self) -> int:
-        return self._total
-
-    def _locate_shard(self, idx: int) -> int:
-        shard_idx = bisect.bisect_right(self._cumulative, idx)
-        if shard_idx >= len(self.shard_paths):
-            raise IndexError(f"Index {idx} out of bounds (total={self._total})")
-        return shard_idx
-
-    def _load_shard(self, shard_idx: int) -> List[Dict[str, Any]]:
-        if shard_idx in self._loaded_shards:
-            return self._loaded_shards[shard_idx]
-
-        payload = torch.load(self.shard_paths[shard_idx], map_location="cpu")
-        samples: List[Dict[str, Any]] = payload.get("samples", [])
-        self._loaded_shards[shard_idx] = samples
-        self._lru.append(shard_idx)
-        if len(self._lru) > self.max_shards_in_memory:
-            drop_idx = self._lru.pop(0)
-            if drop_idx in self._loaded_shards:
-                del self._loaded_shards[drop_idx]
-        return samples
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        if idx < 0 or idx >= self._total:
-            raise IndexError(f"Index {idx} out of bounds (total={self._total})")
-        if self._in_memory_samples is not None:
-            sample = dict(self._in_memory_samples[idx])
-            return sample
-        shard_idx = self._locate_shard(idx)
-        prev_cum = self._cumulative[shard_idx - 1] if shard_idx > 0 else 0
-        local_idx = idx - prev_cum
-        shard_samples = self._load_shard(shard_idx)
-        sample = dict(shard_samples[local_idx])
-        if 'xyz_local' in sample and 'cached_xyz_local' not in sample:
-            sample['cached_xyz_local'] = sample.pop('xyz_local')
-        if 'se3' in sample and 'cached_se3' not in sample:
-            sample['cached_se3'] = sample.pop('se3')
-        return sample
+        raise RuntimeError(
+            "CachedHandKeypointDataset (PT shards) is deprecated and disabled. "
+            "Please use HDF5HandKeypointDataset with '<phase>_cache.h5' files instead."
+        )
 
 
 class HDF5HandKeypointDataset(Dataset):
@@ -241,13 +162,23 @@ class HDF5HandKeypointDataset(Dataset):
 
     File-level attrs should contain the same keys as the original PT cache
     "meta" dict (e.g., stored_anchor, source_anchor, hand_scale, rot_type).
+    
+    Optionally supports loading point clouds from a separate HDF5 file via
+    point_cloud_cache parameter.
     """
 
-    def __init__(self, file_path: str, phase: Optional[str] = None, show_progress: bool = True) -> None:
+    def __init__(
+        self,
+        file_path: str,
+        phase: Optional[str] = None,
+        show_progress: bool = True,
+        point_cloud_cache: Optional[HDF5PointCloudCache] = None,
+    ) -> None:
         super().__init__()
         self.file_path = Path(file_path)
         self.phase = phase
         self.show_progress = bool(show_progress)
+        self.point_cloud_cache = point_cloud_cache
         if not self.file_path.exists():
             raise FileNotFoundError(f"HDF5 cache file not found: {self.file_path}")
 
@@ -313,6 +244,15 @@ class HDF5HandKeypointDataset(Dataset):
         }
         if norm_pose is not None and np.asarray(norm_pose).size > 0:
             sample["norm_pose"] = torch.from_numpy(np.asarray(norm_pose, dtype=np.float32))
+        
+        # Load point cloud if cache is available
+        if self.point_cloud_cache is not None:
+            pc = self.point_cloud_cache.get(obj_code, scene_id)
+            if pc is not None:
+                sample["scene_pc"] = pc
+            else:
+                sample["scene_pc"] = torch.zeros((0, 3), dtype=torch.float32)
+        
         return sample
 
     def __del__(self) -> None:  # pragma: no cover - best-effort cleanup

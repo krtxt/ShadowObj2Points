@@ -100,4 +100,16 @@ proj_num_iters: 2
 # proj_max_corr: 每次投影的最大相对修正幅度（防止数值不稳定）
 proj_max_corr: 0.2
 
-# EMA & Visualization moved to callbacks
+# -----------------------------------------------------------------------------
+# 6. Validation sampling config (memory optimization)
+# -----------------------------------------------------------------------------
+# 验证时的 recon metrics 需要完整 ODE 采样，开销很大。
+# 指定想要采样的 batch 数量，系统会自动均匀分布在整个验证集上。
+#
+# val_num_sample_batches: 验证时采样多少个 batch 来计算 recon metrics
+#   - 自动计算均匀间隔: stride = total_val_batches / val_num_sample_batches
+#   - 例如: 验证集 100 batch, val_num_sample_batches=10 → 每 10 个 batch 采样一次
+#   - 第一个 epoch 会自动探测验证集大小，之后均匀采样
+#   - 总采样样本数 = val_num_sample_batches * batch_size
+val_num_sample_batches: 10
+

@@ -97,6 +97,8 @@ class HandFlowMatchingDiT(L.LightningModule):
         state_projection_kwargs: Optional[Dict] = None,
         use_norm_data: bool = False,
         use_per_point_gaussian_noise: bool = False,
+        # Validation sampling config
+        val_num_sample_batches: int = 10,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["graph_consts", "backbone", "hand_encoder", "dit"])
@@ -115,7 +117,11 @@ class HandFlowMatchingDiT(L.LightningModule):
         self._setup_loss(loss_cfg)
         self._setup_val_metrics(loss_cfg)
         self.optimizer_cfg = optimizer_cfg
-        self._val_step_losses: List[torch.Tensor] = []
+        self._val_step_losses: List[float] = []  # Store scalars, not tensors
+        # Validation sampling config: how many batches to sample for recon metrics
+        self.val_num_sample_batches: int = val_num_sample_batches
+        self._val_total_batches: int = 0  # Discovered during first validation epoch
+        self._val_sample_count: int = 0   # Counter for current epoch
         self._log_model_init_summary()
 
     def _validate_norm_bounds(self) -> None:
@@ -653,9 +659,14 @@ class HandFlowMatchingDiT(L.LightningModule):
         flow_edge_len_err: torch.Tensor,
         scene_pc: torch.Tensor,
         raw_target: torch.Tensor,
-        batch_size: int
+        batch_size: int,
+        batch_idx: int = 0,
     ) -> None:
-        """Compute and log validation metrics."""
+        """Compute and log validation metrics.
+        
+        Note: Sampling-based recon metrics are only computed on first few batches
+        to avoid excessive memory usage during validation.
+        """
         if self.val_metric_manager is None:
             return
 
@@ -676,22 +687,45 @@ class HandFlowMatchingDiT(L.LightningModule):
             )
 
         # Sampling-based reconstruction metrics (full keypoint prediction)
-        with torch.no_grad():
-            pred_xyz = self.sample(scene_pc)
-            recon_metrics = self.val_metric_manager.compute_recon_metrics(
-                pred_xyz=pred_xyz,
-                gt_xyz=raw_target,
+        # Uniformly sample val_num_sample_batches across the validation set
+        num_sample_batches = getattr(self, "val_num_sample_batches", 10)
+        
+        # Compute stride based on discovered total batches (from previous epoch)
+        # First epoch: use batch_idx to estimate, sample more conservatively
+        if self._val_total_batches > 0:
+            # After first epoch: we know the total, compute uniform stride
+            stride = max(1, self._val_total_batches // num_sample_batches)
+            should_sample = (batch_idx % stride == 0) and (self._val_sample_count < num_sample_batches)
+        else:
+            # First epoch: sample first few batches, then every ~20th batch as fallback
+            fallback_stride = 20
+            should_sample = (batch_idx < 3) or (
+                batch_idx % fallback_stride == 0 and self._val_sample_count < num_sample_batches
             )
-        for name, value in recon_metrics.items():
-            self.log(
-                f"val/recon_{name}",
-                value,
-                prog_bar=False,
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=batch_size,
-            )
+        
+        # Track max batch_idx to learn total batches for next epoch
+        self._val_total_batches = max(self._val_total_batches, batch_idx + 1)
+        
+        if should_sample:
+            self._val_sample_count += 1
+            with torch.no_grad():
+                pred_xyz = self.sample(scene_pc)
+                recon_metrics = self.val_metric_manager.compute_recon_metrics(
+                    pred_xyz=pred_xyz,
+                    gt_xyz=raw_target,
+                )
+                # Explicitly delete to help GC
+                del pred_xyz
+            for name, value in recon_metrics.items():
+                self.log(
+                    f"val/recon_{name}",
+                    value,
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=batch_size,
+                )
 
     def _record_trajectory_state(
         self, 
@@ -715,6 +749,7 @@ class HandFlowMatchingDiT(L.LightningModule):
     def on_validation_epoch_start(self) -> None:
         """Reset validation loss buffer at the start of each epoch."""
         self._val_step_losses = []
+        self._val_sample_count = 0  # Reset sample counter for this epoch
 
     def validation_step(self, batch: Dict[str, Any], batch_idx: int) -> None:
         """Validation step for flow matching and reconstruction metrics.
@@ -740,7 +775,7 @@ class HandFlowMatchingDiT(L.LightningModule):
                 )
                 return
 
-            self._val_step_losses.append(loss.detach())
+            self._val_step_losses.append(float(loss.detach().item()))  # Store scalar, not tensor
 
             self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch_size)
             self.log("val_loss", loss, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch_size)
@@ -771,7 +806,7 @@ class HandFlowMatchingDiT(L.LightningModule):
                 batch_size=batch_size,
             )
 
-            self._compute_val_metrics(loss_dict, flow_edge_len_err, scene_pc, raw_target, batch_size)
+            self._compute_val_metrics(loss_dict, flow_edge_len_err, scene_pc, raw_target, batch_size, batch_idx)
 
         except Exception as e:
             self.log("val/error_flag", 1.0, prog_bar=True, on_step=False, on_epoch=True)

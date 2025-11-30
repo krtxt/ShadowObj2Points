@@ -4,10 +4,10 @@ mode: dexgraspnet
 
 # HandEncoderDataModule constructor args
 batch_size: ${batch_size}
-num_workers: 16
+num_workers: 4               # 降低 worker 数量以减少内存占用
 pin_memory: true
 prefetch_factor: 2
-persistent_workers: true
+persistent_workers: false    # 禁用持久化 worker 以减少内存
 rot_type: ${rot_type}           # 'quat' | 'r6d' | 'euler' | 'axis'
 trans_anchor: ${hand_anchor}    # 'base' | 'palm_center' | 'mjcf'
 hand_scale: 1.0
@@ -20,6 +20,13 @@ return_norm: true
 norm_xyz_stats_path: ${paths.data_dir}/DexGraspNet/handencoder_scene_xyz_bounds.json
 xyz_per_point_stats_path: ${paths.data_dir}/DexGraspNet/handencoder_xyz_per_point_stats.json
 
+# Cache-only mode: 完全从 HDF5 缓存加载，不依赖原始数据集
+# 启用此模式可大幅减少内存使用 (避免加载 1.3GB pt 文件和 2.5GB 点云 pickle)
+cache_only_mode: true
+point_cloud_hdf5_path: ${paths.data_dir}/DexGraspNet/object_pcds.h5
+point_cloud_max_cache_size: 200  # LRU 缓存大小
+max_points: 4096
+
 # Optional phases for splits
 train_phase: train
 val_phase: test
@@ -31,6 +38,7 @@ connect_forearm: true
 add_middle_distal: true
 
 # Passed through to the underlying dataset (MyDexGraspNet)
+# 当 cache_only_mode=true 时，这些参数不会被使用
 dataset_kwargs:
   asset_dir: ${paths.data_dir}/DexGraspNet
   phase: all

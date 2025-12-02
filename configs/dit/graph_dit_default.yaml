@@ -18,7 +18,7 @@ ff_bias: true
 dropout: 0.0
 
 # Activation function used inside FeedForward blocks
-# Options follow diffusers: gelu | geglu | approx_gelu
+# Options follow diffusers: gelu | geglu | approx_gelu | swiglu
 activation_fn: geglu
 
 # Whether to apply qk normalization in attention
@@ -28,7 +28,15 @@ qk_norm_type: layer
 # Normalization type for the main blocks: 'layer' | 'rms'
 norm_type: layer
 
+# Epsilon for numerical stability in normalization layers
+norm_eps: 1.0e-6
+
 # Structural bias configuration used by GraphAttentionBias
 graph_bias:
   enabled: true
   d_struct: 8
+
+# Optional hand->scene distance bias added to cross-attention logits
+hand_scene_bias:
+  enabled: false   # default off for backward compatibility
+  gamma: 1.0       # scale for negative distance bias (bias = -gamma * dist)

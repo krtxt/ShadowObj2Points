@@ -355,21 +355,33 @@ class HandFlowMatchingDiT(L.LightningModule):
 
         self.val_metric_manager = HandValidationMetricManager(edge_index=self.edge_index, config=val_cfg)
 
-    def encode_scene_tokens(self, scene_pc: torch.Tensor) -> torch.Tensor:
+    def encode_scene_tokens(self, scene_pc: torch.Tensor, return_xyz: bool = False):
         """Encode scene point cloud into tokens.
 
         Args:
-            scene_pc: Scene point cloud of shape (B, P, 3). Returns zero tokens if empty.
+            scene_pc: Scene point cloud of shape (B, P, C) where C >= 3.
+                      C=3 for xyz only, C=6 for xyz+normals.
+                      If backbone doesn't support normals, automatically truncates to xyz.
+            return_xyz: If True, also return token xyz (when available).
 
         Returns:
-            Scene tokens of shape (B, K, d_model)
+            Scene tokens of shape (B, K, d_model); optionally token xyz.
         """
         if scene_pc.numel() == 0 or scene_pc.shape[1] == 0:
             B = scene_pc.shape[0]
-            return torch.zeros(B, 1, self.hparams.d_model, device=scene_pc.device, dtype=scene_pc.dtype)
+            empty = torch.zeros(B, 1, self.hparams.d_model, device=scene_pc.device, dtype=scene_pc.dtype)
+            return (empty, None) if return_xyz else empty
+        
+        # Check if backbone supports normals; if not, truncate to xyz only
+        backbone_uses_normals = getattr(self.backbone, 'use_scene_normals', False)
+        if not backbone_uses_normals and scene_pc.shape[-1] > 3:
+            scene_pc = scene_pc[..., :3]
+        
         backbone_out = self.backbone(scene_pc)
+        scene_xyz = None
         if isinstance(backbone_out, tuple):
             xyz, feats = backbone_out[0], backbone_out[1]
+            scene_xyz = xyz
             if not isinstance(feats, torch.Tensor) or feats.dim() != 3:
                 raise TypeError("Backbone features must be a 3D tensor when returning a tuple (xyz, features)")
             if not isinstance(xyz, torch.Tensor) or xyz.dim() != 3:
@@ -413,7 +425,8 @@ class HandFlowMatchingDiT(L.LightningModule):
             raise TypeError(f"Unsupported backbone output type: {type(backbone_out)}")
         # Ensure consistent dtype for DiT input to avoid torch.compile recompilation
         # between training (fp16 from autocast) and validation (fp32)
-        return scene_tokens.float()
+        scene_tokens = scene_tokens.float()
+        return (scene_tokens, scene_xyz) if return_xyz else scene_tokens
 
     def encode_hand_tokens(self, keypoints: torch.Tensor) -> torch.Tensor:
         """Encode hand keypoints into per-point tokens.
@@ -452,9 +465,17 @@ class HandFlowMatchingDiT(L.LightningModule):
         Optionally accepts pre-computed ``scene_tokens`` to avoid re-encoding during
         sampling, where the scene does not change across ODE evaluations.
         """
+        use_cross_bias = bool(getattr(self.dit, "hand_scene_bias", False))
+        scene_xyz: Optional[torch.Tensor] = None
+
         # Reuse cached scene tokens if provided (e.g., inside sampling loop)
         if scene_tokens is None:
-            scene_tokens = self.encode_scene_tokens(scene_pc)
+            if use_cross_bias:
+                scene_tokens, scene_xyz = self.encode_scene_tokens(scene_pc, return_xyz=True)
+            else:
+                scene_tokens = self.encode_scene_tokens(scene_pc)
+        elif use_cross_bias and isinstance(scene_tokens, tuple):
+            scene_tokens, scene_xyz = scene_tokens
         hand_tokens = self.encode_hand_tokens(keypoints)
         time_emb = self.timestep_embed(timesteps)
         hand_tokens_out = self.dit(
@@ -462,6 +483,7 @@ class HandFlowMatchingDiT(L.LightningModule):
             scene_tokens=scene_tokens,
             temb=time_emb,
             xyz=keypoints,
+            scene_xyz=scene_xyz,
         )
         # Delegate:
         velocity = self.velocity_strategy.predict(
@@ -624,9 +646,11 @@ class HandFlowMatchingDiT(L.LightningModule):
                 )
         else:
             scene_pc = scene_pc.to(self.device)
-            if scene_pc.dim() != 3 or scene_pc.size(-1) != 3:
+            # Accept 3D (xyz only) or 6D (xyz + normals) point clouds
+            valid_dims = (3, 6)
+            if scene_pc.dim() != 3 or scene_pc.size(-1) not in valid_dims:
                 self.log(f"{stage}/invalid_scene_shape", 1.0, prog_bar=True, on_step=(stage == "train"), on_epoch=True)
-                raise ValueError(f"Expected 'scene_pc' of shape (B, P, 3), got {tuple(scene_pc.shape)}")
+                raise ValueError(f"Expected 'scene_pc' of shape (B, P, 3 or 6), got {tuple(scene_pc.shape)}")
             
             if stage != "train" and scene_pc.size(1) == 0:
                 self.log(f"{stage}/empty_scene_pc", 1.0, prog_bar=True, on_step=False, on_epoch=True)
@@ -934,7 +958,11 @@ class HandFlowMatchingDiT(L.LightningModule):
             keypoints = initial_noise.to(device)
         
         # Scene tokens are static across ODE evaluations; cache once to avoid recompute.
-        scene_tokens_cached = self.encode_scene_tokens(scene_pc)
+        use_cross_bias = bool(getattr(self.dit, "hand_scene_bias", False))
+        if use_cross_bias:
+            scene_tokens_cached = self.encode_scene_tokens(scene_pc, return_xyz=True)
+        else:
+            scene_tokens_cached = self.encode_scene_tokens(scene_pc)
         timesteps = self.sampling_config.time_schedule.generate(num_steps, device)
         
         capture_steps: List[int] = []

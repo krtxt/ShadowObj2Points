@@ -291,17 +291,25 @@ class DDPBarrierMonitor(Callback):
     Args:
         barrier_timeout: Timeout for barrier in seconds (default: 600)
         check_interval: How often to log waiting status (default: 30)
+        sync_on_checkpoint: Add barrier before/after checkpoint save (default: True)
     """
 
     def __init__(
         self,
         barrier_timeout: float = 600.0,
         check_interval: float = 30.0,
+        sync_on_checkpoint: bool = True,
     ) -> None:
         super().__init__()
         self.barrier_timeout = barrier_timeout
         self.check_interval = check_interval
+        self.sync_on_checkpoint = sync_on_checkpoint
         self._log = logging.getLogger(self.__class__.__name__)
+        self._trainer: Optional[Trainer] = None
+
+    def setup(self, trainer: Trainer, pl_module: LightningModule, stage: str) -> None:
+        """Store trainer reference for barrier calls."""
+        self._trainer = trainer
 
     def on_train_epoch_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
         """Monitor barrier at epoch end."""
@@ -316,6 +324,28 @@ class DDPBarrierMonitor(Callback):
             return
 
         self._timed_barrier(f"val_epoch_{trainer.current_epoch}_end")
+
+    def on_save_checkpoint(
+        self, trainer: Trainer, pl_module: LightningModule, checkpoint: dict
+    ) -> None:
+        """Barrier before checkpoint save to ensure all ranks are synchronized."""
+        if not self.sync_on_checkpoint:
+            return
+        if trainer.world_size <= 1 or not dist.is_initialized():
+            return
+
+        self._timed_barrier(f"before_save_epoch_{trainer.current_epoch}")
+
+    def on_load_checkpoint(
+        self, trainer: Trainer, pl_module: LightningModule, checkpoint: dict
+    ) -> None:
+        """Barrier after checkpoint load to ensure all ranks loaded successfully."""
+        if not self.sync_on_checkpoint:
+            return
+        if trainer.world_size <= 1 or not dist.is_initialized():
+            return
+
+        self._timed_barrier("after_load_checkpoint")
 
     def _timed_barrier(self, name: str) -> None:
         """Execute barrier with timeout monitoring."""

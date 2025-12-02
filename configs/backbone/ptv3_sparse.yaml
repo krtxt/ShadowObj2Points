@@ -7,6 +7,11 @@ target_num_tokens: 128
 token_strategy: last_layer  # last_layer | fps | grid | learned | multiscale
 tokens_last: true  # true | false
 
+# Scene point cloud normals support
+# When true, the backbone expects and processes 6D input (xyz + normals)
+# When false, only xyz (3D) is expected
+use_scene_normals: false
+
 # encoder_channels: [32, 64, 128, 256, 512]
 # encoder_depths: [2, 2, 2, 6, 2]
 # encoder_num_head: [2, 4, 8, 16, 32]
@@ -27,4 +32,7 @@ mlp_ratio:         3
 
 
 out_dim: 512
+# input_feature_dim: Number of additional features beyond xyz coordinates
+# - 1: default (PTv3 uses constant 1s as features when no extra features)
+# - 3: when use_scene_normals=true (normals as additional features)
 input_feature_dim: 1

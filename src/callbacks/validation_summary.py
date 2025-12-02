@@ -1,3 +1,12 @@
+"""Validation summary callback for unified training info display.
+
+Aggregates and displays training information from pl_module.run_info:
+- eta: Training progress and time estimates (from TrainingETACallback)
+- curriculum: Current curriculum stage (from model, if applicable)
+- meta: Run metadata (experiment name, backbone, etc.)
+- memory: RAM and GPU memory usage (collected here)
+"""
+
 import gc
 import math
 from typing import Any, Dict, Optional
@@ -17,196 +26,202 @@ except ImportError:
 
 
 class ValidationSummaryCallback(Callback):
-    """Callback to aggregate validation metrics and pretty-print a summary.
+    """Callback to display unified training info and validation metrics summary.
 
-    This callback assumes the model (pl_module) optionally exposes:
-      - _val_step_losses: List[Tensor] of per-batch validation losses
-    and that metrics are logged via pl_module.log with keys such as:
-      - "val_loss"
-      - "val/flow_*" for flow matching metrics
-      - "val/recon_*" for reconstruction metrics
+    Reads from pl_module.run_info dict which can contain:
+    - "eta": dict with elapsed, remaining, completion, progress_pct, avg_epoch
+    - "curriculum": dict with stage, epoch
+    - "meta": dict with experiment_name, velocity_mode, backbone_name
     """
 
+    def _get_run_info(self, pl_module: L.LightningModule) -> Dict[str, Any]:
+        """Get run_info dict from pl_module, creating if needed."""
+        if not hasattr(pl_module, "run_info"):
+            pl_module.run_info = {}
+        return pl_module.run_info
+
     @rank_zero_only
-    def _log_memory_usage(self, epoch: int) -> Dict[str, float]:
-        """Log memory usage for debugging memory leaks."""
-        mem_info = {}
-        
-        # Force garbage collection
+    def _collect_memory(self, pl_module: L.LightningModule) -> Dict[str, float]:
+        """Collect and store memory usage in run_info["memory"]."""
         gc.collect()
-        
-        # CPU/RAM usage
+        mem_info = {}
+
         if HAS_PSUTIL:
-            process = psutil.Process()
-            mem_gb = process.memory_info().rss / 1024**3
-            mem_info["ram_gb"] = mem_gb
-            console.print(f"[bold cyan][Memory][/] Epoch {epoch} | RAM: {mem_gb:.2f} GB")
-        
-        # GPU memory
+            mem_info["ram_gb"] = psutil.Process().memory_info().rss / 1024**3
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             for i in range(torch.cuda.device_count()):
-                allocated = torch.cuda.memory_allocated(i) / 1024**3
-                reserved = torch.cuda.memory_reserved(i) / 1024**3
-                mem_info[f"gpu{i}_allocated_gb"] = allocated
-                mem_info[f"gpu{i}_reserved_gb"] = reserved
-                if HAS_PSUTIL:
-                    console.print(
-                        f"[bold cyan][Memory][/] GPU {i} | "
-                        f"Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB"
-                    )
-        
+                mem_info[f"gpu{i}_allocated_gb"] = torch.cuda.memory_allocated(i) / 1024**3
+                mem_info[f"gpu{i}_reserved_gb"] = torch.cuda.memory_reserved(i) / 1024**3
+
+        run_info = self._get_run_info(pl_module)
+        run_info["memory"] = mem_info
         return mem_info
 
-    def on_validation_epoch_end(
-        self,
-        trainer: "L.Trainer",
-        pl_module: "L.LightningModule",
-    ) -> None:
-        epoch = int(getattr(trainer, "current_epoch", 0))
-        
-        # Log memory usage at the start of validation summary
-        mem_info = self._log_memory_usage(epoch)
-        for key, value in (mem_info or {}).items():
-            pl_module.log(f"memory/{key}", value, on_epoch=True, sync_dist=False)
-        
-        # Aggregate basic loss statistics from per-step losses, if available
-        # Supports both List[float] (memory-efficient) and List[Tensor] (legacy)
-        avg_loss = float("nan")
-        loss_std = float("nan")
-        loss_min = float("nan")
-        loss_max = float("nan")
-        num_batches = 0
-        
+    @rank_zero_only
+    def _print_run_info(self, pl_module: L.LightningModule, epoch: int) -> None:
+        """Print unified run info section: ETA, curriculum, memory, meta."""
+        from callbacks.training_eta import TrainingETACallback
+
+        run_info = self._get_run_info(pl_module)
+        has_content = any(run_info.get(k) for k in ("eta", "curriculum", "memory", "meta"))
+        if not has_content:
+            return
+
+        console.print("")
+        console.rule("[header]📊 Run Information[/header]", style="cyan")
+
+        # ETA info
+        if eta := run_info.get("eta"):
+            fmt = TrainingETACallback.format_duration
+            parts = [
+                f"[metric]Progress[/metric]: [value]{eta.get('progress_pct', 0):.1f}%[/value]",
+                f"[metric]Elapsed[/metric]: [value]{fmt(eta.get('elapsed', 0))}[/value]",
+                f"[metric]Remaining[/metric]: [value]{fmt(eta.get('remaining', 0))}[/value]",
+                f"[metric]ETA[/metric]: [value]{eta.get('completion', 'N/A')}[/value]",
+            ]
+            if avg := eta.get("avg_epoch"):
+                parts.append(f"[metric]Avg Epoch[/metric]: [value]{fmt(avg)}[/value]")
+            console.print(" | ".join(parts))
+
+        # Curriculum stage
+        if curr := run_info.get("curriculum"):
+            console.print(
+                f"[metric]Curriculum Stage[/metric]: [value]{curr.get('stage', 'N/A')}[/value]"
+            )
+
+        # Memory usage
+        if mem := run_info.get("memory"):
+            parts = []
+            if "ram_gb" in mem:
+                parts.append(f"RAM: {mem['ram_gb']:.2f} GB")
+            for i in range(8):  # Support up to 8 GPUs
+                if f"gpu{i}_allocated_gb" in mem:
+                    alloc = mem[f"gpu{i}_allocated_gb"]
+                    reserved = mem.get(f"gpu{i}_reserved_gb", alloc)
+                    parts.append(f"GPU{i}: {alloc:.2f}/{reserved:.2f} GB")
+            if parts:
+                console.print(f"[metric]Memory[/metric]: [value]{' | '.join(parts)}[/value]")
+
+        # Run meta info
+        if meta := run_info.get("meta"):
+            meta_parts = []
+            if exp := meta.get("experiment_name"):
+                meta_parts.append(f"Exp: {exp}")
+            if vel := meta.get("velocity_mode"):
+                meta_parts.append(f"Velocity: {vel}")
+            if bb := meta.get("backbone_name"):
+                meta_parts.append(f"Backbone: {bb}")
+            if meta_parts:
+                console.print(f"[metric]Meta[/metric]: [value]{' | '.join(meta_parts)}[/value]")
+
+    def _collect_metrics(
+        self, trainer: L.Trainer, pl_module: L.LightningModule
+    ) -> Dict[str, Any]:
+        """Collect validation metrics from trainer and model."""
+        # Aggregate loss statistics from per-step losses
+        avg_loss, loss_std, loss_min, loss_max, num_batches = (
+            float("nan"), float("nan"), float("nan"), float("nan"), 0
+        )
+
         if hasattr(pl_module, "_val_step_losses") and pl_module._val_step_losses:
             losses = pl_module._val_step_losses
             try:
-                # Check if it's a list of floats or tensors
                 if isinstance(losses[0], (int, float)):
-                    # List of scalars (memory-efficient)
                     import numpy as np
-                    losses_arr = np.array(losses, dtype=np.float32)
-                    avg_loss = float(np.mean(losses_arr))
-                    loss_std = float(np.std(losses_arr))
-                    loss_min = float(np.min(losses_arr))
-                    loss_max = float(np.max(losses_arr))
-                    num_batches = len(losses_arr)
+                    arr = np.array(losses, dtype=np.float32)
+                    avg_loss, loss_std = float(np.mean(arr)), float(np.std(arr))
+                    loss_min, loss_max = float(np.min(arr)), float(np.max(arr))
+                    num_batches = len(arr)
                 else:
-                    # List of tensors (legacy)
-                    losses_tensor = torch.stack(list(losses)).float().detach().cpu()
-                    avg_loss = float(losses_tensor.mean().item())
-                    loss_std = float(losses_tensor.std(unbiased=False).item())
-                    loss_min = float(losses_tensor.min().item())
-                    loss_max = float(losses_tensor.max().item())
-                    num_batches = int(losses_tensor.numel())
+                    t = torch.stack(list(losses)).float().detach().cpu()
+                    avg_loss, loss_std = float(t.mean()), float(t.std(unbiased=False))
+                    loss_min, loss_max = float(t.min()), float(t.max())
+                    num_batches = int(t.numel())
             except Exception:
                 pass
 
-        metrics: Dict[str, Any] = dict(trainer.callback_metrics)
+        metrics = dict(trainer.callback_metrics)
 
-        def _get_metric(name: str) -> Optional[float]:
-            value = metrics.get(name)
-            if value is None:
+        def get_metric(name: str) -> Optional[float]:
+            v = metrics.get(name)
+            if v is None:
                 return None
             try:
-                if hasattr(value, "item"):
-                    value = value.item()
-                return float(value)
+                return float(v.item() if hasattr(v, "item") else v)
             except Exception:
                 return None
 
-        # Detailed loss breakdown: collect all validation loss-like metrics
-        # - Always include "val_loss" if available
-        # - Additionally include any metrics whose key starts with "val/loss"
-        #   so different models can expose their own loss components without
-        #   requiring hard-coded names here.
-        val_detailed_loss: Dict[str, float] = {}
-
-        for name in metrics.keys():
+        # Detailed loss breakdown
+        val_detailed_loss = {}
+        for name in metrics:
             if name == "val_loss" or name.startswith("val/loss"):
-                v = _get_metric(name)
-                if v is None or not math.isfinite(v):
-                    continue
+                if (v := get_metric(name)) is not None and math.isfinite(v):
+                    key = name.split("/", 1)[-1] if "/" in name else name
+                    if key not in val_detailed_loss:
+                        val_detailed_loss[key] = v
 
-                # Normalize display key: strip "val/" prefix if present so
-                # components like "val/loss_pos" become "loss_pos".
-                display_key = name.split("/", 1)[-1] if "/" in name else name
+        # Flow metrics
+        val_flow_metrics = {}
+        for key in ("val/flow_loss", "val/flow_loss_fm", "val/flow_loss_tangent",
+                    "val/flow_edge_len_err", "val/flow_total"):
+            if (v := get_metric(key)) is not None:
+                val_flow_metrics[key.split("/", 1)[-1]] = v
 
-                # Later metrics with the same display_key should not
-                # overwrite earlier ones (e.g., keep the primary val_loss).
-                if display_key not in val_detailed_loss:
-                    val_detailed_loss[display_key] = v
+        # Quality metrics
+        val_quality_metrics = {}
+        for key in ("val/recon_smooth_l1", "val/recon_chamfer", "val/recon_direction",
+                    "val/recon_edge_len_err", "val/recon_total"):
+            if (v := get_metric(key)) is not None:
+                val_quality_metrics[key.split("/", 1)[-1]] = v
 
-        # Flow metrics group
-        flow_metric_keys = [
-            "val/flow_loss",
-            "val/flow_loss_fm",
-            "val/flow_loss_tangent",
-            "val/flow_edge_len_err",
-            "val/flow_total",
-        ]
-        val_flow_metrics: Dict[str, float] = {}
-        for key in flow_metric_keys:
-            v = _get_metric(key)
-            if v is None:
-                continue
-            short_name = key.split("/", 1)[-1]
-            val_flow_metrics[short_name] = v
+        return {
+            "num_batches": num_batches,
+            "avg_loss": avg_loss,
+            "loss_std": loss_std,
+            "loss_min": loss_min,
+            "loss_max": loss_max,
+            "val_detailed_loss": val_detailed_loss,
+            "val_flow_metrics": val_flow_metrics,
+            "val_quality_metrics": val_quality_metrics,
+            "val_set_metrics": {},
+            "val_diversity_metrics": {},
+        }
 
-        # Reconstruction / quality metrics group
-        recon_metric_keys = [
-            "val/recon_smooth_l1",
-            "val/recon_chamfer",
-            "val/recon_direction",
-            "val/recon_edge_len_err",
-            "val/recon_total",
-        ]
-        val_quality_metrics: Dict[str, float] = {}
-        for key in recon_metric_keys:
-            v = _get_metric(key)
-            if v is None:
-                continue
-            short_name = key.split("/", 1)[-1]
-            val_quality_metrics[short_name] = v
+    def on_validation_epoch_end(
+        self, trainer: L.Trainer, pl_module: L.LightningModule
+    ) -> None:
+        epoch = int(getattr(trainer, "current_epoch", 0))
 
-        # Currently we do not track set/diversity metrics here
-        val_set_metrics: Dict[str, float] = {}
-        val_diversity_metrics: Dict[str, float] = {}
+        # Collect memory and log to tensorboard
+        mem_info = self._collect_memory(pl_module)
+        for key, value in (mem_info or {}).items():
+            pl_module.log(f"memory/{key}", value, on_epoch=True, sync_dist=False)
 
-        run_meta = getattr(pl_module, "run_meta", None)
+        # Print unified run info
         if getattr(trainer, "is_global_zero", True):
-            if isinstance(run_meta, dict) and run_meta:
-                exp_name = run_meta.get("experiment_name")
-                velocity_mode = run_meta.get("velocity_mode")
-                backbone_name = run_meta.get("backbone_name")
+            self._print_run_info(pl_module, epoch)
 
-                console.print("")
-                console.rule("[header]🧪 Run Meta Information[/header]", style="cyan")
-                if exp_name is not None:
-                    console.print(f"[metric]Experiment[/metric]: [value]{exp_name}[/value]")
-                if velocity_mode is not None:
-                    console.print(f"[metric]Velocity Strategy[/metric]: [value]{velocity_mode}[/value]")
-                if backbone_name is not None:
-                    console.print(f"[metric]Backbone[/metric]: [value]{backbone_name}[/value]")
-
+        # Collect and print metrics
+        m = self._collect_metrics(trainer, pl_module)
         log_validation_summary(
             epoch=epoch,
-            num_batches=num_batches,
-            avg_loss=avg_loss,
-            loss_std=loss_std,
-            loss_min=loss_min,
-            loss_max=loss_max,
-            val_detailed_loss=val_detailed_loss,
-            val_set_metrics=val_set_metrics,
-            val_quality_metrics=val_quality_metrics,
-            val_diversity_metrics=val_diversity_metrics,
-            val_flow_metrics=val_flow_metrics,
+            num_batches=m["num_batches"],
+            avg_loss=m["avg_loss"],
+            loss_std=m["loss_std"],
+            loss_min=m["loss_min"],
+            loss_max=m["loss_max"],
+            val_detailed_loss=m["val_detailed_loss"],
+            val_set_metrics=m["val_set_metrics"],
+            val_quality_metrics=m["val_quality_metrics"],
+            val_diversity_metrics=m["val_diversity_metrics"],
+            val_flow_metrics=m["val_flow_metrics"],
         )
 
-        # Reset per-step validation loss buffer to avoid cross-loop accumulation
+        # Reset validation loss buffer
         if hasattr(pl_module, "_val_step_losses"):
             try:
                 pl_module._val_step_losses = []
             except Exception:
-                # Best-effort; do not crash callback on failure
                 pass

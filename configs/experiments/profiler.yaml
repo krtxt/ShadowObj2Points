@@ -15,8 +15,8 @@ trainer:
   profiler: "advanced"      # Enable advanced profiler
   max_epochs: 3             # Run only 1 epoch
   check_val_every_n_epoch: 1
-  limit_train_batches: 100  # Run only 100 batches to save time
-  limit_val_batches: 50      # Skip validation to focus on training
+  limit_train_batches: 50  # Run only 100 batches to save time
+  limit_val_batches: 25      # Skip validation to focus on training
   # limit_test_batches: 0     # Skip testing
   num_sanity_val_steps: 0   # Skip sanity check to avoid noise in profile
   log_every_n_steps: 1
@@ -52,11 +52,12 @@ auto_resume: false
 compile: false
 
 # Data Settings (Ensure fast loading for profiling)
-batch_size: 256
+batch_size: 128
 datamodule:
-  num_workers: 8          # Ensure enough workers
+  num_workers: 16          # Ensure enough workers
   prefetch_factor: 2
   pin_memory: true
+  persistent_workers: false
 
 # Logger (Disable heavy logging)
 logger:

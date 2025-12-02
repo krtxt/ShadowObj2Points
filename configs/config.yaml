@@ -3,7 +3,7 @@
 
 # defaults list
 defaults:
-  - datamodule: handencoder_dm_dex_debug
+  - datamodule: handencoder_dm_dex
   - model: flow_matching_hand_dit # deterministic_hand_dit | flow_matching_hand_dit
   - backbone: ptv3_sparse
   - hand_encoder: transformer_bias

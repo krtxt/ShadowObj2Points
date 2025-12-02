@@ -65,7 +65,8 @@ class MyBodexShadow(Dataset):
                  split_file_name: Optional[str] = None,
                  debug_mode: bool = False,
                  max_points: int = 4096,
-                 point_clouds_file_name: Optional[str] = None):
+                 point_clouds_file_name: Optional[str] = None,
+                 use_scene_normals: bool = False):
         super().__init__()
 
         self.name = 'BodexShadow'
@@ -89,6 +90,7 @@ class MyBodexShadow(Dataset):
 
         self.max_points = int(max_points) if int(max_points) > 0 else 4096
         self.point_clouds_file_name = point_clouds_file_name
+        self.use_scene_normals = bool(use_scene_normals)
 
         # Split file defaults to dataset root
         if split_file_name is None:
@@ -640,14 +642,26 @@ class MyBodexShadow(Dataset):
             or scene_pc.ndim < 2
             or scene_pc.shape[1] < 3
         ):
-            return torch.zeros((0, 3), dtype=torch.float32)
-        scene_pc_xyz = scene_pc[:, :3] * float(scale)
-        if len(scene_pc_xyz) > self.max_points:
+            out_dim = 6 if self.use_scene_normals else 3
+            return torch.zeros((0, out_dim), dtype=torch.float32)
+
+        # Determine output dimension based on use_scene_normals
+        has_normals = scene_pc.shape[1] >= 6
+        if self.use_scene_normals and has_normals:
+            # Return xyz + normals (6D), scale only affects xyz
+            scene_pc_out = scene_pc[:, :6].copy().astype(np.float32)
+            scene_pc_out[:, :3] *= float(scale)  # Scale xyz only, normals remain unchanged
+        else:
+            # Return xyz only (3D)
+            scene_pc_out = (scene_pc[:, :3] * float(scale)).astype(np.float32)
+
+        if len(scene_pc_out) > self.max_points:
             if self.phase != "train":
                 np.random.seed(0)
-            resample_indices = np.random.permutation(len(scene_pc_xyz))
-            scene_pc_xyz = scene_pc_xyz[resample_indices[: self.max_points]]
-        return torch.from_numpy(scene_pc_xyz.astype(np.float32))
+            resample_indices = np.random.permutation(len(scene_pc_out))
+            scene_pc_out = scene_pc_out[resample_indices[: self.max_points]]
+
+        return torch.from_numpy(scene_pc_out)
 
     def _get_scene_point_cloud(self, scene_id: str, object_name: str, scale: float) -> torch.Tensor:
         if scene_id in self._scene_pc_cache:

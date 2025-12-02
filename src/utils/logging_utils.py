@@ -1,6 +1,7 @@
 import logging
 import math
-from typing import Dict
+from pathlib import Path
+from typing import Dict, Optional
 
 from rich import box
 from rich.align import Align
@@ -89,7 +90,94 @@ _custom_theme = Theme({
     "breakdown": "bold magenta",
     "header": "bold blue",
 })
-console = Console(theme=_custom_theme)
+
+
+class DualConsole:
+    """Console wrapper: rank_zero_only + dual output (terminal + file)."""
+
+    def __init__(self, theme: Theme) -> None:
+        self._terminal = Console(theme=theme)
+        self._file: Optional[Console] = None
+        self._file_handle = None
+
+    @rank_zero_only
+    def setup_file(self, path: Path) -> None:
+        """Setup file output. Call once at startup (rank 0 only)."""
+        if self._file_handle:
+            self._file_handle.close()
+        self._file_handle = open(path, "w", encoding="utf-8")
+        self._file = Console(
+            file=self._file_handle, force_terminal=False, width=120, theme=_custom_theme
+        )
+
+    @rank_zero_only
+    def print(self, *args, **kwargs) -> None:
+        self._terminal.print(*args, **kwargs)
+        if self._file:
+            self._file.print(*args, **kwargs)
+
+    @rank_zero_only
+    def rule(self, *args, **kwargs) -> None:
+        self._terminal.rule(*args, **kwargs)
+        if self._file:
+            self._file.rule(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._terminal, name)
+
+
+class RankZeroLogger:
+    """Logger wrapper that only emits on rank zero."""
+
+    def __init__(self, logger: logging.Logger) -> None:
+        self._logger = logger
+
+    @rank_zero_only
+    def info(self, *args, **kwargs):
+        return self._logger.info(*args, **kwargs)
+
+    @rank_zero_only
+    def warning(self, *args, **kwargs):
+        return self._logger.warning(*args, **kwargs)
+
+    @rank_zero_only
+    def error(self, *args, **kwargs):
+        return self._logger.error(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._logger, name)
+
+
+console = DualConsole(theme=_custom_theme)
+
+
+def get_logger(name: str) -> RankZeroLogger:
+    """Get a RankZeroLogger for any module. Use for strict rank 0 only logging."""
+    return RankZeroLogger(logging.getLogger(name))
+
+
+def setup_logging(output_dir: Optional[Path] = None, logger_name: str = "train") -> RankZeroLogger:
+    """One-time initialization for logging and console.
+
+    Call this once in main() after output_dir is known:
+        log = setup_logging(output_dir)
+
+    This function:
+    - Configures Rich logging (RichHandler for terminal, preserves Hydra's FileHandler for train.log)
+    - Sets up console file output to output_dir/console.log (if output_dir provided)
+    - Returns a RankZeroLogger instance
+
+    Args:
+        output_dir: Output directory path. If provided, console output is also saved to console.log.
+        logger_name: Name for the logger (default: "train").
+
+    Returns:
+        RankZeroLogger instance for logging.
+    """
+    setup_rich_logging()
+    if output_dir:
+        console.setup_file(output_dir / "console.log")
+    return RankZeroLogger(logging.getLogger(logger_name))
 
 
 @rank_zero_only

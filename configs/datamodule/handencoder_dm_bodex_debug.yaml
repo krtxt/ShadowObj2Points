@@ -16,6 +16,10 @@ cache_max_shards_in_memory: 2
 use_local_pose_only: true
 norm_xyz_stats_path: ${paths.data_dir}/bodex/bodex_shadow/norm_xyz_stats_use_local_anchor-${hand_anchor}
 
+# Scene point cloud normals
+# When true, returns 6D point cloud (xyz + normals) instead of 3D (xyz only)
+use_scene_normals: false
+
 # Optional phases for splits
 train_phase: all
 val_phase: all

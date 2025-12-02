@@ -234,24 +234,37 @@ class HandDeterministicDiT(L.LightningModule):
             tmpl = tmpl.unsqueeze(0)
         return tmpl.to(device).expand(batch_size, -1, -1).contiguous()
 
-    def encode_scene_tokens(self, scene_pc: torch.Tensor) -> torch.Tensor:
+    def encode_scene_tokens(self, scene_pc: torch.Tensor, return_xyz: bool = False):
         """
         Robustly extract tokens from backbone.
         Handles various return types: Tuple, Dict, or Tensor.
+        
+        Args:
+            scene_pc: Scene point cloud of shape (B, P, C) where C >= 3.
+                      C=3 for xyz only, C=6 for xyz+normals.
+                      If backbone doesn't support normals, automatically truncates to xyz.
+            return_xyz: If True, also return token xyz (when available).
         """
         B = scene_pc.shape[0]
         empty_token = torch.zeros(B, 1, self.hparams.d_model, device=scene_pc.device)
         
         if scene_pc.numel() == 0 or scene_pc.shape[1] == 0:
-            return empty_token
+            return (empty_token, None) if return_xyz else empty_token
+
+        # Check if backbone supports normals; if not, truncate to xyz only
+        backbone_uses_normals = getattr(self.backbone, 'use_scene_normals', False)
+        if not backbone_uses_normals and scene_pc.shape[-1] > 3:
+            scene_pc = scene_pc[..., :3]
 
         out = self.backbone(scene_pc)
         tokens = None
+        scene_xyz = None
 
         # 1. Parse Output Type
         if isinstance(out, tuple):
             # Assumes (coords, features)
             tokens = out[1]
+            scene_xyz = out[0]
         elif isinstance(out, dict):
             for k in ["tokens", "scene_tokens", "feat"]:
                 if k in out:
@@ -274,7 +287,8 @@ class HandDeterministicDiT(L.LightningModule):
 
         # Ensure consistent dtype for DiT input to avoid torch.compile recompilation
         # between training (fp16 from autocast) and validation (fp32)
-        return tokens.float()
+        tokens = tokens.float()
+        return (tokens, scene_xyz) if return_xyz else tokens
 
     # =========================================================================
     # Forward Pass & Prediction
@@ -292,8 +306,15 @@ class HandDeterministicDiT(L.LightningModule):
         device = scene_pc.device
 
         # 1. Prepare Inputs
+        use_cross_bias = bool(getattr(self.dit, "hand_scene_bias", False))
+        scene_xyz: Optional[torch.Tensor] = None
         if scene_tokens is None:
-            scene_tokens = self.encode_scene_tokens(scene_pc)
+            if use_cross_bias:
+                scene_tokens, scene_xyz = self.encode_scene_tokens(scene_pc, return_xyz=True)
+            else:
+                scene_tokens = self.encode_scene_tokens(scene_pc)
+        elif use_cross_bias and isinstance(scene_tokens, tuple):
+            scene_tokens, scene_xyz = scene_tokens
         
         template = self._get_template_batch(B, device)
         
@@ -316,6 +337,7 @@ class HandDeterministicDiT(L.LightningModule):
             scene_tokens=scene_tokens,
             temb=t_embed,
             xyz=template, # Geometric bias
+            scene_xyz=scene_xyz,
         )
 
         # 4. Decode & Apply Residual
@@ -405,9 +427,11 @@ class HandDeterministicDiT(L.LightningModule):
         for name, weight in weights.items():
             self.log(f"loss_weight/{name}", weight, on_step=False, on_epoch=True, sync_dist=True)
 
-        stage = self.loss_manager.scheduler.get_current_stage_name()
-        if stage:
-            logger.info(f"Epoch {epoch}: Curriculum stage = {stage}")
+        # Store curriculum stage in run_info for ValidationSummaryCallback
+        if stage := self.loss_manager.scheduler.get_current_stage_name():
+            if not hasattr(self, "run_info"):
+                self.run_info = {}
+            self.run_info["curriculum"] = {"stage": stage, "epoch": epoch}
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         target, _, scene = self._extract_batch(batch, "train")
@@ -415,12 +439,14 @@ class HandDeterministicDiT(L.LightningModule):
 
         pred = self.predict_hand_xyz(scene)
         denorm_fn = self._denorm_xyz if self.use_norm_data else None
+        # Loss manager expects xyz only (3D), truncate if scene has normals (6D)
+        scene_xyz = scene[..., :3] if scene.size(-1) > 3 else scene
         loss, components = self.loss_manager(
             pred_xyz=pred,
             gt_xyz=target,
             edge_rest_lengths=self.edge_rest_lengths,
             active_edge_mask=getattr(self, "active_edge_mask", None),
-            scene_pc=scene,
+            scene_pc=scene_xyz,
             denorm_fn=denorm_fn,
             epoch=self.current_epoch,
         )
@@ -465,12 +491,14 @@ class HandDeterministicDiT(L.LightningModule):
 
         pred = self.predict_hand_xyz(scene)
         denorm_fn = self._denorm_xyz if self.use_norm_data else None
+        # Loss manager expects xyz only (3D), truncate if scene has normals (6D)
+        scene_xyz = scene[..., :3] if scene.size(-1) > 3 else scene
         loss, components = self.loss_manager(
             pred_xyz=pred,
             gt_xyz=target,
             edge_rest_lengths=self.edge_rest_lengths,
             active_edge_mask=getattr(self, "active_edge_mask", None),
-            scene_pc=scene,
+            scene_pc=scene_xyz,
             denorm_fn=denorm_fn,
             epoch=self.current_epoch,
         )

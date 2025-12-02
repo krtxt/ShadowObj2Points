@@ -50,7 +50,7 @@ python train.py \
     experiment_name=exp_1130_fm_direct_free_full \
     dit.qk_norm=true \
     dit.qk_norm_type='rms' \
-    batch_size=360 \
+    batch_size=320 \
     trainer.precision=bf16-mixed \
     velocity_strategy=direct_free \
     datamodule.num_workers=16 \

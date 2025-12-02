@@ -1,0 +1,91 @@
+# PTv3 Sparse Encoder - Fourier Enhanced Strategy
+# 
+# Token construction:
+#   Token_obj = MLP([Feat_PTv3, Fourier(xyz), Normal(nx, ny, nz)])
+#
+# Benefits:
+# - Fourier(xyz): Explicit high-frequency positional encoding for precise localization
+# - Normals: Surface orientation for anti-penetration learning
+#   "This surface faces (0, 1, 0), if hand finger points opposite and distance < 0, it's penetration"
+
+name: ptv3_sparse
+token_strategy: fourier_enhanced  # Key: uses FourierEnhancedTokenizer
+
+# ===== PTv3 Encoder Basic Config =====
+
+grid_size: 0.02
+stride: [2, 2, 2, 2]
+target_num_tokens: 128
+tokens_last: true
+use_flash_attention: true
+
+# Encoder architecture
+encoder_channels:  [48, 80, 160, 320, 512]
+encoder_depths:    [2, 3, 3, 9, 2]
+encoder_num_head:  [3, 5, 10, 20, 32]
+enc_patch_size:    [1024, 1024, 1024, 1024, 1024]
+mlp_ratio:         3
+
+out_dim: 512
+# input_feature_dim: Number of additional features beyond xyz coordinates
+# - 1: default (PTv3 uses constant 1s as features when no extra features)
+# - 3: when use_scene_normals=true (normals as additional features for PTv3)
+input_feature_dim: 3
+
+# ===== Scene Normals Support =====
+# IMPORTANT: Must be true for fourier_enhanced to use normals
+# This tells the model layer to pass 6D point cloud (xyz + normals) to backbone
+use_scene_normals: true
+
+# ===== Fourier Enhanced Tokenizer Config =====
+
+# fourier_num_frequencies: Number of Fourier frequency bands
+#   - Similar to NeRF positional encoding
+#   - Higher = more high-frequency detail, but more parameters
+#   - Output dim = 3 + 3*2*num_frequencies (e.g., 63 for 10 frequencies)
+#   - Recommended: 10 (matches Hand Encoder's FourierPositionalEmbedding)
+fourier_num_frequencies: 10
+
+# fourier_use_normals: Whether to include surface normals in token
+#   - true: Token = MLP([PTv3_feat, Fourier(xyz), Normal])
+#   - false: Token = MLP([PTv3_feat, Fourier(xyz)])
+#   - Normals are crucial for anti-penetration learning in grasping
+fourier_use_normals: true
+
+# fourier_mlp_ratio: MLP hidden layer expansion ratio
+#   - hidden_dim = output_dim * mlp_ratio
+#   - Higher = more capacity, but slower
+fourier_mlp_ratio: 2
+
+# fourier_dropout: Dropout rate in MLP
+fourier_dropout: 0.1
+
+# ===== Performance Notes =====
+#
+# Memory overhead vs. standard FPS:
+#   - FourierEnhancedTokenizer adds ~3MB weights
+#   - Nearest neighbor search for normals: O(K * N) per batch
+#   - Fourier encoding: negligible (just sin/cos operations)
+#
+# Computational cost:
+#   - NN search: ~5ms for K=128, N=4096 on A100
+#   - Fourier encoding: ~1ms
+#   - MLP forward: ~2ms
+#   - Total overhead: ~8ms per batch
+#
+# Tips:
+#   1. Ensure datamodule.use_scene_normals=true to get 6D point clouds
+#   2. If normals not available, set fourier_use_normals=false
+#      (will use zeros, losing anti-penetration benefit)
+#   3. Monitor val/recon_* metrics - should improve with normals
+#
+# ===== Usage =====
+#
+# In command line:
+#   python train.py backbone=ptv3_sparse_fourier datamodule.use_scene_normals=true
+#
+# Or in experiment config:
+#   defaults:
+#     - override /backbone: ptv3_sparse_fourier
+#   datamodule:
+#     use_scene_normals: true

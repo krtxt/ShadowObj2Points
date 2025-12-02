@@ -27,6 +27,11 @@ point_cloud_hdf5_path: ${paths.data_dir}/DexGraspNet/object_pcds.h5
 point_cloud_max_cache_size: 200  # LRU 缓存大小
 max_points: 4096
 
+# Scene point cloud normals
+# When true, returns 6D point cloud (xyz + normals) instead of 3D (xyz only)
+# Requires backbone.use_scene_normals=true to actually use the normals
+use_scene_normals: false
+
 # Optional phases for splits
 train_phase: train
 val_phase: test

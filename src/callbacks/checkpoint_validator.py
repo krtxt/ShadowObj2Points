@@ -20,6 +20,7 @@ class CheckpointValidator(Callback):
     - Post-save verification of checkpoint file
     - Checkpoint loading test (optional)
     - Corruption detection
+    - Callback state cleanup to reduce checkpoint size
     
     Args:
         validate_on_save: Validate checkpoint immediately after saving.
@@ -27,7 +28,18 @@ class CheckpointValidator(Callback):
         validate_loadable: Actually try to load the checkpoint (slower but thorough).
         log_checkpoint: Log the size of saved checkpoints.
         required_keys: List of keys that must exist in the checkpoint.
+        strip_callback_states: Remove unnecessary callback states to reduce file size.
+        keep_callback_states: Callback names to preserve (e.g., ModelCheckpoint, EarlyStopping).
     """
+
+    # Callbacks whose state should be preserved for proper resume
+    DEFAULT_KEEP_CALLBACKS = frozenset({
+        "ModelCheckpoint",
+        "EarlyStopping",
+        "LearningRateMonitor",
+        "EMACallback",
+        "StochasticWeightAveraging",
+    })
 
     def __init__(
         self,
@@ -36,6 +48,8 @@ class CheckpointValidator(Callback):
         validate_loadable: bool = False,
         log_checkpoint: bool = True,
         required_keys: Optional[list] = None,
+        strip_callback_states: bool = True,
+        keep_callback_states: Optional[list] = None,
     ) -> None:
         super().__init__()
         self.validate_on_save = validate_on_save
@@ -43,6 +57,8 @@ class CheckpointValidator(Callback):
         self.validate_loadable = validate_loadable
         self.log_checkpoint = log_checkpoint
         self.required_keys = required_keys or ["state_dict", "epoch", "global_step"]
+        self.strip_callback_states = strip_callback_states
+        self.keep_callback_states = set(keep_callback_states) if keep_callback_states else self.DEFAULT_KEEP_CALLBACKS
         
         self._last_checkpoint_path: Optional[str] = None
         self._validation_errors: list = []
@@ -128,22 +144,45 @@ class CheckpointValidator(Callback):
         
         return len(errors) == 0, errors
 
-    @rank_zero_only
     def on_save_checkpoint(
         self,
         trainer: L.Trainer,
         pl_module: L.LightningModule,
         checkpoint: Dict[str, Any],
     ) -> None:
-        """Validate checkpoint before saving."""
-        if not self.validate_state_dict:
-            return
+        """Validate checkpoint and strip unnecessary callback states before saving."""
+        # Strip callback states to reduce checkpoint size
+        if self.strip_callback_states:
+            self._strip_callback_states(checkpoint)
         
-        if "state_dict" in checkpoint:
+        # Validate state_dict (only log on rank 0)
+        if self.validate_state_dict and "state_dict" in checkpoint:
             errors = self._validate_state_dict(checkpoint["state_dict"])
-            if errors:
+            if errors and trainer.is_global_zero:
                 log.warning(f"Pre-save checkpoint validation warnings: {errors}")
                 self._validation_errors.extend(errors)
+
+    def _strip_callback_states(self, checkpoint: Dict[str, Any]) -> None:
+        """Remove unnecessary callback states from checkpoint to reduce file size."""
+        if "callbacks" not in checkpoint:
+            return
+
+        callbacks = checkpoint["callbacks"]
+        original_count = len(callbacks)
+        removed = []
+
+        for key in list(callbacks.keys()):
+            # Extract callback class name (handle both "ClassName" and "module.ClassName" formats)
+            cb_name = key.split(".")[-1] if "." in key else key
+            
+            if cb_name not in self.keep_callback_states:
+                del callbacks[key]
+                removed.append(cb_name)
+
+        if removed:
+            log.debug(
+                f"Stripped {len(removed)}/{original_count} callback states: {removed}"
+            )
 
     def on_train_epoch_end(
         self, trainer: L.Trainer, pl_module: L.LightningModule

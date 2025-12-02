@@ -532,11 +532,22 @@ class _HandEncoderPreparedDataset(Dataset):
         if R_world.shape != (3, 3) or t_world.shape != (3,) or t_local.shape != (3,): return scene_pc
 
         pts = scene_pc[:, :3].to(dtype=torch.float32)
-        # Transform: (X_world - T_world) @ R_world + T_local
+        # Transform XYZ: (X_world - T_world) @ R_world + T_local
         local = (pts - t_world.view(1, 3)) @ R_world.float() + t_local.view(1, 3).float()
         
         if scene_pc.shape[1] > 3:
-            return torch.cat([local.to(dtype=scene_pc.dtype), scene_pc[:, 3:]], dim=1)
+            extra_features = scene_pc[:, 3:]
+            # If we have normals (columns 3:6), rotate them as well (no translation)
+            if scene_pc.shape[1] >= 6:
+                normals = scene_pc[:, 3:6].to(dtype=torch.float32)
+                # Rotate normals: N_local = N_world @ R_world (rotation only, no translation)
+                normals_local = normals @ R_world.float()
+                if scene_pc.shape[1] > 6:
+                    # Keep any additional features beyond normals unchanged
+                    extra_features = torch.cat([normals_local, scene_pc[:, 6:]], dim=1)
+                else:
+                    extra_features = normals_local
+            return torch.cat([local.to(dtype=scene_pc.dtype), extra_features.to(dtype=scene_pc.dtype)], dim=1)
         return local.to(dtype=scene_pc.dtype)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
@@ -747,6 +758,8 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
         point_cloud_hdf5_path: Optional[str] = None,
         point_cloud_max_cache_size: int = 200,
         max_points: int = 4096,
+        # Optional scene point cloud normals
+        use_scene_normals: bool = False,
     ) -> None:
         super().__init__()
         
@@ -789,6 +802,7 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
         self.point_cloud_hdf5_path = str(point_cloud_hdf5_path) if point_cloud_hdf5_path else None
         self.point_cloud_max_cache_size = int(point_cloud_max_cache_size)
         self.max_points = int(max_points)
+        self.use_scene_normals = bool(use_scene_normals)
         self._point_cloud_cache = None  # Lazy initialized
 
         # Normalization Config
@@ -911,7 +925,13 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
         return mode_dir
 
     def _make_base_dataset(self, phase: str) -> Dataset:
-        kwargs = {**self.dataset_kwargs, 'phase': phase, 'rot_type': self.rot_type, 'trans_anchor': self.trans_anchor}
+        kwargs = {
+            **self.dataset_kwargs,
+            'phase': phase,
+            'rot_type': self.rot_type,
+            'trans_anchor': self.trans_anchor,
+            'use_scene_normals': self.use_scene_normals,
+        }
         if self.mode in ('dexgraspnet', 'dex'):
             return MyDexGraspNet(**kwargs)
         if self.mode in ('bodexshadow', 'bodex', 'bodexhshadow'):
@@ -939,8 +959,9 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
             str(pc_path),
             max_cache_size=self.point_cloud_max_cache_size,
             max_points=self.max_points,
+            use_normals=self.use_scene_normals,
         )
-        logger.info(f"HandEncoderDataModule: point cloud cache enabled from {pc_path}")
+        logger.info(f"HandEncoderDataModule: point cloud cache enabled from {pc_path} (normals={self.use_scene_normals})")
         return self._point_cloud_cache
 
     def _make_cached_dataset(self, phase: str) -> Dataset:

@@ -24,6 +24,11 @@ cache_show_progress: true
 # cache_root: null
 # cache_max_shards_in_memory: 2
 
+# Scene point cloud normals
+# When true, returns 6D point cloud (xyz + normals) instead of 3D (xyz only)
+# Requires backbone.use_scene_normals=true to actually use the normals
+use_scene_normals: false
+
 # Optional phases for splits
 train_phase: train
 val_phase: test

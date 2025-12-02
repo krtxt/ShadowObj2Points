@@ -20,6 +20,7 @@ class HDF5PointCloudCache:
     - Lazy file opening (only opens when first accessed)
     - Per-object caching with configurable cache size
     - Scale extraction from scene_id
+    - Optional normals support (6D output when use_normals=True)
     """
     
     def __init__(
@@ -27,10 +28,12 @@ class HDF5PointCloudCache:
         file_path: str,
         max_cache_size: int = 100,
         max_points: int = 4096,
+        use_normals: bool = False,
     ) -> None:
         self.file_path = Path(file_path)
         self.max_cache_size = max_cache_size
         self.max_points = max_points
+        self.use_normals = bool(use_normals)
         self._file: Optional[h5py.File] = None
         self._cache: Dict[str, np.ndarray] = {}
         self._cache_order: List[str] = []
@@ -54,15 +57,15 @@ class HDF5PointCloudCache:
     def get(self, obj_code: str, scene_id: str) -> Optional[torch.Tensor]:
         """Get point cloud for object, applying scale from scene_id.
         
-        Returns only XYZ coordinates (first 3 columns), shape (N, 3).
+        Returns XYZ coordinates (N, 3) or XYZ + normals (N, 6) if use_normals=True.
         """
         f = self._ensure_open()
         
         if obj_code not in self._available_objects:
             return None
         
-        # Check cache
-        cache_key = f"{obj_code}_{scene_id}"
+        # Check cache (cache key includes normals flag to avoid mixing)
+        cache_key = f"{obj_code}_{scene_id}_n{int(self.use_normals)}"
         if cache_key in self._cache:
             return torch.from_numpy(self._cache[cache_key].copy())
         
@@ -83,8 +86,14 @@ class HDF5PointCloudCache:
                 indices = np.random.permutation(len(pc))[:self.max_points]
                 pc = pc[indices]
             
-            # Only keep XYZ (first 3 columns)
-            pc = pc[:, :3]
+            # Determine output dimension based on use_normals
+            has_normals = pc.shape[1] >= 6
+            if self.use_normals and has_normals:
+                # Return xyz + normals (6D), scale only affects xyz (already applied above)
+                pc = pc[:, :6]
+            else:
+                # Return xyz only (3D)
+                pc = pc[:, :3]
             
             # Update cache with LRU eviction
             if len(self._cache) >= self.max_cache_size:
@@ -251,7 +260,8 @@ class HDF5HandKeypointDataset(Dataset):
             if pc is not None:
                 sample["scene_pc"] = pc
             else:
-                sample["scene_pc"] = torch.zeros((0, 3), dtype=torch.float32)
+                out_dim = 6 if self.point_cloud_cache.use_normals else 3
+                sample["scene_pc"] = torch.zeros((0, out_dim), dtype=torch.float32)
         
         return sample
 

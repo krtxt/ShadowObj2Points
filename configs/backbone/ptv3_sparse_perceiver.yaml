@@ -33,7 +33,13 @@ enc_patch_size: [1024, 1024, 1024, 1024, 1024]
 mlp_ratio: 2
 
 # input_feature_dim: 输入特征维度（除 xyz 外）
+# - 1: default (PTv3 uses constant 1s when no extra features)
+# - 3: when use_scene_normals=true (normals as additional features)
 input_feature_dim: 1
+
+# Scene point cloud normals support
+# When true, the backbone expects and processes 6D input (xyz + normals)
+use_scene_normals: false
 
 # out_dim: 输出特征维度
 out_dim: 512

@@ -33,51 +33,9 @@ from lightning.pytorch.loggers import Logger
 from lightning.pytorch.tuner import Tuner
 from lightning.pytorch.utilities import rank_zero_only
 from omegaconf import DictConfig, OmegaConf
-from rich.console import Console
-
-from utils.logging_utils import setup_rich_logging
+from utils.logging_utils import setup_logging, console, DualConsole
 
 torch.set_float32_matmul_precision("high")
-
-
-class RankZeroLogger:
-    """Logger wrapper that only emits on rank zero."""
-
-    def __init__(self, logger: logging.Logger) -> None:
-        self._logger = logger
-
-    @rank_zero_only
-    def info(self, *args, **kwargs):
-        return self._logger.info(*args, **kwargs)
-
-    @rank_zero_only
-    def warning(self, *args, **kwargs):
-        return self._logger.warning(*args, **kwargs)
-
-    @rank_zero_only
-    def error(self, *args, **kwargs):
-        return self._logger.error(*args, **kwargs)
-
-    def __getattr__(self, name):
-        return getattr(self._logger, name)
-
-
-class RankZeroConsole:
-    """Console wrapper that only prints on rank zero."""
-
-    def __init__(self, console: Console) -> None:
-        self._console = console
-
-    @rank_zero_only
-    def print(self, *args, **kwargs):
-        return self._console.print(*args, **kwargs)
-
-    @rank_zero_only
-    def rule(self, *args, **kwargs):
-        return self._console.rule(*args, **kwargs)
-
-    def __getattr__(self, name):
-        return getattr(self._console, name)
 
 
 class GracefulExitManager:
@@ -89,7 +47,7 @@ class GracefulExitManager:
         self._trainer: Optional[Trainer] = None
         self._cfg: Optional[DictConfig] = None
         self._log: Optional[logging.Logger] = None
-        self._console: Optional[RankZeroConsole] = None
+        self._console: Optional[DualConsole] = None
         self._interrupted = False
         self._original_handlers: Dict[int, Any] = {}
 
@@ -104,7 +62,7 @@ class GracefulExitManager:
         trainer: Trainer,
         cfg: DictConfig,
         log: logging.Logger,
-        console: RankZeroConsole,
+        console: DualConsole,
     ) -> None:
         self._trainer = trainer
         self._cfg = cfg
@@ -402,7 +360,7 @@ def run_tuner(trainer: Trainer, model: L.LightningModule, dm: L.LightningDataMod
             log.info(f"Learning rate: [bold]{lr}[/]")
 
 
-def section(console: RankZeroConsole, title: str) -> None:
+def section(title: str) -> None:
     """Print a section header."""
     console.print("")
     console.rule(title)
@@ -412,26 +370,30 @@ def section(console: RankZeroConsole, title: str) -> None:
 @hydra.main(version_base="1.3", config_path="configs", config_name="config")
 def main(cfg: DictConfig) -> None:
     """Main training entrypoint."""
-    setup_rich_logging()
-    console = RankZeroConsole(Console())
-    log = RankZeroLogger(logging.getLogger("train"))
+    # Initialize logging first (console file set later after output_dir is known)
+    log = setup_logging()
 
     cfg = resolve_resume_config(cfg, log)
     validate_config(cfg)
 
-    section(console, "🌑 [bold italic #FF33AA] Training Configuration[/]")
+    # Setup console file output now that output_dir is known
+    if output_dir := cfg.get("paths", {}).get("output_dir"):
+        out_path = Path(to_absolute_path(str(output_dir)))
+        out_path.mkdir(parents=True, exist_ok=True)
+        console.setup_file(out_path / "console.log")
+
+    section("🌑 [bold italic #FF33AA] Training Configuration[/]")
     log.info(OmegaConf.to_yaml(cfg))
 
     if seed := cfg.get("seed"):
         seed_everything(int(seed), workers=True)
         log.info(f"[bold #33FFAA]Seed[/]: {seed}")
 
-    if output_dir := cfg.get("paths", {}).get("output_dir"):
-        Path(to_absolute_path(str(output_dir))).mkdir(parents=True, exist_ok=True)
+    if output_dir:
         log.info(f"[bold #33AAFF]Output[/]: {output_dir}")
 
     # DataModule
-    section(console, "😈 [bold italic #33FF00] Initializing DataModule[/]")
+    section("😈 [bold italic #33FF00] Initializing DataModule[/]")
     dm = hydra_instantiate(cfg.datamodule, _recursive_=False)
     log.info(f"[bold]{dm.__class__.__name__}[/]")
     dm.setup(stage="fit")
@@ -443,12 +405,14 @@ def main(cfg: DictConfig) -> None:
     log.info(f"Graph: [bold #55FF55]N={graph['finger_ids'].shape[0]}, E={graph['edge_index'].shape[1]}[/]")
 
     # Model
-    section(console, "🔮 [bold italic #FF33CC] Initializing Model[/]")
+    section("🔮 [bold italic #FF33CC] Initializing Model[/]")
     if "_target_" not in cfg.get("model", {}):
         raise ValueError("cfg.model must have '_target_'")
 
     model = hydra_instantiate(cfg.model, graph_consts=graph, _recursive_=False)
-    model.run_meta = {
+    if not hasattr(model, "run_info"):
+        model.run_info = {}
+    model.run_info["meta"] = {
         k: v for k, v in {
             "experiment_name": cfg.get("experiment_name"),
             "backbone_name": getattr(OmegaConf.select(cfg, "backbone"), "name", None),
@@ -468,7 +432,7 @@ def main(cfg: DictConfig) -> None:
     log.info(f"Parameters: [bold #33AAFF]{total:,}[/] (trainable: {trainable:,})")
 
     # Callbacks & Logger
-    section(console, "🕸️ [bold italic #9900CC] Setting up Callbacks & Logger[/]")
+    section("🕸️ [bold italic #9900CC] Setting up Callbacks & Logger[/]")
     callbacks = instantiate_callbacks(cfg.get("callbacks"), "callbacks", log)
     for cb in callbacks:
         log.info(f" [bold]{cb.__class__.__name__}[/]")
@@ -478,7 +442,7 @@ def main(cfg: DictConfig) -> None:
         log.info(f" [bold]{logger.__class__.__name__}[/]")
 
     # Trainer
-    section(console, "🦄 [bold italic #3300FF] Initializing Trainer[/]")
+    section("🦄 [bold italic #3300FF] Initializing Trainer[/]")
     trainer = build_trainer(cfg, callbacks, logger, log)
     log.info(f"Accelerator: [bold]{trainer.accelerator}[/], Devices: [bold]{cfg.trainer.devices}[/]")
     log.info(f"Precision: [bold]{cfg.trainer.precision}[/], Max epochs: [bold]{cfg.trainer.max_epochs}[/]")
@@ -495,7 +459,7 @@ def main(cfg: DictConfig) -> None:
     ckpt_path = ckpt_path or find_last_checkpoint(cfg, log)
 
     if ckpt_path:
-        section(console, "🔍 [bold italic #00AAFF] Checkpoint Validation[/]")
+        section("🔍 [bold italic #00AAFF] Checkpoint Validation[/]")
         valid, epoch = validate_checkpoint(ckpt_path, log, cfg.get("validate_checkpoint", True))
         if not valid:
             raise RuntimeError(f"Invalid checkpoint: {ckpt_path}")
@@ -504,7 +468,7 @@ def main(cfg: DictConfig) -> None:
             log.info(f"Resume epoch: {epoch}")
 
     # Train
-    section(console, "🖤 [bold italic #CC9900] Starting Training[/]")
+    section("🖤 [bold italic #CC9900] Starting Training[/]")
     try:
         trainer.fit(model=model, datamodule=dm, ckpt_path=ckpt_path)
 

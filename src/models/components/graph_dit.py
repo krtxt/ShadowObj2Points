@@ -84,7 +84,7 @@ class FeedForward(nn.Module):
         self.final_dropout = final_dropout
         self.dropout = nn.Dropout(dropout)
 
-        if act == "geglu":
+        if act == "geglu" or act == "swiglu":
             self.proj_in = nn.Linear(dim, inner_dim * 2, bias=bias)
         else:
             self.proj_in = nn.Linear(dim, inner_dim, bias=bias)
@@ -95,8 +95,14 @@ class FeedForward(nn.Module):
         if self.activation_fn == "geglu":
             x_in, gate = self.proj_in(x).chunk(2, dim=-1)
             x_in = x_in * F.gelu(gate)
+        elif self.activation_fn == "swiglu":
+            x_in, gate = self.proj_in(x).chunk(2, dim=-1)
+            x_in = x_in * F.silu(gate)
         elif self.activation_fn == "gelu":
             x_in = F.gelu(self.proj_in(x))
+        elif self.activation_fn == "approx_gelu":
+            # tanh approximation of GELU, faster on some hardware
+            x_in = F.gelu(self.proj_in(x), approximate="tanh")
         elif self.activation_fn == "silu":
             x_in = F.silu(self.proj_in(x))
         else:
@@ -307,16 +313,33 @@ class CrossAttention(nn.Module):
             self.q_norm = None
             self.k_norm = None
 
+    def _format_attn_bias(
+        self,
+        attn_bias: torch.Tensor,
+        batch: int,
+        heads: int,
+        seq_len: int,
+        ctx_len: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Broadcast bias to SDPA-compatible shape."""
+        if attn_bias.dim() == 3:
+            # (B, N, K) -> (B, 1, N, K)
+            attn_bias = attn_bias.unsqueeze(1)
+        return attn_bias.to(dtype=dtype)
+
     def forward(
         self,
         x: torch.Tensor,
         context: torch.Tensor,
+        attn_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute cross-attention between target and context tokens.
         
         Args:
             x: Target tokens of shape (B, N, D)
             context: Context tokens of shape (B, K, C)
+            attn_bias: Optional additive bias of shape (B, 1, N, K) or (B, N, K)
             
         Returns:
             Output tokens of shape (B, N, D)
@@ -334,14 +357,20 @@ class CrossAttention(nn.Module):
             k = self.k_norm(k)
             
         if self.use_sdpa:
-            # For cross attention, attn_mask is usually None unless we need masking
+            attn_mask = None
+            if attn_bias is not None:
+                attn_mask = self._format_attn_bias(attn_bias, B, h, N, k.size(2), q.dtype)
             out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=False
+                q, k, v, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0.0, is_causal=False
             )
             out = out.transpose(1, 2).contiguous().view(B, N, D)
             return self.to_out(out)
             
         scores = torch.matmul(q, k.transpose(-2, -1)) / (dh**0.5)
+        if attn_bias is not None:
+            if attn_bias.dim() == 3:
+                attn_bias = attn_bias.unsqueeze(1)
+            scores = scores + attn_bias
         attn = F.softmax(scores, dim=-1)
         attn = F.dropout(attn, p=self.dropout, training=self.training)
         out = torch.matmul(attn, v)
@@ -481,6 +510,7 @@ class HandSceneGraphDiTBlock(nn.Module):
         scene_tokens: Optional[torch.Tensor], # (B, K, D_scene); may be None
         temb: torch.Tensor,                   # (B, D) flow embedding already projected to D
         graph_attn_bias: Optional[torch.Tensor] = None,  # (B,1,N,N) or (B,N,N)
+        cross_attn_bias: Optional[torch.Tensor] = None,  # (B,1,N,K) or (B,N,K)
     ) -> torch.Tensor:
         """
         Returns:
@@ -503,7 +533,7 @@ class HandSceneGraphDiTBlock(nn.Module):
         if scene_tokens is not None:
             h = self.norm2(x)
             h = modulate(h, shift_ca, scale_ca)
-            h = self.cross_attn(h, scene_tokens)
+            h = self.cross_attn(h, scene_tokens, attn_bias=cross_attn_bias)
             x = x + gate_ca.unsqueeze(1) * h
         
         # 4. Feed-Forward Block
@@ -563,11 +593,15 @@ class HandSceneGraphDiT(nn.Module):
         ff_inner_dim: Optional[int] = None,
         ff_bias: bool = True,
         norm_eps: float = 1e-6,
+        hand_scene_bias: bool = False,
+        hand_scene_bias_gamma: float = 1.0,
     ):
         super().__init__()
         self.dim = dim
         self.depth = depth
         self.graph_bias = graph_bias
+        self.hand_scene_bias = bool(hand_scene_bias)
+        self.hand_scene_bias_gamma = float(hand_scene_bias_gamma)
 
         self.blocks = nn.ModuleList(
             [
@@ -607,6 +641,7 @@ class HandSceneGraphDiT(nn.Module):
         scene_tokens: Optional[torch.Tensor],  # (B, K, D_s) or None
         temb: torch.Tensor,                    # (B, D)
         xyz: Optional[torch.Tensor] = None,    # (B, N, 3) for graph bias; skip if None
+        scene_xyz: Optional[torch.Tensor] = None,  # (B, K, 3) for hand-scene bias; skip if None
     ) -> torch.Tensor:
         """Return updated hand tokens after passing through all DiT blocks."""
         B, N, D = hand_tokens.shape
@@ -616,6 +651,20 @@ class HandSceneGraphDiT(nn.Module):
         if self.graph_bias is not None and xyz is not None:
             attn_bias = self.graph_bias(xyz)
 
+        # Hand-scene distance bias for cross-attention (optional)
+        cross_attn_bias = None
+        if (
+            self.hand_scene_bias
+            and xyz is not None
+            and scene_tokens is not None
+            and scene_xyz is not None
+        ):
+            # dist: (B, N, K)
+            dist = torch.cdist(xyz, scene_xyz)
+            cross_attn_bias = -self.hand_scene_bias_gamma * dist
+            # (B, N, K) -> (B,1,N,K) for broadcasting in attention
+            cross_attn_bias = cross_attn_bias.unsqueeze(1).to(dtype=hand_tokens.dtype)
+
         h = hand_tokens
         for block in self.blocks:
             h = block(
@@ -623,6 +672,7 @@ class HandSceneGraphDiT(nn.Module):
                 scene_tokens=scene_tokens,
                 temb=temb,
                 graph_attn_bias=attn_bias,
+                cross_attn_bias=cross_attn_bias,
             )
             
         h = self.final_layer(h, temb)
@@ -680,16 +730,17 @@ def build_dit(
         return default
 
     d_struct = _get("d_struct", 8)
-    depth = _get("depth", 6)
+    depth = _get("depth", 8)
     num_heads = _get("num_heads", 8)
     cross_attention_dim = _get("cross_attention_dim", None)
     ff_inner_dim = _get("ff_inner_dim", None)
     ff_bias = _get("ff_bias", True)
     dropout = _get("dropout", 0.0)
     activation_fn = _get("activation_fn", "geglu")
-    qk_norm = _get("qk_norm", True)
+    qk_norm = _get("qk_norm", False)
     qk_norm_type = _get("qk_norm_type", "layer")
     norm_type = _get("norm_type", "layer")
+    norm_eps = _get("norm_eps", 1e-6)
 
     def _subcfg_value(node: Any, key: str, default):
         if node is None: return default
@@ -701,6 +752,10 @@ def build_dit(
     graph_bias_cfg = _get("graph_bias", None)
     graph_bias_enabled = _subcfg_value(graph_bias_cfg, "enabled", True)
     d_struct = _subcfg_value(graph_bias_cfg, "d_struct", d_struct)
+
+    hand_scene_bias_cfg = _get("hand_scene_bias", None)
+    hand_scene_bias_enabled = _subcfg_value(hand_scene_bias_cfg, "enabled", False)
+    hand_scene_bias_gamma = _subcfg_value(hand_scene_bias_cfg, "gamma", 1.0)
 
     graph_bias_module: Optional[GraphAttentionBias]
     if graph_bias_enabled:
@@ -731,6 +786,9 @@ def build_dit(
         norm_type=norm_type,
         ff_inner_dim=ff_inner_dim,
         ff_bias=ff_bias,
+        norm_eps=norm_eps,
+        hand_scene_bias=hand_scene_bias_enabled,
+        hand_scene_bias_gamma=hand_scene_bias_gamma,
     )
 
 if __name__ == "__main__":

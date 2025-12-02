@@ -1,13 +1,17 @@
+import logging
+from typing import List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional, Tuple
 
 # Try importing pytorch3d
 try:
     from pytorch3d.transforms import rotation_6d_to_matrix
 except ImportError:
     rotation_6d_to_matrix = None
+
+logger = logging.getLogger(__name__)
 
 
 # Geometric & Graph Utilities
@@ -319,11 +323,21 @@ class XPBDProjector(nn.Module):
 # Velocity Strategies
 
 class VelocityStrategyBase(nn.Module):
-    """Abstract base class for velocity strategies."""
+    """Abstract base class for velocity strategies.
     
-    def __init__(self, tau_min: float = 1e-3):
+    Args:
+        tau_min: Minimum tau value to prevent division by zero (default: 1e-3)
+        prediction_target: Network output semantic, "v" for velocity, "x" for target position.
+                          When "x", velocity is derived as v = (x_pred - z) / (1-t).
+                          Reference: JiT (Just-in-Time) paper shows predicting x can improve quality.
+    """
+    
+    def __init__(self, tau_min: float = 1e-3, prediction_target: str = "v"):
         super().__init__()
         self.tau_min = float(tau_min)
+        self.prediction_target = prediction_target.lower()
+        assert self.prediction_target in ("x", "v"), \
+            f"prediction_target must be 'x' or 'v', got '{prediction_target}'"
 
     def predict(self, model, keypoints, timesteps, hand_tokens_out) -> torch.Tensor:
         raise NotImplementedError
@@ -332,7 +346,33 @@ class VelocityStrategyBase(nn.Module):
         """Compute time scaling factor tau from timestep t (0 to 1)."""
         if t.dim() == 1:
             t = t.view(-1, 1, 1)
-        return torch.clamp(1.0 - t, min=self.tau_min)
+        tau = torch.clamp(1.0 - t, min=self.tau_min)
+        if self.prediction_target == "x":
+            near_one = t >= (1.0 - self.tau_min)
+            tau = torch.where(near_one, torch.ones_like(tau), tau)
+        return tau
+
+    def _output_to_velocity(
+        self,
+        output: torch.Tensor,
+        keypoints: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        """Convert network head output to velocity based on prediction_target.
+        
+        Args:
+            output: Network head output (B, N, 3), semantic depends on prediction_target
+            keypoints: Current keypoints z (B, N, 3)
+            timesteps: Current timesteps t (B,)
+            
+        Returns:
+            Velocity v (B, N, 3)
+        """
+        if self.prediction_target == "v":
+            return output
+        else:  # prediction_target == "x"
+            tau = self._tau(timesteps)
+            return (output - keypoints) / tau
 
     def apply_tangent_projection(self, v: torch.Tensor, keypoints: torch.Tensor) -> torch.Tensor:
         """Apply tangent projection if enabled."""
@@ -343,17 +383,27 @@ class VelocityStrategyBase(nn.Module):
 
 class DirectVelocityStrategy(VelocityStrategyBase):
     """
-    Predicts velocity directly from tokens.
-    v = head(tokens)
+    Predicts velocity directly from tokens (or target x when prediction_target='x').
+    
+    When prediction_target='v': output = v (velocity)
+    When prediction_target='x': output = x_pred, v = (x_pred - z) / (1-t)
     """
-    def __init__(self, d_model: int, use_tangent: bool, edge_index: torch.Tensor):
-        super().__init__()
+    def __init__(
+        self,
+        d_model: int,
+        use_tangent: bool,
+        edge_index: torch.Tensor,
+        tau_min: float = 1e-3,
+        prediction_target: str = "v",
+    ):
+        super().__init__(tau_min=tau_min, prediction_target=prediction_target)
         self.head = nn.Linear(d_model, 3)
         self.register_buffer("edge_index", edge_index.clone().detach())
         self.tangent_projector = TangentProjector(edge_index) if use_tangent else None
 
     def predict(self, model, keypoints, timesteps, hand_tokens_out) -> torch.Tensor:
-        v = self.head(hand_tokens_out)
+        output = self.head(hand_tokens_out)
+        v = self._output_to_velocity(output, keypoints, timesteps)
         v = self.apply_tangent_projection(v, keypoints)
         return v
 
@@ -362,6 +412,8 @@ class PhysGuidedVelocityStrategy(VelocityStrategyBase):
     """
     Direct velocity + gradient correction towards satisfying lengths.
     v = v_pred - eta * grad(ConstraintEnergy)
+    
+    Supports prediction_target='x' or 'v'.
     """
     def __init__(
         self,
@@ -370,8 +422,10 @@ class PhysGuidedVelocityStrategy(VelocityStrategyBase):
         rest_lengths: torch.Tensor,
         eta: float = 0.5,
         use_tangent: bool = True,
+        tau_min: float = 1e-3,
+        prediction_target: str = "v",
     ):
-        super().__init__()
+        super().__init__(tau_min=tau_min, prediction_target=prediction_target)
         self.head = nn.Linear(d_model, 3)
         self.register_buffer("edge_index", edge_index.clone().detach())
         self.register_buffer("rest_lengths", rest_lengths.clone().detach())
@@ -404,7 +458,8 @@ class PhysGuidedVelocityStrategy(VelocityStrategyBase):
         return out
 
     def predict(self, model, keypoints, timesteps, hand_tokens_out) -> torch.Tensor:
-        v_raw = self.head(hand_tokens_out)
+        output = self.head(hand_tokens_out)
+        v_raw = self._output_to_velocity(output, keypoints, timesteps)
         grad = self._length_grad(keypoints)
         v = v_raw - self.eta * grad
         v = self.apply_tangent_projection(v, keypoints)
@@ -427,7 +482,7 @@ class GoalKabschVelocityStrategy(VelocityStrategyBase):
         tau_min: float = 1e-3,
         use_tangent: bool = True,
     ):
-        super().__init__(tau_min=tau_min)
+        super().__init__(tau_min=tau_min, prediction_target="x")
         self.decode = nn.Sequential(
             nn.Linear(d_model, 256), nn.SiLU(),
             nn.Linear(256, 3)
@@ -468,7 +523,7 @@ class GroupRigidParamVelocityStrategy(VelocityStrategyBase):
         use_tangent: bool = True,
         tau_min: float = 1e-3,
     ):
-        super().__init__(tau_min=tau_min)
+        super().__init__(tau_min=tau_min, prediction_target="x")
         self.groups = [g.clone().detach() for g in groups]
         self.template = template_xyz.clone().detach()
         self.register_buffer("edge_index", edge_index.clone().detach())
@@ -535,6 +590,8 @@ class PBDCorrectedVelocityStrategy(VelocityStrategyBase):
     """
     Predicts velocity, takes a step, then corrects position with XPBD, then re-computes velocity.
     v = (XPBD(x + tau*v_pred) - x) / tau
+    
+    Supports prediction_target='x' or 'v'.
     """
     def __init__(
         self,
@@ -546,8 +603,9 @@ class PBDCorrectedVelocityStrategy(VelocityStrategyBase):
         xpbd_max_corr: float = 0.15,
         use_tangent: bool = False,
         tau_min: float = 1e-3,
+        prediction_target: str = "v",
     ):
-        super().__init__(tau_min=tau_min)
+        super().__init__(tau_min=tau_min, prediction_target=prediction_target)
         self.head = nn.Linear(d_model, 3)
         self.projector = XPBDProjector(
             edge_index=edge_index,
@@ -561,7 +619,8 @@ class PBDCorrectedVelocityStrategy(VelocityStrategyBase):
 
     def predict(self, model, keypoints, timesteps, hand_tokens_out) -> torch.Tensor:
         tau = self._tau(timesteps)
-        v_pred = self.head(hand_tokens_out)
+        output = self.head(hand_tokens_out)
+        v_pred = self._output_to_velocity(output, keypoints, timesteps)
         
         x_raw = keypoints + tau * v_pred
         x_corr = self.projector(x_raw)
@@ -573,21 +632,41 @@ class PBDCorrectedVelocityStrategy(VelocityStrategyBase):
 
 # Velocity Strategy Registry
 
-def _build_direct(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs):
+def _build_direct(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs, prediction_target, tau_min):
     """Builder for DirectVelocityStrategy"""
     use_tangent = bool(kwargs.get("use_tangent", False))
-    return DirectVelocityStrategy(d_model=d_model, use_tangent=use_tangent, edge_index=edge_index)
+    return DirectVelocityStrategy(
+        d_model=d_model,
+        use_tangent=use_tangent,
+        edge_index=edge_index,
+        tau_min=tau_min,
+        prediction_target=prediction_target,
+    )
 
-def _build_direct_tangent(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs):
+def _build_direct_tangent(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs, prediction_target, tau_min):
     """Builder for DirectVelocityStrategy with tangent=True"""
     use_tangent = bool(kwargs.get("use_tangent", True))
-    return DirectVelocityStrategy(d_model=d_model, use_tangent=use_tangent, edge_index=edge_index)
+    return DirectVelocityStrategy(
+        d_model=d_model,
+        use_tangent=use_tangent,
+        edge_index=edge_index,
+        tau_min=tau_min,
+        prediction_target=prediction_target,
+    )
 
-def _build_goal_kabsch(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs):
-    """Builder for GoalKabschVelocityStrategy"""
+def _build_goal_kabsch(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs, prediction_target, tau_min):
+    """Builder for GoalKabschVelocityStrategy.
+    
+    Note: This strategy inherently predicts x (goal position) then derives v.
+    The prediction_target parameter is ignored as it's always effectively 'x'.
+    """
+    if prediction_target == "v":
+        logger.warning(
+            "goal_kabsch strategy always predicts goal x internally and derives v; "
+            "prediction_target='v' is ignored."
+        )
     if template_xyz is None:
         raise ValueError("template_xyz required for goal_kabsch strategy")
-    tau_min = float(kwargs.get("tau_min", 1e-3))
     use_tangent = bool(kwargs.get("use_tangent", True))
     return GoalKabschVelocityStrategy(
         d_model=d_model,
@@ -598,11 +677,19 @@ def _build_goal_kabsch(d_model, edge_index, rest_lengths, template_xyz, groups, 
         use_tangent=use_tangent,
     )
 
-def _build_group_rigid(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs):
-    """Builder for GroupRigidParamVelocityStrategy"""
+def _build_group_rigid(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs, prediction_target, tau_min):
+    """Builder for GroupRigidParamVelocityStrategy.
+    
+    Note: This strategy inherently predicts rigid parameters then derives goal x and v.
+    The prediction_target parameter is ignored as it's always effectively 'x'.
+    """
+    if prediction_target == "v":
+        logger.warning(
+            "group_rigid strategy always predicts rigid transforms and derives goal x then v; "
+            "prediction_target='v' is ignored."
+        )
     if template_xyz is None:
         raise ValueError("template_xyz required for group_rigid strategy")
-    tau_min = float(kwargs.get("tau_min", 1e-3))
     use_tangent = bool(kwargs.get("use_tangent", True))
     return GroupRigidParamVelocityStrategy(
         d_model=d_model,
@@ -613,7 +700,7 @@ def _build_group_rigid(d_model, edge_index, rest_lengths, template_xyz, groups, 
         tau_min=tau_min,
     )
 
-def _build_pbd_corrected(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs):
+def _build_pbd_corrected(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs, prediction_target, tau_min):
     """Builder for PBDCorrectedVelocityStrategy"""
     return PBDCorrectedVelocityStrategy(
         d_model=d_model,
@@ -623,10 +710,11 @@ def _build_pbd_corrected(d_model, edge_index, rest_lengths, template_xyz, groups
         xpbd_compliance=float(kwargs.get("compliance", 0.0)),
         xpbd_max_corr=float(kwargs.get("max_corr", 0.15)),
         use_tangent=bool(kwargs.get("use_tangent", False)),
-        tau_min=float(kwargs.get("tau_min", 1e-3)),
+        tau_min=tau_min,
+        prediction_target=prediction_target,
     )
 
-def _build_phys_guided(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs):
+def _build_phys_guided(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs, prediction_target, tau_min):
     """Builder for PhysGuidedVelocityStrategy"""
     return PhysGuidedVelocityStrategy(
         d_model=d_model,
@@ -634,6 +722,8 @@ def _build_phys_guided(d_model, edge_index, rest_lengths, template_xyz, groups, 
         rest_lengths=rest_lengths,
         eta=float(kwargs.get("eta", 0.5)),
         use_tangent=bool(kwargs.get("use_tangent", True)),
+        tau_min=tau_min,
+        prediction_target=prediction_target,
     )
 
 VELOCITY_STRATEGY_REGISTRY = {
@@ -647,15 +737,15 @@ VELOCITY_STRATEGY_REGISTRY = {
     },
     "goal_kabsch": {
         "builder": _build_goal_kabsch,
-        "allowed_kwargs": {"tau_min", "use_tangent"},
+        "allowed_kwargs": {"use_tangent"},
     },
     "group_rigid": {
         "builder": _build_group_rigid,
-        "allowed_kwargs": {"tau_min", "use_tangent"},
+        "allowed_kwargs": {"use_tangent"},
     },
     "pbd_corrected": {
         "builder": _build_pbd_corrected,
-        "allowed_kwargs": {"iters", "compliance", "max_corr", "use_tangent", "tau_min"},
+        "allowed_kwargs": {"iters", "compliance", "max_corr", "use_tangent"},
     },
     "phys_guided": {
         "builder": _build_phys_guided,
@@ -671,6 +761,8 @@ def build_velocity_strategy(
     template_xyz: Optional[torch.Tensor],
     groups: List[torch.Tensor],
     kwargs: Optional[dict] = None,
+    prediction_target: str = "v",
+    tau_min: float = 1e-3,
 ) -> VelocityStrategyBase:
     """
     Factory function to build a velocity strategy from registry.
@@ -683,6 +775,11 @@ def build_velocity_strategy(
         template_xyz: Template keypoints (optional, required for some strategies)
         groups: Rigid groups (required for some strategies)
         kwargs: Additional strategy-specific keyword arguments
+        prediction_target: Network output semantic, "v" for velocity, "x" for target position.
+                          When "x", velocity is derived as v = (x_pred - z) / (1-t).
+                          Note: goal_kabsch and group_rigid strategies always predict x internally.
+        tau_min: Minimum tau value to prevent division by zero when prediction_target='x'.
+                 Default 1e-3 (conservative), JiT paper uses 1e-5.
     
     Returns:
         VelocityStrategyBase instance
@@ -692,6 +789,8 @@ def build_velocity_strategy(
     """
     mode_lower = str(mode).lower()
     kwargs = dict(kwargs or {})
+    prediction_target = str(prediction_target).lower()
+    tau_min = float(tau_min)
     
     if mode_lower not in VELOCITY_STRATEGY_REGISTRY:
         available = sorted(VELOCITY_STRATEGY_REGISTRY.keys())
@@ -709,7 +808,7 @@ def build_velocity_strategy(
         )
     
     builder = entry["builder"]
-    return builder(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs)
+    return builder(d_model, edge_index, rest_lengths, template_xyz, groups, kwargs, prediction_target, tau_min)
 
 
 # State Projector Registry

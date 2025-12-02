@@ -44,6 +44,22 @@ velocity_kwargs: ${velocity_strategy.kwargs}
 state_projection_mode: ${velocity_strategy.projection_mode}
 state_projection_kwargs: ${velocity_strategy.projection_kwargs}
 
+# -----------------------------------------------------------------------------
+# 2.2 Prediction Target (JiT-style option)
+# -----------------------------------------------------------------------------
+# prediction_target: 网络输出的语义，参考 JiT (arXiv:2411.xxx) 的研究结论
+#   - "v": 直接预测速度 v (默认，传统 Flow Matching)
+#   - "x": 预测目标位置 x，然后反推速度 v = (x_pred - z) / (1-t)
+#          JiT 发现预测 x 可以获得更好的生成质量
+# 此选项与 velocity_strategy 正交，可自由组合
+prediction_target: v
+
+# tau_min: 当 prediction_target='x' 时，防止 t→1 除零的最小值
+#   - 1e-3: 默认值，较保守
+#   - 1e-5: JiT 论文使用的值，更激进
+#   - 如果训练末期不稳定，可以增大此值
+tau_min: 1e-3
+
 
 # -----------------------------------------------------------------------------
 # 3. Flow Matching loss

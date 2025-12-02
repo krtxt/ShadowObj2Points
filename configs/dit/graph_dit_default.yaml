@@ -37,6 +37,9 @@ graph_bias:
   d_struct: 8
 
 # Optional hand->scene distance bias added to cross-attention logits
+# Uses squared distance for smoother decay: bias = -gamma * dist²
+# - Near points: fine-grained differentiation
+# - Far points: rapid falloff
 hand_scene_bias:
   enabled: false   # default off for backward compatibility
-  gamma: 1.0       # scale for negative distance bias (bias = -gamma * dist)
+  gamma: 0.5       # scale for negative squared distance bias (bias = -gamma * dist²)

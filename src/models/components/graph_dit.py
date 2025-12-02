@@ -659,9 +659,12 @@ class HandSceneGraphDiT(nn.Module):
             and scene_tokens is not None
             and scene_xyz is not None
         ):
-            # dist: (B, N, K)
-            dist = torch.cdist(xyz, scene_xyz)
-            cross_attn_bias = -self.hand_scene_bias_gamma * dist
+            # Squared distance for smoother attention decay
+            # - Near points: fine-grained differentiation (d² grows slowly)
+            # - Far points: rapid falloff (d² grows fast)
+            # dist_sq: (B, N, K)
+            dist_sq = torch.cdist(xyz, scene_xyz).pow(2)
+            cross_attn_bias = -self.hand_scene_bias_gamma * dist_sq
             # (B, N, K) -> (B,1,N,K) for broadcasting in attention
             cross_attn_bias = cross_attn_bias.unsqueeze(1).to(dtype=hand_tokens.dtype)
 

@@ -417,6 +417,7 @@ def main(cfg: DictConfig) -> None:
             "experiment_name": cfg.get("experiment_name"),
             "backbone_name": getattr(OmegaConf.select(cfg, "backbone"), "name", None),
             "velocity_mode": getattr(model, "velocity_mode", None),
+            "prediction_target": getattr(model, "prediction_target", None),
         }.items() if v is not None
     }
 

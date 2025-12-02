@@ -113,6 +113,8 @@ class ValidationSummaryCallback(Callback):
                 meta_parts.append(f"Velocity: {vel}")
             if bb := meta.get("backbone_name"):
                 meta_parts.append(f"Backbone: {bb}")
+            if pt := meta.get("prediction_target"):
+                meta_parts.append(f"PredTarget: {pt}")
             if meta_parts:
                 console.print(f"[metric]Meta[/metric]: [value]{' | '.join(meta_parts)}[/value]")
 

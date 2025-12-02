@@ -1,6 +1,5 @@
 mode: "group_rigid"
 kwargs:
-  tau_min: 0.005
   use_tangent: true
 projection_mode: "rigid"
 projection_kwargs: {}

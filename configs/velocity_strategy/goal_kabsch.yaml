@@ -1,7 +1,6 @@
 # Goal-directed Kabsch velocity strategy
 mode: "goal_kabsch"
 kwargs:
-  tau_min: 0.005
   use_tangent: true
 # Rigid projection is recommended for this strategy
 projection_mode: "rigid"

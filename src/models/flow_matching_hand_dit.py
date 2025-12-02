@@ -99,9 +99,13 @@ class HandFlowMatchingDiT(L.LightningModule):
         use_per_point_gaussian_noise: bool = False,
         # Validation sampling config
         val_num_sample_batches: int = 10,
+        # Prediction target (JiT-style option)
+        prediction_target: str = "v",
+        tau_min: float = 1e-3,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["graph_consts", "backbone", "hand_encoder", "dit"])
+        self.prediction_target = str(prediction_target).lower()
         self.use_norm_data = bool(use_norm_data)
         self.use_per_point_gaussian_noise = bool(use_per_point_gaussian_noise)
         self._setup_graph_structure(graph_consts)
@@ -109,7 +113,7 @@ class HandFlowMatchingDiT(L.LightningModule):
             self._validate_norm_bounds()
             self._apply_norm_to_graph_consts()
         self._setup_core_modules(d_model, backbone, hand_encoder, dit, graph_consts)
-        self._setup_velocity_strategy(d_model, velocity_mode, velocity_kwargs)
+        self._setup_velocity_strategy(d_model, velocity_mode, velocity_kwargs, prediction_target, tau_min)
         self._setup_sampling_config(
             sample_num_steps, sample_solver, sample_schedule, schedule_shift,
             state_projection_mode, state_projection_kwargs, proj_num_iters, proj_max_corr
@@ -264,6 +268,8 @@ class HandFlowMatchingDiT(L.LightningModule):
         d_model: int,
         velocity_mode: str,
         velocity_kwargs: Optional[Dict],
+        prediction_target: str = "v",
+        tau_min: float = 1e-3,
     ) -> None:
         """Build velocity prediction strategy."""
         self.velocity_mode = str(velocity_mode).lower()
@@ -275,6 +281,8 @@ class HandFlowMatchingDiT(L.LightningModule):
             template_xyz=self.template_xyz,
             groups=self.rigid_groups_active if self.rigid_groups_active else self.rigid_groups,
             kwargs=velocity_kwargs,
+            prediction_target=prediction_target,
+            tau_min=tau_min,
         )
     
     def _setup_sampling_config(

@@ -40,21 +40,43 @@ export CUDA_VISIBLE_DEVICES=4,5,6,7
 #     datamodule.prefetch_factor=2 \
 #     datamodule.persistent_workers=false
 
+# python train.py \
+#     model=flow_matching_hand_dit \
+#     backbone=ptv3_sparse \
+#     datamodule=handencoder_dm_dex \
+#     experiments=multi_gpu \
+#     optimizer.lr=2e-4 \
+#     compile=false \
+#     experiment_name=exp_1130_fm_direct_free_full \
+#     dit.qk_norm=true \
+#     dit.qk_norm_type='rms' \
+#     batch_size=320 \
+#     trainer.precision=bf16-mixed \
+#     velocity_strategy=direct_free \
+#     datamodule.num_workers=16 \
+#     datamodule.prefetch_factor=2 \
+#     datamodule.persistent_workers=false 
+
 python train.py \
     model=flow_matching_hand_dit \
-    backbone=ptv3_sparse \
+    backbone=ptv3_sparse_fourier \
     datamodule=handencoder_dm_dex \
+    datamodule.use_scene_normals=true \
     experiments=multi_gpu \
     optimizer.lr=2e-4 \
-    compile=false \
-    experiment_name=exp_1130_fm_direct_free_full \
+    compile=true \
+    experiment_name=exp_1202_fm_direct_free_full \
     dit.qk_norm=true \
     dit.qk_norm_type='rms' \
+    dit.norm_type='rms' \
+    dit.activation_fn=swiglu \
+    dit.hand_scene_bias.enabled=true \
     batch_size=320 \
     trainer.precision=bf16-mixed \
     velocity_strategy=direct_free \
+    model.prediction_target=x \
     datamodule.num_workers=16 \
-    datamodule.prefetch_factor=2 \
+    datamodule.prefetch_factor=4 \
     datamodule.persistent_workers=false 
 
 

@@ -12,15 +12,20 @@ from typing import Dict, List, Optional, Union
 logger = logging.getLogger(__name__)
 
 
-# Default weights when curriculum is disabled
-# These represent a balanced configuration for stable training
+# Default weights when curriculum is disabled.
+# These keys correspond to registered LossComponent names in LOSS_COMPONENT_REGISTRY.
+# Components with weight=0 are not computed by LossManager (saves compute).
 DEFAULT_WEIGHTS = {
-    "smooth_l1": 2.0,    # Primary position regression (Huber-like, robust to outliers)
+    "l1": 2.0,           # Primary position regression (MAE)
     "chamfer": 1.0,      # Bidirectional point cloud distance for global shape consistency
     "direction": 1.0,    # Edge direction alignment for correct bone orientations
     "edge_len": 1.0,     # Edge length consistency for skeleton proportions
-    "bone": 0.0,         # Bone length regularization vs template (can overlap with edge_len)
+    "bone": 0.0,         # Bone length regularization vs template (weight=0 skips computation)
     "collision": 0.25,   # Penetration penalty against scene geometry
+}
+
+LEGACY_WEIGHT_ALIASES = {
+    "smooth_l1": "l1",
 }
 
 # Default curriculum stages with rationale:
@@ -32,7 +37,7 @@ DEFAULT_STAGES = [
         "name": "reconstruction",
         "epochs": [0, 30],
         "weights": {
-            "smooth_l1": 2.0,
+            "l1": 2.0,
             "chamfer": 1.0,
             "direction": 0.5,
             "edge_len": 0.5,
@@ -44,7 +49,7 @@ DEFAULT_STAGES = [
         "name": "structure",
         "epochs": [30, 60],
         "weights": {
-            "smooth_l1": 2.0,
+            "l1": 2.0,
             "chamfer": 1.0,
             "direction": 1.0,
             "edge_len": 1.0,
@@ -56,7 +61,7 @@ DEFAULT_STAGES = [
         "name": "physics",
         "epochs": [60, None],
         "weights": {
-            "smooth_l1": 2.0,
+            "l1": 2.0,
             "chamfer": 1.0,
             "direction": 1.0,
             "edge_len": 1.0,
@@ -72,7 +77,7 @@ class LossScheduler:
     Curriculum loss weight scheduler with smooth stage transitions.
 
     Loss Terms Explained:
-    - smooth_l1: Position regression loss (SmoothL1/Huber). Core reconstruction signal.
+    - l1: Position regression loss (MAE). Core reconstruction signal.
     - chamfer: Chamfer distance ensuring global point distribution matches GT.
     - direction: Cosine similarity of edge directions. Ensures correct bone orientations.
     - edge_len: Relative edge length error. Maintains skeleton proportions.
@@ -80,7 +85,7 @@ class LossScheduler:
     - collision: Penetration depth penalty. Prevents hand-object intersection.
 
     Training Strategy:
-    1. Reconstruction phase: Learn approximate positions with smooth_l1 + chamfer.
+    1. Reconstruction phase: Learn approximate positions with l1 + chamfer.
     2. Structure phase: Refine with direction + edge_len + bone for valid topology.
     3. Physics phase: Add collision for physically plausible results.
     """
@@ -101,7 +106,7 @@ class LossScheduler:
         """
         self.enabled = enabled
         self.warmup_epochs = max(0, warmup_epochs)
-        self.default_weights = default_weights or DEFAULT_WEIGHTS.copy()
+        self.default_weights = self._normalize_weight_keys(default_weights or DEFAULT_WEIGHTS.copy())
 
         if enabled and stages:
             self.stages = self._validate_stages(stages)
@@ -112,6 +117,20 @@ class LossScheduler:
         self._current_stage_name = None
         self._logged_stage = None
 
+    def _normalize_weight_keys(self, weights: Dict[str, float]) -> Dict[str, float]:
+        """Normalize legacy weight keys to current names."""
+        normalized: Dict[str, float] = {}
+        for k, v in weights.items():
+            key = LEGACY_WEIGHT_ALIASES.get(k, k)
+            if key in DEFAULT_WEIGHTS:
+                normalized[key] = float(v)
+            else:
+                logger.warning(f"Unknown loss key '{k}', ignored.")
+        # Ensure all default keys exist
+        for k, v in DEFAULT_WEIGHTS.items():
+            normalized.setdefault(k, float(v))
+        return normalized
+
     def _validate_stages(self, stages: List[Dict]) -> List[Dict]:
         """Validate and normalize stage configurations."""
         validated = []
@@ -120,7 +139,7 @@ class LossScheduler:
         for i, stage in enumerate(stages):
             name = stage.get("name", f"stage_{i}")
             epochs = stage.get("epochs", [0, None])
-            weights = stage.get("weights", {})
+            weights = self._normalize_weight_keys(stage.get("weights", {}))
 
             # Ensure all weight keys are present
             full_weights = DEFAULT_WEIGHTS.copy()

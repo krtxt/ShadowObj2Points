@@ -1069,11 +1069,11 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
         logger.info(
             "HandEncoderDataModule setup: mode=%s, rot_type=%s, trans_anchor=%s, "
             "batch_size=%d, num_workers=%d, pin_memory=%s, prefetch_factor=%d, persistent_workers=%s, "
-            "use_local_pose_only=%s, return_norm=%s, scene_pc_mode=%s, use_cached_keypoints=%s, cache_only_mode=%s",
+            "use_local_pose_only=%s, return_norm=%s, scene_pc_mode=%s, use_cached_keypoints=%s, cache_only_mode=%s, use_scene_normals=%s",
             self.mode, self.rot_type, self.trans_anchor,
             self.batch_size, self.num_workers, self.pin_memory, self.prefetch_factor, self.persistent_workers,
             self.use_local_pose_only, self.return_norm, self.scene_pc_return_mode, self.use_cached_keypoints,
-            self.cache_only_mode,
+            self.cache_only_mode, self.use_scene_normals,
         )
         if not self.use_cached_keypoints and not self._cache_usage_logged:
             logger.info("HandEncoderDataModule: cache disabled (use_cached_keypoints=False); computing keypoints on the fly.")

@@ -191,7 +191,8 @@ def log_validation_summary(epoch: int,
                            val_set_metrics: Dict[str, float] = None,
                            val_quality_metrics: Dict[str, float] = None,
                            val_diversity_metrics: Dict[str, float] = None,
-                           val_flow_metrics: Dict[str, float] = None) -> None:
+                           val_flow_metrics: Dict[str, float] = None,
+                           val_regression_metrics: Dict[str, float] = None) -> None:
     """Pretty-print validation summary results with Rich console output only."""
 
     # Header (console pretty print)
@@ -290,7 +291,7 @@ def log_validation_summary(epoch: int,
             pad_edge=True,
             expand=False,
             border_style="green",
-            title="Quality",
+            title="Quality Metrics",
         )
         quality_table.add_column("Metric", style="good", no_wrap=True)
         quality_table.add_column("Value", style="value", justify="right")
@@ -323,6 +324,29 @@ def log_validation_summary(epoch: int,
             flow_table.add_row(f"{metric_name}", f"[value]{v:.4f}[/value]")
 
         console.print(Align.center(flow_table))
+
+    # --- Regression Loss Metrics ---
+    if isinstance(val_regression_metrics, dict) and len(val_regression_metrics) > 0:
+        console.print("")  # blank line
+        console.print("[metric]📐 Regression Loss Components[/metric]")
+
+        reg_table = Table(
+            show_header=True,
+            header_style="bold yellow",
+            box=box.MINIMAL,
+            pad_edge=True,
+            expand=False,
+            border_style="yellow",
+            title="Regression Loss",
+        )
+        reg_table.add_column("Component", style="warn", no_wrap=True)
+        reg_table.add_column("Value", style="value", justify="right")
+
+        for k, v in val_regression_metrics.items():
+            metric_name = k.replace("_", " ").title()
+            reg_table.add_row(f"{metric_name}", f"[value]{v:.4f}[/value]")
+
+        console.print(Align.center(reg_table))
 
     # --- Diversity Metrics ---
     if isinstance(val_diversity_metrics, dict) and len(val_diversity_metrics) > 0:

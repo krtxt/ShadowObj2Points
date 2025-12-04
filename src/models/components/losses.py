@@ -2,7 +2,8 @@
 
 import logging
 import math
-from typing import Dict, Optional, Tuple, List, Callable
+from abc import ABC, abstractmethod
+from typing import Dict, Optional, Tuple, List, Callable, Set, Any
 
 import torch
 import torch.nn as nn
@@ -11,6 +12,7 @@ from kaolin.metrics.trianglemesh import (
     compute_sdf,
     CUSTOM_index_vertices_by_faces as index_vertices_by_faces,
 )
+from .loss_scheduler import LossScheduler, DEFAULT_WEIGHTS, LEGACY_WEIGHT_ALIASES
 
 # Optional dependency: PyTorch3D
 try:
@@ -20,6 +22,518 @@ except ImportError:
     _PYTORCH3D_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Loss Component Registry and Base Class
+# =============================================================================
+
+class LossComponent(ABC):
+    """Base class for all loss components.
+    
+    Each component is a standalone, stateless function that computes a single
+    loss term. Components are registered in LOSS_COMPONENT_REGISTRY and can be
+    dynamically selected based on weights configuration.
+    """
+    
+    name: str = ""  # Unique identifier for this component
+    
+    @abstractmethod
+    def compute(self, ctx: Dict[str, Any]) -> torch.Tensor:
+        """Compute the loss value.
+        
+        Args:
+            ctx: Context dictionary containing all possible inputs:
+                - pred_xyz: Predicted keypoints (B, N, 3)
+                - gt_xyz: Ground-truth keypoints (B, N, 3)
+                - edge_index: Graph edges (2, E)
+                - fixed_point_mask: Boolean mask for fixed points (N,)
+                - edge_rest_lengths: Rest lengths (E,)
+                - active_edge_mask: Boolean mask for active edges (E,)
+                - v_hat, v_star, y_tau: For flow matching losses
+                - scene_pc: Scene point cloud (B, P, 3)
+                - ... other component-specific inputs
+                
+        Returns:
+            Scalar loss tensor (unweighted)
+        """
+        raise NotImplementedError
+    
+    @property
+    def required_inputs(self) -> Set[str]:
+        """Return set of required input keys in ctx."""
+        return set()
+    
+    def is_available(self, ctx: Dict[str, Any]) -> bool:
+        """Check if this component can be computed with given context."""
+        return all(k in ctx and ctx[k] is not None for k in self.required_inputs)
+
+
+# Global registry for loss components
+LOSS_COMPONENT_REGISTRY: Dict[str, LossComponent] = {}
+
+
+def register_loss_component(component: LossComponent) -> LossComponent:
+    """Register a loss component in the global registry."""
+    if not component.name:
+        raise ValueError(f"Component {component.__class__.__name__} must have a non-empty name")
+    LOSS_COMPONENT_REGISTRY[component.name] = component
+    return component
+
+
+def get_loss_component(name: str) -> Optional[LossComponent]:
+    """Get a registered loss component by name."""
+    return LOSS_COMPONENT_REGISTRY.get(name)
+
+
+# =============================================================================
+# Reconstruction Loss Components
+# =============================================================================
+
+class L1LossComponent(LossComponent):
+    """L1 (MAE) position regression loss."""
+    
+    name = "l1"
+    
+    def __init__(self, eps: float = 1e-6):
+        self.eps = eps
+    
+    @property
+    def required_inputs(self) -> Set[str]:
+        return {"pred_xyz", "gt_xyz"}
+    
+    def compute(self, ctx: Dict[str, Any]) -> torch.Tensor:
+        pred_xyz = ctx["pred_xyz"]
+        gt_xyz = ctx["gt_xyz"]
+        fixed_point_mask = ctx.get("fixed_point_mask")
+        
+        if fixed_point_mask is not None and fixed_point_mask.any():
+            # Exclude fixed points
+            keep_mask = ~fixed_point_mask.to(pred_xyz.device)
+            pred_sel = pred_xyz[:, keep_mask, :]
+            gt_sel = gt_xyz[:, keep_mask, :]
+        else:
+            pred_sel, gt_sel = pred_xyz, gt_xyz
+        
+        if pred_sel.numel() == 0:
+            return torch.tensor(0.0, device=pred_xyz.device)
+        
+        return F.l1_loss(pred_sel, gt_sel)
+
+
+class ChamferLossComponent(LossComponent):
+    """Chamfer distance for global shape consistency."""
+    
+    name = "chamfer"
+    
+    def __init__(self, use_pytorch3d: bool = True):
+        self.use_pytorch3d = use_pytorch3d
+    
+    @property
+    def required_inputs(self) -> Set[str]:
+        return {"pred_xyz", "gt_xyz"}
+    
+    def is_available(self, ctx: Dict[str, Any]) -> bool:
+        if not super().is_available(ctx):
+            return False
+        return _PYTORCH3D_AVAILABLE if self.use_pytorch3d else True
+    
+    def compute(self, ctx: Dict[str, Any]) -> torch.Tensor:
+        pred_xyz = ctx["pred_xyz"]
+        gt_xyz = ctx["gt_xyz"]
+        fixed_point_mask = ctx.get("fixed_point_mask")
+        
+        if fixed_point_mask is not None and fixed_point_mask.any():
+            keep_mask = ~fixed_point_mask.to(pred_xyz.device)
+            pred_sel = pred_xyz[:, keep_mask, :]
+            gt_sel = gt_xyz[:, keep_mask, :]
+        else:
+            pred_sel, gt_sel = pred_xyz, gt_xyz
+        
+        if pred_sel.numel() == 0:
+            return torch.tensor(0.0, device=pred_xyz.device)
+        
+        if not _PYTORCH3D_AVAILABLE:
+            return torch.tensor(float("nan"), device=pred_xyz.device)
+
+        # PyTorch3D KNN kernels expect matching float dtypes (fp32 recommended).
+        pred_sel = pred_sel.float()
+        gt_sel = gt_sel.float()
+
+        val, _ = chamfer_distance(
+            pred_sel, gt_sel, 
+            point_reduction="mean", 
+            batch_reduction="mean"
+        )
+        return val
+
+
+class DirectionLossComponent(LossComponent):
+    """Edge direction alignment loss for bone orientations."""
+    
+    name = "direction"
+    
+    def __init__(self, mode: str = "cos", eps: float = 1e-6):
+        self.mode = mode
+        self.eps = eps
+    
+    @property
+    def required_inputs(self) -> Set[str]:
+        return {"pred_xyz", "gt_xyz", "edge_index"}
+    
+    def compute(self, ctx: Dict[str, Any]) -> torch.Tensor:
+        pred_xyz = ctx["pred_xyz"]
+        gt_xyz = ctx["gt_xyz"]
+        edge_index = ctx["edge_index"].to(pred_xyz.device)
+        
+        v_gt = F.normalize(
+            gt_xyz[:, edge_index[1]] - gt_xyz[:, edge_index[0]] + self.eps, 
+            dim=-1
+        )
+        v_pd = F.normalize(
+            pred_xyz[:, edge_index[1]] - pred_xyz[:, edge_index[0]] + self.eps, 
+            dim=-1
+        )
+        
+        if self.mode == "l2":
+            return (v_pd - v_gt).norm(p=2, dim=-1).mean()
+        else:  # cos mode
+            cos_sim = (v_gt * v_pd).sum(dim=-1).clamp(-1, 1)
+            return (1.0 - cos_sim).mean()
+
+
+class EdgeLenLossComponent(LossComponent):
+    """Edge length consistency loss for skeleton proportions."""
+    
+    name = "edge_len"
+    
+    def __init__(self, eps: float = 1e-6):
+        self.eps = eps
+    
+    @property
+    def required_inputs(self) -> Set[str]:
+        return {"pred_xyz", "gt_xyz", "edge_index"}
+    
+    def compute(self, ctx: Dict[str, Any]) -> torch.Tensor:
+        pred_xyz = ctx["pred_xyz"]
+        gt_xyz = ctx["gt_xyz"]
+        edge_index = ctx["edge_index"].to(pred_xyz.device)
+        
+        len_gt = (gt_xyz[:, edge_index[0]] - gt_xyz[:, edge_index[1]]).norm(dim=-1)
+        len_pd = (pred_xyz[:, edge_index[0]] - pred_xyz[:, edge_index[1]]).norm(dim=-1)
+        
+        return ((len_pd - len_gt).abs() / (len_gt + self.eps)).mean()
+
+
+class BoneLossComponent(LossComponent):
+    """Bone length regularization vs template rest lengths."""
+    
+    name = "bone"
+    
+    @property
+    def required_inputs(self) -> Set[str]:
+        return {"pred_xyz", "edge_index", "edge_rest_lengths"}
+    
+    def compute(self, ctx: Dict[str, Any]) -> torch.Tensor:
+        pred_xyz = ctx["pred_xyz"]
+        edge_index = ctx["edge_index"].to(pred_xyz.device)
+        edge_rest_lengths = ctx["edge_rest_lengths"]
+        active_edge_mask = ctx.get("active_edge_mask")
+        
+        if edge_rest_lengths is None:
+            return torch.tensor(0.0, device=pred_xyz.device)
+        
+        i, j = edge_index
+        lengths = torch.linalg.norm(pred_xyz[:, i] - pred_xyz[:, j], dim=-1)
+        target = edge_rest_lengths.view(1, -1).to(pred_xyz.device)
+        
+        rel_err = (lengths - target) / (target + 1e-6)
+        if active_edge_mask is not None:
+            rel_err = rel_err[:, active_edge_mask.to(pred_xyz.device)]
+        
+        return rel_err.pow(2).mean()
+
+
+# =============================================================================
+# Flow Matching Loss Components
+# =============================================================================
+
+class FlowMatchingMSEComponent(LossComponent):
+    """MSE loss between predicted and target velocity."""
+    
+    name = "loss_fm"
+    
+    def __init__(self, loss_clamp: float = 100.0):
+        self.loss_clamp = loss_clamp
+    
+    @property
+    def required_inputs(self) -> Set[str]:
+        return {"v_hat", "v_star"}
+    
+    def compute(self, ctx: Dict[str, Any]) -> torch.Tensor:
+        v_hat = ctx["v_hat"]
+        v_star = ctx["v_star"]
+        loss = F.mse_loss(v_hat, v_star)
+        return torch.clamp(loss, max=self.loss_clamp)
+
+
+class TangentRegularizationComponent(LossComponent):
+    """Tangent regularization for rigid body constraint."""
+    
+    name = "loss_tangent"
+    
+    def __init__(self, loss_clamp: float = 100.0):
+        self.loss_clamp = loss_clamp
+    
+    @property
+    def required_inputs(self) -> Set[str]:
+        return {"v_hat", "y_tau", "edge_index"}
+    
+    def compute(self, ctx: Dict[str, Any]) -> torch.Tensor:
+        v_hat = ctx["v_hat"]
+        y_tau = ctx["y_tau"]
+        edge_index = ctx["edge_index"].to(v_hat.device)
+        
+        i, j = edge_index
+        diff_y = y_tau[:, i] - y_tau[:, j]
+        diff_v = v_hat[:, i] - v_hat[:, j]
+        
+        orthogonality = (diff_y * diff_v).sum(dim=-1)
+        loss = (orthogonality ** 2).mean()
+        return torch.clamp(loss, max=self.loss_clamp)
+
+
+# =============================================================================
+# Collision Loss Component (requires kaolin)
+# =============================================================================
+
+class CollisionLossComponent(LossComponent):
+    """Penetration loss against scene geometry using capsule SDF."""
+    
+    name = "collision"
+    
+    def __init__(
+        self,
+        margin: float = 0.0,
+        capsule_radius: float = 0.008,
+        capsule_circle_segments: int = 8,
+        capsule_cap_segments: int = 2,
+        max_scene_points: Optional[int] = None,
+    ):
+        self.margin = margin
+        self.capsule_radius = capsule_radius
+        self.capsule_circle_segments = capsule_circle_segments
+        self.capsule_cap_segments = capsule_cap_segments
+        self.max_scene_points = max_scene_points
+    
+    @property
+    def required_inputs(self) -> Set[str]:
+        return {"pred_xyz", "edge_index", "scene_pc"}
+    
+    def is_available(self, ctx: Dict[str, Any]) -> bool:
+        if not super().is_available(ctx):
+            return False
+        scene_pc = ctx.get("scene_pc")
+        return scene_pc is not None and scene_pc.numel() > 0 and scene_pc.shape[1] > 0
+    
+    def compute(self, ctx: Dict[str, Any]) -> torch.Tensor:
+        pred_xyz = ctx["pred_xyz"]
+        scene_pc = ctx["scene_pc"]
+        edge_index = ctx["edge_index"].to(pred_xyz.device)
+        denorm_fn = ctx.get("denorm_fn")
+        active_edge_mask = ctx.get("active_edge_mask")
+        
+        if scene_pc is None or scene_pc.shape[1] == 0:
+            return torch.tensor(0.0, device=pred_xyz.device)
+        
+        # Work in world space if denorm_fn provided
+        pred_w = denorm_fn(pred_xyz) if denorm_fn is not None else pred_xyz
+        scene_w = denorm_fn(scene_pc) if denorm_fn is not None else scene_pc
+        
+        template_v, template_f = _get_capsule_template(
+            device=pred_w.device,
+            dtype=pred_w.dtype,
+            circle_segments=self.capsule_circle_segments,
+            cap_segments=self.capsule_cap_segments,
+        )
+        
+        batch_size = pred_w.shape[0]
+        i, j = edge_index
+        
+        # Handle edge mask
+        if active_edge_mask is not None:
+            mask = active_edge_mask.to(pred_w.device)
+            if mask.dim() == 1:
+                active_edges = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+            else:
+                active_edges = None  # Per-batch mask not supported in simple form
+        else:
+            active_edges = torch.arange(i.numel(), device=pred_w.device)
+        
+        if active_edges is not None and active_edges.numel() == 0:
+            return torch.tensor(0.0, device=pred_xyz.device)
+        
+        # Sample scene points if needed
+        num_scene_pts = scene_w.shape[1]
+        if self.max_scene_points and num_scene_pts > self.max_scene_points:
+            sample_idx = torch.randint(0, num_scene_pts, (batch_size, self.max_scene_points), device=pred_w.device)
+        else:
+            sample_idx = None
+        
+        losses = []
+        if active_edges is not None:
+            starts = pred_w[:, i[active_edges]]
+            ends = pred_w[:, j[active_edges]]
+            verts = _capsule_vertices_from_edges(
+                template_vertices=template_v,
+                starts=starts.reshape(-1, 3),
+                ends=ends.reshape(-1, 3),
+                radius=self.capsule_radius,
+                cap_scale=1.5,
+            ).reshape(batch_size, -1, template_v.shape[0], 3)
+            
+            num_edges = active_edges.numel()
+            faces = template_f.unsqueeze(0) + (
+                torch.arange(num_edges, device=pred_w.device).view(-1, 1, 1) * template_v.shape[0]
+            )
+            faces = faces.reshape(-1, 3)
+            
+            for b in range(batch_size):
+                scene_pts = scene_w[b]
+                if sample_idx is not None:
+                    scene_pts = scene_pts[sample_idx[b]]
+                if scene_pts.shape[0] == 0:
+                    continue
+                
+                vertices = verts[b].reshape(-1, 3)
+                face_vertices = index_vertices_by_faces(vertices, faces)
+                sdf, dist_sign, _, _ = compute_sdf(scene_pts, face_vertices)
+                signed_dist = sdf * dist_sign.sign().to(sdf.dtype)
+                penetration = torch.relu(self.margin - signed_dist)
+                losses.append(penetration.mean())
+        
+        if not losses:
+            return torch.tensor(0.0, device=pred_xyz.device)
+        return torch.stack(losses).mean()
+
+
+# =============================================================================
+# Register Default Components
+# =============================================================================
+
+# Reconstruction components
+register_loss_component(L1LossComponent())
+register_loss_component(ChamferLossComponent())
+register_loss_component(DirectionLossComponent())
+register_loss_component(EdgeLenLossComponent())
+register_loss_component(BoneLossComponent())
+register_loss_component(CollisionLossComponent())
+
+# Flow matching components
+register_loss_component(FlowMatchingMSEComponent())
+register_loss_component(TangentRegularizationComponent())
+
+
+# =============================================================================
+# Loss Manager Base Class
+# =============================================================================
+
+class LossManager:
+    """Base class for loss managers that dispatch to registered components."""
+    
+    def __init__(
+        self,
+        weights: Dict[str, float],
+        component_configs: Optional[Dict[str, Dict]] = None,
+    ):
+        """
+        Args:
+            weights: Dict mapping component name to weight. Components with weight=0 are skipped.
+            component_configs: Optional per-component configuration overrides.
+        """
+        self.weights = {k: float(v) for k, v in weights.items()}
+        self.component_configs = component_configs or {}
+        
+        # Build active components (weight > 0)
+        self._active_components: Dict[str, LossComponent] = {}
+        for name, weight in self.weights.items():
+            if weight > 0:
+                component = self._get_or_create_component(name)
+                if component is not None:
+                    self._active_components[name] = component
+    
+    def _get_or_create_component(self, name: str) -> Optional[LossComponent]:
+        """Get component from registry or create with custom config."""
+        cfg = self.component_configs.get(name, {})
+        
+        # Try to get from registry first
+        base_component = get_loss_component(name)
+        if base_component is None:
+            logger.warning(f"Loss component '{name}' not found in registry, skipping")
+            return None
+        
+        # If no custom config, use the registered instance
+        if not cfg:
+            return base_component
+        
+        # Create new instance with custom config
+        component_class = base_component.__class__
+        try:
+            return component_class(**cfg)
+        except TypeError as e:
+            logger.warning(f"Failed to create component '{name}' with config {cfg}: {e}")
+            return base_component
+    
+    def compute_components(
+        self, 
+        ctx: Dict[str, Any],
+        return_weighted: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute all active loss components.
+        
+        Args:
+            ctx: Context dictionary with all inputs
+            return_weighted: If True, return weighted values; otherwise raw values
+            
+        Returns:
+            Dict of component name -> loss value (only for active, computable components)
+        """
+        results = {}
+        for name, component in self._active_components.items():
+            if not component.is_available(ctx):
+                continue
+            try:
+                value = component.compute(ctx)
+                if return_weighted:
+                    value = value * self.weights[name]
+                results[name] = value
+            except Exception as e:
+                logger.warning(f"Failed to compute component '{name}': {e}")
+        return results
+    
+    def compute_total(self, ctx: Dict[str, Any]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute weighted total loss and individual components.
+        
+        Returns:
+            (total_loss, {name: unweighted_value})
+        """
+        components = self.compute_components(ctx, return_weighted=False)
+        
+        if not components:
+            device = ctx.get("pred_xyz", ctx.get("v_hat", torch.zeros(1))).device
+            return torch.tensor(0.0, device=device), {}
+        
+        device = next(iter(components.values())).device
+        total = torch.tensor(0.0, device=device)
+        for name, value in components.items():
+            total = total + self.weights[name] * value
+        
+        return total, components
+    
+    @property
+    def active_component_names(self) -> List[str]:
+        """Return list of active component names."""
+        return list(self._active_components.keys())
 
 # Cached unit capsule mesh (z-axis aligned, length=1 between cap centers, radius=1)
 _CAPSULE_TEMPLATE_CACHE: Dict[
@@ -198,27 +712,48 @@ class FlowMatchingLoss(nn.Module):
     """
     Computes Flow Matching loss with structure-preserving tangent regularization.
     
+    Uses component registry for modular loss computation. Only computes and returns
+    components with weight > 0.
+    
     Formula:
         L_total = ||v_pred - v_target||^2 + λ * ||(v_pred_rel · y_curr_rel)||^2
     
     Args:
         edge_index: Graph edge indices of shape (2, E).
-        lambda_tangent: Weight for tangent regularization loss.
+        lambda_tangent: Weight for tangent regularization loss (0 to disable).
         loss_clamp: Maximum value for individual loss terms to prevent gradient explosion.
+        weights: Optional dict of component weights (overrides lambda_tangent if provided).
     """
     def __init__(
         self, 
         edge_index: torch.Tensor, 
         lambda_tangent: float = 1.0,
         loss_clamp: float = 100.0,
+        weights: Optional[Dict[str, float]] = None,
     ) -> None:
         super().__init__()
         if edge_index.dim() != 2 or edge_index.size(0) != 2:
             raise ValueError(f"edge_index shape mismatch. Expected (2, E), got {edge_index.shape}")
             
         self.register_buffer("edge_index", edge_index.long(), persistent=False)
-        self.lambda_tangent = float(lambda_tangent)
         self.loss_clamp = float(loss_clamp)
+        
+        # Build weights dict
+        if weights is not None:
+            self._weights = {k: float(v) for k, v in weights.items()}
+        else:
+            self._weights = {
+                "loss_fm": 1.0,
+                "loss_tangent": float(lambda_tangent),
+            }
+        self.lambda_tangent = self._weights.get("loss_tangent", 0.0)
+        
+        # Build loss manager with component configs
+        component_configs = {
+            "loss_fm": {"loss_clamp": loss_clamp},
+            "loss_tangent": {"loss_clamp": loss_clamp},
+        }
+        self._manager = LossManager(self._weights, component_configs)
 
     def forward(
         self, 
@@ -229,33 +764,21 @@ class FlowMatchingLoss(nn.Module):
         if v_hat.shape != v_star.shape or v_hat.shape != y_tau.shape:
             raise ValueError(f"Shape mismatch: v_hat={v_hat.shape}, v_star={v_star.shape}, y_tau={y_tau.shape}")
 
-        # 1. Flow Matching MSE with numerical stability
-        loss_fm = F.mse_loss(v_hat, v_star)
-        # Clamp to prevent gradient explosion
-        loss_fm = torch.clamp(loss_fm, max=self.loss_clamp)
-
-        # 2. Tangent Regularization (vectorized)
-        loss_tan = torch.tensor(0.0, device=v_hat.device, dtype=v_hat.dtype)
-        if self.lambda_tangent > 0.0:
-            i, j = self.edge_index
-            # Relative positions and velocities along edges
-            diff_y = y_tau[:, i] - y_tau[:, j]
-            diff_v = v_hat[:, i] - v_hat[:, j]
-            
-            # Penalize velocity components parallel to the bone vector (rigid body constraint)
-            # Dot product along the last dim
-            orthogonality = (diff_y * diff_v).sum(dim=-1)
-            loss_tan = (orthogonality ** 2).mean()
-            # Clamp to prevent gradient explosion
-            loss_tan = torch.clamp(loss_tan, max=self.loss_clamp)
-
-        total_loss = loss_fm + self.lambda_tangent * loss_tan
-        
-        return {
-            "loss": total_loss,
-            "loss_fm": loss_fm,
-            "loss_tangent": loss_tan
+        # Build context for components
+        ctx = {
+            "v_hat": v_hat,
+            "v_star": v_star,
+            "y_tau": y_tau,
+            "edge_index": self.edge_index,
         }
+        
+        # Compute active components
+        total, components = self._manager.compute_total(ctx)
+        
+        # Return with "loss" as the total
+        result = {"loss": total}
+        result.update(components)
+        return result
 
 
 class TranslationLoss(nn.Module):
@@ -333,9 +856,13 @@ class ChamferLoss(nn.Module):
         self.norm = 1 if loss_type == "l1" else 2
 
     def forward(self, pred_points: torch.Tensor, gt_points: torch.Tensor) -> torch.Tensor:
+        # Force fp32 to avoid mixed-precision dtype mismatches in KNN kernel.
+        pred = pred_points.float()
+        gt = gt_points.float()
+
         loss, _ = chamfer_distance(
-            pred_points, 
-            gt_points, 
+            pred, 
+            gt, 
             point_reduction="mean", 
             batch_reduction="mean", 
             norm=self.norm
@@ -478,13 +1005,26 @@ class TotalLoss(nn.Module):
 class HandValidationMetricManager:
     """
     Computes validation metrics for Flow Matching and Hand Reconstruction.
-    Configurable via nested dictionary.
+    
+    Uses component registry for modular metric computation. Only computes and returns
+    components with weight > 0 in config.
     """
-    def __init__(self, edge_index: torch.Tensor, config: Optional[Dict] = None) -> None:
+    def __init__(
+        self,
+        edge_index: torch.Tensor,
+        config: Optional[Dict] = None,
+        fixed_point_indices: Optional[torch.Tensor] = None,
+        recon_scale: float = 1.0,
+    ) -> None:
         if edge_index.dim() != 2 or edge_index.size(0) != 2:
             raise ValueError(f"edge_index mismatch. Expected (2, E), got {edge_index.shape}")
         
         self.edge_index = edge_index.long().detach().cpu()
+        self.fixed_point_indices = None
+        self.fixed_point_mask = None
+        if fixed_point_indices is not None:
+            idx = torch.as_tensor(fixed_point_indices, dtype=torch.long)
+            self.fixed_point_indices = idx.detach().cpu()
         cfg = config or {}
 
         # --- Parse Config Safely ---
@@ -493,15 +1033,30 @@ class HandValidationMetricManager:
         
         self.flow_enabled = self.flow.get("enabled", True)
         self.recon_enabled = self.recon.get("enabled", True)
+        self.recon_scale = float(cfg.get("recon_scale", self.recon.get("scale_factor", recon_scale)))
 
-        # Pre-fetch weights to avoid dict lookups in loop
-        self.flow_weights = self.flow.get("weights", {})
+        # Flow weights
+        self.flow_weights = self.flow.get("weights", {"loss": 1.0})
         
-        # Recon Sub-configs
-        self.cfg_smooth = self.recon.get("smooth_l1", {})
-        self.cfg_chamfer = self.recon.get("chamfer", {})
-        self.cfg_dir = self.recon.get("direction", {})
-        self.cfg_edge = self.recon.get("edge_len", {})
+        # Build recon weights from config (enabled=True means weight=1.0 by default)
+        self._recon_weights = {}
+        self._recon_component_configs = {}
+        
+        for name in ["l1", "chamfer", "direction", "edge_len"]:
+            sub_cfg = self.recon.get(name, self.recon.get("smooth_l1", {}) if name == "l1" else {})
+            if sub_cfg.get("enabled", True):
+                self._recon_weights[name] = float(sub_cfg.get("weight", 1.0))
+                # Extract component-specific params
+                self._recon_component_configs[name] = {
+                    k: v for k, v in sub_cfg.items() 
+                    if k not in ("enabled", "weight")
+                }
+        
+        # Build recon manager
+        if self.recon_enabled and self._recon_weights:
+            self._recon_manager = LossManager(self._recon_weights, self._recon_component_configs)
+        else:
+            self._recon_manager = None
 
     def compute_flow_metrics(
         self, 
@@ -512,22 +1067,24 @@ class HandValidationMetricManager:
         if not self.flow_enabled:
             return {}
 
-        # Collect raw values
-        metrics = {
-            "loss": loss_dict.get("loss"),
-            "loss_fm": loss_dict.get("loss_fm"),
-            "loss_tangent": loss_dict.get("loss_tangent"),
-            "edge_len_err": flow_edge_len_err
-        }
+        # Only include metrics with weight > 0
+        metrics = {}
+        for name in ["loss", "loss_fm", "loss_tangent"]:
+            w = float(self.flow_weights.get(name, 1.0 if name == "loss" else 0.0))
+            if w > 0 and name in loss_dict and loss_dict[name] is not None:
+                metrics[name] = loss_dict[name].detach()
         
-        # Filter None values and detach
-        metrics = {k: v.detach() for k, v in metrics.items() if v is not None}
+        # edge_len_err is always useful
+        if flow_edge_len_err is not None:
+            w = float(self.flow_weights.get("edge_len_err", 0.0))
+            if w > 0:
+                metrics["edge_len_err"] = flow_edge_len_err.detach()
         
         # Compute Weighted Total
         total = torch.tensor(0.0, device=flow_edge_len_err.device)
         for name, value in metrics.items():
-            w = float(self.flow_weights.get(name, 0.0 if name != "loss" else 1.0))
-            if w > 0 and torch.isfinite(value):
+            w = float(self.flow_weights.get(name, 1.0 if name == "loss" else 0.0))
+            if torch.isfinite(value):
                 total += w * value
                 
         metrics["total"] = total
@@ -538,102 +1095,49 @@ class HandValidationMetricManager:
         pred_xyz: torch.Tensor, 
         gt_xyz: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
-        return _compute_recon_components(
-            edge_index=self.edge_index,
-            pred_xyz=pred_xyz,
-            gt_xyz=gt_xyz,
-            cfg_smooth=self.cfg_smooth,
-            cfg_chamfer=self.cfg_chamfer,
-            cfg_dir=self.cfg_dir,
-            cfg_edge=self.cfg_edge,
-            recon_enabled=self.recon_enabled,
-        )
-
-
-def _compute_recon_components(
-    edge_index: torch.Tensor,
-    pred_xyz: torch.Tensor,
-    gt_xyz: torch.Tensor,
-    cfg_smooth: Dict,
-    cfg_chamfer: Dict,
-    cfg_dir: Dict,
-    cfg_edge: Dict,
-    recon_enabled: bool = True,
-) -> Dict[str, torch.Tensor]:
-    """Shared implementation for reconstruction-style losses/metrics.
-
-    Used both by HandValidationMetricManager and deterministic regression loss
-    to avoid code duplication.
-
-    Returns individual loss values WITHOUT weighting - caller is responsible
-    for applying weights via LossScheduler or config.
-    """
-
-    if not recon_enabled:
-        return {}
-    if pred_xyz.shape != gt_xyz.shape:
-        raise ValueError("Shape mismatch in reconstruction metrics.")
-
-    device = pred_xyz.device
-    metrics: Dict[str, torch.Tensor] = {}
-
-    # 1. Smooth L1 - Primary position regression (robust to outliers)
-    if cfg_smooth.get("enabled", True):
-        val = F.smooth_l1_loss(pred_xyz, gt_xyz, beta=cfg_smooth.get("beta", 0.01))
-        metrics["smooth_l1"] = val
-
-    # 2. Chamfer - Bidirectional point cloud distance for global shape
-    if cfg_chamfer.get("enabled", True):
-        if _PYTORCH3D_AVAILABLE and cfg_chamfer.get("use_pytorch3d", True):
-            val, _ = chamfer_distance(pred_xyz, gt_xyz, point_reduction="mean", batch_reduction="mean")
-            metrics["chamfer"] = val
-        else:
-            metrics["chamfer"] = torch.tensor(float("nan"), device=device)
-
-    # 3. Edge Direction - Bone orientation consistency
-    if cfg_dir.get("enabled", True):
-        eps = cfg_dir.get("eps", 1e-6)
-        edges = edge_index.to(device)
-
-        v_gt = F.normalize(gt_xyz[:, edges[1]] - gt_xyz[:, edges[0]] + eps, dim=-1)
-        v_pd = F.normalize(pred_xyz[:, edges[1]] - pred_xyz[:, edges[0]] + eps, dim=-1)
-
-        if cfg_dir.get("mode", "cos") == "l2":
-            val = (v_pd - v_gt).norm(p=2, dim=-1).mean()
-        else:
-            cos_sim = (v_gt * v_pd).sum(dim=-1).clamp(-1, 1)
-            val = (1.0 - cos_sim).mean()
-
-        metrics["direction"] = val
-
-    # 4. Edge Length - Skeleton proportion consistency
-    if cfg_edge.get("enabled", True):
-        eps = cfg_edge.get("eps", 1e-6)
-        edges = edge_index.to(device)
-
-        len_gt = (gt_xyz[:, edges[0]] - gt_xyz[:, edges[1]]).norm(dim=-1)
-        len_pd = (pred_xyz[:, edges[0]] - pred_xyz[:, edges[1]]).norm(dim=-1)
-
-        val = ((len_pd - len_gt).abs() / (len_gt + eps)).mean()
-        metrics["edge_len"] = val
-
-    return metrics
+        if not self.recon_enabled or self._recon_manager is None:
+            return {}
+        
+        if self.recon_scale != 1.0:
+            pred_xyz = pred_xyz * self.recon_scale
+            gt_xyz = gt_xyz * self.recon_scale
+        
+        # Build context
+        ctx = {
+            "pred_xyz": pred_xyz,
+            "gt_xyz": gt_xyz,
+            "edge_index": self.edge_index,
+            "fixed_point_mask": self._build_fixed_point_mask(pred_xyz.shape[1], pred_xyz.device),
+        }
+        
+        # Compute using manager (returns unweighted values)
+        return self._recon_manager.compute_components(ctx, return_weighted=False)
+    
+    def _build_fixed_point_mask(self, num_points: int, device: torch.device) -> Optional[torch.Tensor]:
+        """Build fixed point mask tensor."""
+        if self.fixed_point_indices is None or self.fixed_point_indices.numel() == 0:
+            return None
+        mask = torch.zeros(num_points, dtype=torch.bool, device=device)
+        idx = self.fixed_point_indices.to(device)
+        idx = idx[idx < num_points]
+        if idx.numel() > 0:
+            mask[idx] = True
+        return mask
 
 
 class DeterministicRegressionLoss(nn.Module):
     """Loss manager for deterministic hand regression model.
 
-    Combines reconstruction-style terms (Smooth L1, Chamfer, edge direction,
-    and edge length) with optional bone-length regularization and collision
-    penalty against the scene point cloud.
+    Uses component registry for modular loss computation. Only computes and returns
+    components with weight > 0.
 
     Supports curriculum learning via LossScheduler for multi-stage training:
-    - Stage 1 (Reconstruction): Focus on position regression (smooth_l1, chamfer)
+    - Stage 1 (Reconstruction): Focus on position regression (l1, chamfer)
     - Stage 2 (Structure): Add skeletal constraints (direction, edge_len, bone)
     - Stage 3 (Physics): Add collision avoidance
 
-    Loss Terms:
-    - smooth_l1: Position regression (Huber-like, robust to outliers)
+    Loss Terms (registered components):
+    - l1: Position regression (MAE)
     - chamfer: Bidirectional point cloud distance for global shape consistency
     - direction: Edge direction alignment for correct bone orientations
     - edge_len: Edge length consistency for skeleton proportions
@@ -641,53 +1145,69 @@ class DeterministicRegressionLoss(nn.Module):
     - collision: Penetration penalty against scene geometry
     """
 
-    def __init__(self, edge_index: torch.Tensor, config: Optional[Dict] = None) -> None:
+    def __init__(
+        self,
+        edge_index: torch.Tensor,
+        config: Optional[Dict] = None,
+        fixed_point_indices: Optional[torch.Tensor] = None,
+    ) -> None:
         super().__init__()
         if edge_index.dim() != 2 or edge_index.size(0) != 2:
             raise ValueError(f"edge_index mismatch. Expected (2, E), got {edge_index.shape}")
 
         self.register_buffer("edge_index", edge_index.long(), persistent=False)
-
         cfg = config or {}
 
-        # Recon-style loss configuration
-        self.recon = cfg.get("recon", {})
-        self.recon_enabled = self.recon.get("enabled", True)
+        if fixed_point_indices is not None:
+            idx = torch.as_tensor(fixed_point_indices, dtype=torch.long)
+            self.register_buffer("fixed_point_indices", idx, persistent=False)
+            self.fixed_point_indices = idx
+        else:
+            self.fixed_point_indices = None
 
-        self.cfg_smooth = dict(self.recon.get("smooth_l1", {}))
-        self.cfg_chamfer = dict(self.recon.get("chamfer", {}))
-        self.cfg_dir = dict(self.recon.get("direction", {}))
-        self.cfg_edge = dict(self.recon.get("edge_len", {}))
-
-        # Collision hyperparameters
-        self.collision_margin = float(cfg.get("collision_margin", 0.0))
-        self.collision_capsule_radius = float(cfg.get("collision_capsule_radius", 0.008))
-        self.collision_capsule_circle_segments = int(cfg.get("collision_capsule_circle_segments", 8))
-        self.collision_capsule_cap_segments = int(cfg.get("collision_capsule_cap_segments", 2))
-
+        # Parse recon config for component-specific settings
+        recon = cfg.get("recon", {})
+        self.recon_enabled = recon.get("enabled", True)
+        
+        # Build component configs from recon sub-configs
+        self._component_configs: Dict[str, Dict] = {}
+        for name in ["l1", "chamfer", "direction", "edge_len"]:
+            sub_cfg = recon.get(name, recon.get("smooth_l1", {}) if name == "l1" else {})
+            if sub_cfg.get("enabled", True):
+                self._component_configs[name] = {
+                    k: v for k, v in sub_cfg.items() 
+                    if k not in ("enabled", "weight")
+                }
+        
+        # Collision config
+        collision_cfg = {
+            "margin": float(cfg.get("collision_margin", 0.0)),
+            "capsule_radius": float(cfg.get("collision_capsule_radius", 0.008)),
+            "capsule_circle_segments": int(cfg.get("collision_capsule_circle_segments", 8)),
+            "capsule_cap_segments": int(cfg.get("collision_capsule_cap_segments", 2)),
+        }
         max_pts = int(cfg.get("collision_max_scene_points", 0))
-        self.collision_max_scene_points = max_pts if max_pts > 0 else None
+        if max_pts > 0:
+            collision_cfg["max_scene_points"] = max_pts
+        self._component_configs["collision"] = collision_cfg
 
         # Initialize LossScheduler for curriculum learning
-        from .loss_scheduler import LossScheduler, DEFAULT_WEIGHTS
-
         curriculum_cfg = cfg.get("curriculum", {})
         curriculum_enabled = curriculum_cfg.get("enabled", False)
 
-        # Build default weights from config (for non-curriculum mode)
+        # Build default weights from config
         default_weights = DEFAULT_WEIGHTS.copy()
-        # Override with legacy config values if present
         if "lambda_pos" in cfg:
-            default_weights["smooth_l1"] = float(cfg["lambda_pos"]) * default_weights["smooth_l1"]
+            default_weights["l1"] = float(cfg["lambda_pos"]) * default_weights["l1"]
         if "lambda_bone" in cfg:
             default_weights["bone"] = float(cfg["lambda_bone"])
         if "lambda_collision" in cfg:
             default_weights["collision"] = float(cfg["lambda_collision"])
-        # Override with explicit weights section if present
         if "weights" in cfg:
             for k, v in cfg["weights"].items():
-                if k in default_weights:
-                    default_weights[k] = float(v)
+                key = LEGACY_WEIGHT_ALIASES.get(k, k)
+                if key in default_weights:
+                    default_weights[key] = float(v)
 
         self.scheduler = LossScheduler(
             enabled=curriculum_enabled,
@@ -697,176 +1217,41 @@ class DeterministicRegressionLoss(nn.Module):
         )
 
         self._current_epoch = 0
+        self._cached_manager: Optional[LossManager] = None
+        self._cached_weights: Optional[Dict[str, float]] = None
         logger.info(f"DeterministicRegressionLoss initialized: {self.scheduler}")
 
     def set_epoch(self, epoch: int) -> None:
         """Update current epoch for curriculum scheduling."""
         self._current_epoch = epoch
         self.scheduler.set_epoch(epoch)
+        # Invalidate cached manager when weights might change
+        self._cached_manager = None
+        self._cached_weights = None
 
     def get_current_weights(self) -> Dict[str, float]:
         """Get current loss weights based on training progress."""
         return self.scheduler.get_weights()
-
-    def _compute_bone_loss(
-        self,
-        pred_xyz: torch.Tensor,
-        edge_rest_lengths: Optional[torch.Tensor],
-        active_edge_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Compute bone length regularization loss (unweighted)."""
-        if edge_rest_lengths is None:
-            return torch.tensor(0.0, device=pred_xyz.device)
-
-        i, j = self.edge_index
-        lengths = torch.linalg.norm(pred_xyz[:, i] - pred_xyz[:, j], dim=-1)
-        target = edge_rest_lengths.view(1, -1)
-
-        rel_err = (lengths - target) / (target + 1e-6)
-        if active_edge_mask is not None:
-            rel_err = rel_err[:, active_edge_mask]
-
-        return rel_err.pow(2).mean()
-
-    def _compute_collision_loss(
-        self,
-        pred_xyz: torch.Tensor,
-        scene_pc: Optional[torch.Tensor],
-        denorm_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        active_edge_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Compute penetration loss against scene geometry (unweighted)."""
-        if scene_pc is None or scene_pc.shape[1] == 0:
-            return torch.tensor(0.0, device=pred_xyz.device)
-
-        # Work in world space for physical margin if denorm_fn is provided
-        pred_w = denorm_fn(pred_xyz) if denorm_fn is not None else pred_xyz
-        scene_w = denorm_fn(scene_pc) if denorm_fn is not None else scene_pc
-
-        template_v, template_f = _get_capsule_template(
-            device=pred_w.device,
-            dtype=pred_w.dtype,
-            circle_segments=self.collision_capsule_circle_segments,
-            cap_segments=self.collision_capsule_cap_segments,
-        )
-
-        batch_size = pred_w.shape[0]
-        edge_index = self.edge_index.to(pred_w.device)
-        i, j = edge_index
-
-        # Normalize active edge mask shape: allow (E,) or (B, E)
-        edge_mask_global = None
-        if active_edge_mask is not None:
-            edge_mask_global = active_edge_mask.to(device=pred_w.device)
-
-        static_active_edges = None
-        if edge_mask_global is not None and edge_mask_global.dim() == 1:
-            static_active_edges = torch.nonzero(edge_mask_global, as_tuple=False).squeeze(-1)
-
-        faces_cache: Dict[Tuple[str, torch.dtype, int], torch.Tensor] = {}
-
-        # Pre-generate random indices for all batches at once (avoid per-sample randperm)
-        num_scene_pts = scene_w.shape[1]
-        sample_indices = None
-        if self.collision_max_scene_points and num_scene_pts > self.collision_max_scene_points:
-            sample_indices = torch.randint(
-                0, num_scene_pts,
-                (batch_size, self.collision_max_scene_points),
-                device=pred_w.device
-            )
-
-        losses: List[torch.Tensor] = []
-        if static_active_edges is not None:
-            active_edges = static_active_edges
-
-            starts_all = pred_w[:, i[active_edges]]  # (B, E, 3)
-            ends_all = pred_w[:, j[active_edges]]    # (B, E, 3)
-            verts_all = _capsule_vertices_from_edges(
-                template_vertices=template_v,
-                starts=starts_all.reshape(-1, 3),
-                ends=ends_all.reshape(-1, 3),
-                radius=self.collision_capsule_radius,
-                cap_scale=1.5,
-            ).reshape(batch_size, -1, template_v.shape[0], 3)
-
-            num_edges = active_edges.numel()
-            num_vertices = template_v.shape[0]
-            num_faces = template_f.shape[0]
-
-            cache_key = (str(pred_w.device), pred_w.dtype, num_edges)
-            if cache_key not in faces_cache:
-                base_faces = template_f.unsqueeze(0) + (
-                    torch.arange(num_edges, device=pred_w.device).view(-1, 1, 1) * num_vertices
-                )
-                faces_cache[cache_key] = base_faces.reshape(-1, 3)
-            base_faces = faces_cache[cache_key]
-
-            for b in range(batch_size):
-                scene_pts = scene_w[b]
-                if scene_pts.shape[0] == 0:
-                    continue
-
-                if sample_indices is not None:
-                    scene_pts = scene_pts[sample_indices[b]]
-
-                vertices = verts_all[b].reshape(-1, 3)
-                face_vertices = index_vertices_by_faces(vertices, base_faces)
-
-                sdf, dist_sign, _, _ = compute_sdf(scene_pts, face_vertices)
-                signed_dist = sdf * dist_sign.sign().to(sdf.dtype)
-
-                penetration = torch.relu(self.collision_margin - signed_dist)
-                losses.append(penetration.mean())
-        else:
-            for b in range(batch_size):
-                edge_mask = edge_mask_global[b] if edge_mask_global is not None else None
-                if edge_mask is not None:
-                    active_edges = torch.nonzero(edge_mask, as_tuple=False).squeeze(-1)
-                else:
-                    active_edges = torch.arange(i.numel(), device=pred_w.device)
-
-                if active_edges.numel() == 0:
-                    continue
-
-                scene_pts = scene_w[b]
-                if scene_pts.shape[0] == 0:
-                    continue
-
-                if sample_indices is not None:
-                    scene_pts = scene_pts[sample_indices[b]]
-
-                starts = pred_w[b, i[active_edges]]
-                ends = pred_w[b, j[active_edges]]
-
-                verts = _capsule_vertices_from_edges(
-                    template_vertices=template_v,
-                    starts=starts,
-                    ends=ends,
-                    radius=self.collision_capsule_radius,
-                    cap_scale=1.5,
-                )  # (E, V, 3)
-
-                num_edges = verts.shape[0]
-                if num_edges == 0:
-                    continue
-
-                vertices = verts.reshape(-1, 3)
-                faces = template_f.unsqueeze(0) + (
-                    torch.arange(num_edges, device=pred_w.device).view(-1, 1, 1) * template_v.shape[0]
-                )
-                faces = faces.reshape(-1, 3)
-                face_vertices = index_vertices_by_faces(vertices, faces)
-
-                sdf, dist_sign, _, _ = compute_sdf(scene_pts, face_vertices)
-                signed_dist = sdf * dist_sign.sign().to(sdf.dtype)
-
-                penetration = torch.relu(self.collision_margin - signed_dist)
-                losses.append(penetration.mean())
-
-        if not losses:
-            return torch.tensor(0.0, device=pred_xyz.device)
-
-        return torch.stack(losses).mean()
+    
+    def _get_manager(self) -> LossManager:
+        """Get or create LossManager with current weights."""
+        current_weights = self.scheduler.get_weights()
+        # Rebuild manager if weights changed
+        if self._cached_manager is None or self._cached_weights != current_weights:
+            self._cached_weights = current_weights.copy()
+            self._cached_manager = LossManager(current_weights, self._component_configs)
+        return self._cached_manager
+    
+    def _build_fixed_point_mask(self, num_points: int, device: torch.device) -> Optional[torch.Tensor]:
+        """Build fixed point mask tensor."""
+        if self.fixed_point_indices is None or self.fixed_point_indices.numel() == 0:
+            return None
+        mask = torch.zeros(num_points, dtype=torch.bool, device=device)
+        idx = self.fixed_point_indices.to(device)
+        idx = idx[idx < num_points]
+        if idx.numel() > 0:
+            mask[idx] = True
+        return mask
 
     def forward(
         self,
@@ -881,6 +1266,9 @@ class DeterministicRegressionLoss(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Compute total deterministic regression loss and its components.
 
+        Uses component registry for modular loss computation. Only computes and
+        returns components with weight > 0.
+
         Args:
             pred_xyz: Predicted hand keypoints (B, N, 3), typically in normalized space.
             gt_xyz: Ground-truth keypoints (B, N, 3), same space as pred_xyz.
@@ -893,63 +1281,26 @@ class DeterministicRegressionLoss(nn.Module):
 
         Returns:
             total: Weighted sum of all loss terms.
-            components: Dictionary of unweighted individual loss values.
+            components: Dictionary of unweighted individual loss values (only active components).
         """
         # Update epoch if provided
         if epoch is not None:
             self.set_epoch(epoch)
 
-        # Get current weights from scheduler
-        weights = self.scheduler.get_weights()
-
-        # Compute reconstruction-style losses (unweighted values)
-        recon_metrics = _compute_recon_components(
-            edge_index=self.edge_index,
-            pred_xyz=pred_xyz,
-            gt_xyz=gt_xyz,
-            cfg_smooth=self.cfg_smooth,
-            cfg_chamfer=self.cfg_chamfer,
-            cfg_dir=self.cfg_dir,
-            cfg_edge=self.cfg_edge,
-            recon_enabled=self.recon_enabled,
-        )
-
-        device = pred_xyz.device
-        zero = torch.tensor(0.0, device=device)
-
-        # Extract individual loss values
-        smooth_l1 = recon_metrics.get("smooth_l1", zero)
-        chamfer = recon_metrics.get("chamfer", zero)
-        direction = recon_metrics.get("direction", zero)
-        edge_len = recon_metrics.get("edge_len", zero)
-
-        # Compute structural/physics losses (unweighted)
-        bone = self._compute_bone_loss(pred_xyz, edge_rest_lengths, active_edge_mask)
-        collision = self._compute_collision_loss(
-            pred_xyz,
-            scene_pc,
-            denorm_fn,
-            active_edge_mask=active_edge_mask,
-        )
-
-        # Apply weights and sum
-        total = (
-            weights["smooth_l1"] * smooth_l1
-            + weights["chamfer"] * chamfer
-            + weights["direction"] * direction
-            + weights["edge_len"] * edge_len
-            + weights["bone"] * bone
-            + weights["collision"] * collision
-        )
-
-        # Return unweighted components for logging/analysis
-        components: Dict[str, torch.Tensor] = {
-            "smooth_l1": smooth_l1,
-            "chamfer": chamfer,
-            "direction": direction,
-            "edge_len": edge_len,
-            "bone": bone,
-            "collision": collision,
+        # Build context for components
+        ctx = {
+            "pred_xyz": pred_xyz,
+            "gt_xyz": gt_xyz,
+            "edge_index": self.edge_index,
+            "edge_rest_lengths": edge_rest_lengths,
+            "active_edge_mask": active_edge_mask,
+            "scene_pc": scene_pc,
+            "denorm_fn": denorm_fn,
+            "fixed_point_mask": self._build_fixed_point_mask(pred_xyz.shape[1], pred_xyz.device),
         }
-
+        
+        # Use manager to compute active components
+        manager = self._get_manager()
+        total, components = manager.compute_total(ctx)
+        
         return total, components

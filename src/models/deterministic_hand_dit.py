@@ -204,12 +204,18 @@ class HandDeterministicDiT(L.LightningModule):
         self.loss_manager = DeterministicRegressionLoss(
             edge_index=self.edge_index,
             config=cfg,
+            fixed_point_indices=getattr(self, "fixed_point_indices", None),
         )
 
         # Validation Metrics (can be disabled via loss_cfg.val_metrics)
         val_cfg = cfg.get("val_metrics", None)
         self.val_metric_manager = (
-            HandValidationMetricManager(self.edge_index, val_cfg) if val_cfg else None
+            HandValidationMetricManager(
+                self.edge_index,
+                val_cfg,
+                fixed_point_indices=getattr(self, "fixed_point_indices", None),
+                recon_scale=float(val_cfg.get("recon_scale", val_cfg.get("recon", {}).get("scale_factor", 1.0))) if val_cfg else 1.0,
+            ) if val_cfg else None
         )
         self._val_step_losses: List[float] = []  # Store scalars, not tensors
 

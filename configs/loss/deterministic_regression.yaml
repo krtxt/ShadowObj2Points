@@ -1,8 +1,11 @@
 # Deterministic Regression Loss Configuration
 # ============================================
 #
-# Loss Terms Explained:
-# - smooth_l1: Position regression (Huber-like, robust to outliers) - Core reconstruction signal
+# Uses component registry for modular loss computation.
+# Components with weight=0 are not computed (saves compute).
+#
+# Available Loss Components (registered in LOSS_COMPONENT_REGISTRY):
+# - l1: Position regression (MAE) - Core reconstruction signal
 # - chamfer: Bidirectional point cloud distance for global shape consistency
 # - direction: Cosine similarity of edge directions - Ensures correct bone orientations
 # - edge_len: Relative edge length error - Maintains skeleton proportions
@@ -15,13 +18,14 @@
 
 # =============================================================================
 # Default Weights (used when curriculum is disabled)
+# Components with weight=0 will NOT be computed or returned.
 # =============================================================================
 weights:
-  smooth_l1: 2.0      # Primary position loss - high weight for accurate keypoint positions
+  l1: 2.0             # Primary position loss - high weight for accurate keypoint positions
   chamfer: 1.0        # Shape distribution matching
   direction: 1.0      # Bone orientation consistency
   edge_len: 1.0       # Skeleton proportion maintenance
-  bone: 0.0           # Template bone length regularization (often redundant with edge_len)
+  bone: 0.0           # Template bone length regularization (set to 0 to skip computation)
   collision: 0.25     # Penetration avoidance (set to 0.0 to disable)
 
 # =============================================================================
@@ -39,7 +43,7 @@ curriculum:
     - name: reconstruction
       epochs: [0, 30]
       weights:
-        smooth_l1: 2.0
+        l1: 2.0
         chamfer: 1.0
         direction: 0.0    # Lower weight initially - focus on positions first
         edge_len: 0.0
@@ -49,7 +53,7 @@ curriculum:
     - name: structure
       epochs: [30, 60]
       weights:
-        smooth_l1: 2.0
+        l1: 2.0
         chamfer: 1.0
         direction: 1.0    # Full weight for orientation
         edge_len: 1.0     # Full weight for proportions
@@ -59,7 +63,7 @@ curriculum:
     - name: physics
       epochs: [60, null]  # null means until end of training
       weights:
-        smooth_l1: 2.0
+        l1: 2.0
         chamfer: 1.0
         direction: 1.0
         edge_len: 1.0
@@ -71,9 +75,9 @@ curriculum:
 # =============================================================================
 recon:
   enabled: true
-  smooth_l1:
+  scale_factor: 1.0     # Optional: compute recon metrics in centimeters (inputs are meters)
+  l1:
     enabled: true
-    beta: 0.01          # Huber loss transition point
   chamfer:
     enabled: true
     use_pytorch3d: true

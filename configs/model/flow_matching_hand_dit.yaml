@@ -60,6 +60,19 @@ prediction_target: v
 #   - 如果训练末期不稳定，可以增大此值
 tau_min: 1e-3
 
+# -----------------------------------------------------------------------------
+# 2.3 Training time schedule (stochastic t sampling)
+# -----------------------------------------------------------------------------
+# 控制训练时采样的 t 分布（推理采样的 sample_schedule 仍由下方采样配置控制）
+#   - uniform: 直接 U(0,1)
+#   - logit_normal: logit(t) ~ N(mu, sigma)，并裁剪到 [t_min, t_max]
+# JiT 推荐 logit_normal，mu 偏负可强调高噪声（小 t）
+train_time_schedule:
+  name: uniform
+  params:
+    t_min: 0.0
+    t_max: 1.0
+
 
 # -----------------------------------------------------------------------------
 # 3. Flow Matching loss
@@ -128,4 +141,3 @@ proj_max_corr: 0.2
 #   - 第一个 epoch 会自动探测验证集大小，之后均匀采样
 #   - 总采样样本数 = val_num_sample_batches * batch_size
 val_num_sample_batches: 10
-

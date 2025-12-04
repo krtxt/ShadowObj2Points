@@ -1,7 +1,7 @@
 """Time scheduling strategies for flow matching sampling."""
 
 import torch
-from typing import Optional
+from typing import Callable, Optional, Dict, Any
 
 
 class TimeScheduleBase:
@@ -110,3 +110,62 @@ def build_time_schedule(
         return schedule_class(shift=shift)
     
     return schedule_class()
+
+
+# --------------------------------------------------------------------------
+# Training time samplers (for stochastic timestep draws during training)
+# --------------------------------------------------------------------------
+
+def build_training_time_sampler(
+    name: str = "uniform",
+    params: Optional[Dict[str, Any]] = None,
+) -> Callable[[int, torch.device, torch.dtype], torch.Tensor]:
+    """
+    Build a callable that samples timesteps for training.
+    
+    Args:
+        name: Sampler name ('uniform' or 'logit_normal')
+        params: Optional dict of sampler-specific params.
+            - uniform: t_min (float), t_max (float)
+            - logit_normal: mu (float), sigma (float), t_min (float), t_max (float)
+    
+    Returns:
+        Callable: f(batch_size, device, dtype) -> (B,) timesteps in [0, 1]
+    """
+    params = dict(params or {})
+    sampler_name = str(name).lower()
+    
+    if sampler_name == "uniform":
+        t_min = float(params.get("t_min", 0.0))
+        t_max = float(params.get("t_max", 1.0))
+        t_min = max(0.0, min(t_min, 1.0))
+        t_max = max(t_min, min(t_max, 1.0))
+
+        def _sample(batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+            t = torch.rand(batch_size, device=device, dtype=dtype)
+            if t_min != 0.0 or t_max != 1.0:
+                t = t_min + (t_max - t_min) * t
+            return t.clamp(0.0, 1.0)
+
+        return _sample
+
+    if sampler_name == "logit_normal":
+        mu = float(params.get("mu", -0.8))
+        sigma = float(params.get("sigma", 1.6))
+        t_min = float(params.get("t_min", 1e-4))
+        t_max = float(params.get("t_max", 1.0 - 1e-4))
+        t_min = max(0.0, min(t_min, 1.0))
+        t_max = max(t_min, min(t_max, 1.0))
+
+        def _sample(batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+            eps = torch.randn(batch_size, device=device, dtype=dtype)
+            logits = mu + sigma * eps
+            t = torch.sigmoid(logits)
+            return t.clamp(t_min, t_max)
+
+        return _sample
+
+    raise ValueError(
+        f"Unknown training time sampler '{name}'. "
+        "Supported: 'uniform', 'logit_normal'."
+    )

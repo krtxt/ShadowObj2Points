@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -339,7 +339,14 @@ class VelocityStrategyBase(nn.Module):
         assert self.prediction_target in ("x", "v"), \
             f"prediction_target must be 'x' or 'v', got '{prediction_target}'"
 
-    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> torch.Tensor:
+    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> Dict[str, torch.Tensor]:
+        """Predict velocity and optionally raw output.
+        
+        Returns:
+            Dict with keys:
+                - "velocity": velocity tensor (B, N, 3)
+                - "x_pred": predicted target position (B, N, 3), only when prediction_target='x'
+        """
         raise NotImplementedError
 
     def _tau(self, t: torch.Tensor) -> torch.Tensor:
@@ -401,11 +408,14 @@ class DirectVelocityStrategy(VelocityStrategyBase):
         self.register_buffer("edge_index", edge_index.clone().detach())
         self.tangent_projector = TangentProjector(edge_index) if use_tangent else None
 
-    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> torch.Tensor:
+    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> Dict[str, torch.Tensor]:
         output = self.head(hand_tokens_out)
         v = self._output_to_velocity(output, keypoints, timesteps)
         v = self.apply_tangent_projection(v, keypoints)
-        return v
+        result = {"velocity": v}
+        if self.prediction_target == "x":
+            result["x_pred"] = output
+        return result
 
 
 class PhysGuidedVelocityStrategy(VelocityStrategyBase):
@@ -457,13 +467,16 @@ class PhysGuidedVelocityStrategy(VelocityStrategyBase):
         out.scatter_add_(1, idx_j, grad_j)
         return out
 
-    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> torch.Tensor:
+    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> Dict[str, torch.Tensor]:
         output = self.head(hand_tokens_out)
         v_raw = self._output_to_velocity(output, keypoints, timesteps)
         grad = self._length_grad(keypoints)
         v = v_raw - self.eta * grad
         v = self.apply_tangent_projection(v, keypoints)
-        return v
+        result = {"velocity": v}
+        if self.prediction_target == "x":
+            result["x_pred"] = output
+        return result
 
 
 class GoalKabschVelocityStrategy(VelocityStrategyBase):
@@ -491,7 +504,7 @@ class GoalKabschVelocityStrategy(VelocityStrategyBase):
         self.register_buffer("edge_index", edge_index.clone().detach())
         self.tangent_projector = TangentProjector(edge_index) if use_tangent else None
 
-    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> torch.Tensor:
+    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> Dict[str, torch.Tensor]:
         delta = self.decode(hand_tokens_out)  # (B, N, 3)
         # Note: We use model.template_xyz to ensure we use the same device/dtype as the main model
         # if self.projector.template_xyz is not enough. 
@@ -506,7 +519,8 @@ class GoalKabschVelocityStrategy(VelocityStrategyBase):
         tau = self._tau(timesteps)
         v = (x_goal - keypoints) / tau
         v = self.apply_tangent_projection(v, keypoints)
-        return v
+        # GoalKabsch always predicts x (goal position) internally
+        return {"velocity": v, "x_pred": x_goal}
 
 
 class GroupRigidParamVelocityStrategy(VelocityStrategyBase):
@@ -535,7 +549,7 @@ class GroupRigidParamVelocityStrategy(VelocityStrategyBase):
             nn.Linear(256, 9)
         )
 
-    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> torch.Tensor:
+    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> Dict[str, torch.Tensor]:
         B, N, D = hand_tokens_out.shape
         device = hand_tokens_out.device
         
@@ -583,7 +597,8 @@ class GroupRigidParamVelocityStrategy(VelocityStrategyBase):
             v = (x_goal - keypoints_f32) / tau
             v = self.apply_tangent_projection(v, keypoints_f32)
             
-        return v.to(orig_dtype)
+        # GroupRigid always predicts x (goal position) internally
+        return {"velocity": v.to(orig_dtype), "x_pred": x_goal.to(orig_dtype)}
 
 
 class PBDCorrectedVelocityStrategy(VelocityStrategyBase):
@@ -617,7 +632,7 @@ class PBDCorrectedVelocityStrategy(VelocityStrategyBase):
         self.register_buffer("edge_index", edge_index.clone().detach())
         self.tangent_projector = TangentProjector(edge_index) if use_tangent else None
 
-    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> torch.Tensor:
+    def predict(self, model, keypoints, timesteps, hand_tokens_out) -> Dict[str, torch.Tensor]:
         tau = self._tau(timesteps)
         output = self.head(hand_tokens_out)
         v_pred = self._output_to_velocity(output, keypoints, timesteps)
@@ -627,7 +642,8 @@ class PBDCorrectedVelocityStrategy(VelocityStrategyBase):
         
         v = (x_corr - keypoints) / tau
         v = self.apply_tangent_projection(v, keypoints)
-        return v
+        result = {"velocity": v, "x_pred": x_corr}
+        return result
 
 
 # Velocity Strategy Registry

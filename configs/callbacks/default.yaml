@@ -19,7 +19,7 @@ early_stopping:
   patience: 50
   mode: "min"
   verbose: true
-  min_delta: 0.001
+  min_delta: 0.0001
 
 # Learning Rate Monitor
 lr_monitor:
@@ -37,16 +37,26 @@ rich_progress_bar:
   _target_: lightning.pytorch.callbacks.RichProgressBar
   leave: true
   refresh_rate: 1
+  # theme:
+  #   _target_: lightning.pytorch.callbacks.progress.rich_progress.RichProgressBarTheme
+  #   description: "bold italic #FF00FF"
+  #   progress_bar: "#6A0DAD"
+  #   progress_bar_finished: "#FF0000"
+  #   progress_bar_pulse: "#00FF00"
+  #   batch_progress: "bold #FF00FF"
+  #   time: "#9370DB"
+  #   processing_speed: "#00FFFF"
+  #   metrics: "bold #FFA500"
   theme:
     _target_: lightning.pytorch.callbacks.progress.rich_progress.RichProgressBarTheme
-    description: "bold italic #FF00FF"
-    progress_bar: "#6A0DAD"
-    progress_bar_finished: "#FF0000"
-    progress_bar_pulse: "#00FF00"
-    batch_progress: "bold #FF00FF"
-    time: "#9370DB"
-    processing_speed: "#00FFFF"
-    metrics: "bold #FFA500"
+    description: "bold italic #AEC6CF"
+    progress_bar: "#D3D3D3"
+    progress_bar_finished: "#B0C4DE"
+    progress_bar_pulse: "#F0F8FF"
+    batch_progress: "bold #FFFFFF"
+    time: "#228B22"
+    processing_speed: "#4682B4"
+    metrics: "bold #F4A460"
 
 # Image Logger
 # image_logger:

@@ -173,10 +173,30 @@ class ValidationSummaryCallback(Callback):
 
         # Quality metrics
         val_quality_metrics = {}
-        for key in ("val/recon_smooth_l1", "val/recon_chamfer", "val/recon_direction",
-                    "val/recon_edge_len_err", "val/recon_total"):
+        for key in (
+            "val/recon_l1",
+            "val/recon_chamfer",
+            "val/recon_direction",
+            "val/recon_edge_len",  # actual logged name
+            "val/recon_edge_len_err",  # backward compatibility if ever used
+            "val/recon_total",
+        ):
             if (v := get_metric(key)) is not None:
                 val_quality_metrics[key.split("/", 1)[-1]] = v
+
+        # Regression loss metrics (when lambda_regression > 0)
+        val_regression_metrics = {}
+        for key in (
+            "val/loss_regression",
+            "val/reg_l1",
+            "val/reg_chamfer",
+            "val/reg_direction",
+            "val/reg_edge_len",
+            "val/reg_bone",
+            "val/reg_collision",
+        ):
+            if (v := get_metric(key)) is not None:
+                val_regression_metrics[key.split("/", 1)[-1]] = v
 
         return {
             "num_batches": num_batches,
@@ -187,6 +207,7 @@ class ValidationSummaryCallback(Callback):
             "val_detailed_loss": val_detailed_loss,
             "val_flow_metrics": val_flow_metrics,
             "val_quality_metrics": val_quality_metrics,
+            "val_regression_metrics": val_regression_metrics,
             "val_set_metrics": {},
             "val_diversity_metrics": {},
         }
@@ -219,6 +240,7 @@ class ValidationSummaryCallback(Callback):
             val_quality_metrics=m["val_quality_metrics"],
             val_diversity_metrics=m["val_diversity_metrics"],
             val_flow_metrics=m["val_flow_metrics"],
+            val_regression_metrics=m["val_regression_metrics"],
         )
 
         # Reset validation loss buffer

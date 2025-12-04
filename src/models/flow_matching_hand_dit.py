@@ -18,6 +18,7 @@ from .backbone import build_backbone
 from .components.velocity_strategies import build_velocity_strategy
 from .components.graph_config import GraphConfig
 from .components.sampling_config import SamplingConfig
+from .components.time_schedules import build_training_time_sampler
 import logging
 
 
@@ -102,6 +103,8 @@ class HandFlowMatchingDiT(L.LightningModule):
         # Prediction target (JiT-style option)
         prediction_target: str = "v",
         tau_min: float = 1e-3,
+        # Training time schedule (stochastic timestep sampling)
+        train_time_schedule: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["graph_consts", "backbone", "hand_encoder", "dit"])
@@ -114,6 +117,7 @@ class HandFlowMatchingDiT(L.LightningModule):
             self._apply_norm_to_graph_consts()
         self._setup_core_modules(d_model, backbone, hand_encoder, dit, graph_consts)
         self._setup_velocity_strategy(d_model, velocity_mode, velocity_kwargs, prediction_target, tau_min)
+        self._setup_training_time_sampler(train_time_schedule)
         self._setup_sampling_config(
             sample_num_steps, sample_solver, sample_schedule, schedule_shift,
             state_projection_mode, state_projection_kwargs, proj_num_iters, proj_max_corr
@@ -199,13 +203,36 @@ class HandFlowMatchingDiT(L.LightningModule):
             self.edge_rest_lengths.mul_(scalar_scale)
 
     def _denorm_xyz(self, norm_xyz: torch.Tensor) -> torch.Tensor:
-        """Map normalized xyz in [-1,1] back to original space."""
+        """Map normalized xyz in [-1,1] back to original space.
+        
+        Supports both 3D (xyz only) and 6D (xyz + normals) inputs.
+        For 6D input, only the first 3 channels (xyz) are denormalized;
+        normals are kept as-is since they are direction vectors.
+        """
         if self.norm_min is None or self.norm_max is None:
             raise RuntimeError("Normalization bounds not loaded.")
+        
+        # Handle 6D input (xyz + normals)
+        if norm_xyz.shape[-1] == 6:
+            xyz_part = norm_xyz[..., :3]
+            normals_part = norm_xyz[..., 3:]
+            xyz_denorm = self._denorm_xyz(xyz_part)
+            return torch.cat([xyz_denorm, normals_part], dim=-1)
+        
         norm = torch.clamp(norm_xyz, -1.0, 1.0)
         unscaled = (norm + 1.0) * 0.5
         denom = torch.clamp(self.norm_max - self.norm_min, min=1e-6)
         return unscaled * denom + self.norm_min
+    
+    def _safe_register_buffer(self, name: str, tensor: torch.Tensor, persistent: bool = True) -> None:
+        """Register buffer, replacing existing attributes safely if needed."""
+        if hasattr(self, name):
+            if name in self._buffers:
+                self._buffers[name] = tensor
+                return
+            else:
+                delattr(self, name)
+        self.register_buffer(name, tensor, persistent=persistent)
     
     def _setup_graph_structure(self, graph_consts: Dict[str, torch.Tensor]) -> None:
         """Parse and register graph structure constants."""
@@ -217,13 +244,13 @@ class HandFlowMatchingDiT(L.LightningModule):
         self.rigid_groups = graph_cfg.rigid_groups
         fixed_idx = torch.arange(0, min(7, self.N))
         # Keep fixed-point indices on the model device for safe indexing on GPU.
-        self.register_buffer("fixed_point_indices", fixed_idx, persistent=False)
+        self._safe_register_buffer("fixed_point_indices", fixed_idx, persistent=False)
         fixed_mask = torch.zeros(self.N, dtype=torch.bool)
         fixed_mask[fixed_idx] = True
-        self.register_buffer("fixed_point_mask", fixed_mask, persistent=False)
+        self._safe_register_buffer("fixed_point_mask", fixed_mask, persistent=False)
         # Mask edges that are entirely between fixed points for optional use in metrics.
         edge_mask = ~(fixed_mask[self.edge_index[0]] & fixed_mask[self.edge_index[1]])
-        self.register_buffer("active_edge_mask", edge_mask, persistent=False)
+        self._safe_register_buffer("active_edge_mask", edge_mask, persistent=False)
         # Cache rigid groups that involve at least one active point for projection purposes.
         self.rigid_groups_active: List[torch.Tensor] = [
             g for g in self.rigid_groups if not fixed_mask[g].all()
@@ -284,6 +311,13 @@ class HandFlowMatchingDiT(L.LightningModule):
             prediction_target=prediction_target,
             tau_min=tau_min,
         )
+
+    def _setup_training_time_sampler(self, train_time_schedule: Optional[Dict[str, Any]]) -> None:
+        """Build stochastic timestep sampler for training."""
+        cfg = dict(train_time_schedule or {})
+        name = cfg.get("name", "uniform")
+        params = cfg.get("params", {})
+        self.training_time_sampler = build_training_time_sampler(name=name, params=params)
     
     def _setup_sampling_config(
         self,
@@ -320,9 +354,13 @@ class HandFlowMatchingDiT(L.LightningModule):
     
     def _setup_loss(self, loss_cfg: Optional[DictConfig]) -> None:
         """Setup loss function from configuration."""
+        from .components.losses import DeterministicRegressionLoss
+        
         if loss_cfg is None:
             self.loss_fn = FlowMatchingLoss(edge_index=self.edge_index, lambda_tangent=1.0)
             self.lambda_tangent = 1.0
+            self.regression_loss_fn = None
+            self.lambda_regression = 0.0
             return
         
         cfg_dict = (
@@ -334,16 +372,52 @@ class HandFlowMatchingDiT(L.LightningModule):
         # Remove validation-only configuration before instantiating loss
         cfg_dict.pop("val_metrics", None)
         
+        # Extract regression loss config
+        regression_cfg = cfg_dict.pop("regression", None)
+        self.lambda_regression = float(cfg_dict.pop("lambda_regression", 0.0))
+        
+        # Extract flow matching weights (new component-based config)
+        flow_weights = cfg_dict.pop("weights", None)
         lambda_tangent = float(cfg_dict.get("lambda_tangent", 1.0))
+        loss_clamp = float(cfg_dict.get("loss_clamp", 100.0))
         target = cfg_dict.pop("_target_", None)
         
         if target:
             hydra_cfg = OmegaConf.create({"_target_": target, **cfg_dict})
             self.loss_fn = hydra_instantiate(hydra_cfg, edge_index=self.edge_index)
         else:
-            self.loss_fn = FlowMatchingLoss(edge_index=self.edge_index, lambda_tangent=lambda_tangent)
+            # Use weights dict if provided, otherwise fall back to lambda_tangent
+            self.loss_fn = FlowMatchingLoss(
+                edge_index=self.edge_index, 
+                lambda_tangent=lambda_tangent,
+                loss_clamp=loss_clamp,
+                weights=flow_weights,
+            )
         
         self.lambda_tangent = float(getattr(self.loss_fn, "lambda_tangent", lambda_tangent))
+        
+        # Setup regression loss if enabled (prediction_target='x' required)
+        self.regression_loss_fn = None
+        if self.lambda_regression > 0.0:
+            if self.prediction_target != "x":
+                logging.getLogger(__name__).warning(
+                    f"lambda_regression={self.lambda_regression} but prediction_target='{self.prediction_target}'. "
+                    "Regression loss requires prediction_target='x'. Disabling regression loss."
+                )
+                self.lambda_regression = 0.0
+            else:
+                reg_cfg = dict(regression_cfg or {})
+                # Merge collision hyperparameters from top-level config
+                for key in ["collision_margin", "collision_max_scene_points", 
+                            "collision_capsule_radius", "collision_capsule_circle_segments",
+                            "collision_capsule_cap_segments"]:
+                    if key in cfg_dict:
+                        reg_cfg[key] = cfg_dict[key]
+                self.regression_loss_fn = DeterministicRegressionLoss(
+                    edge_index=self.edge_index,
+                    config=reg_cfg,
+                    fixed_point_indices=getattr(self, "fixed_point_indices", None),
+                )
 
     def _setup_val_metrics(self, loss_cfg: Optional[DictConfig]) -> None:
         """Setup validation metric manager from loss configuration."""
@@ -361,7 +435,14 @@ class HandFlowMatchingDiT(L.LightningModule):
         if not val_cfg:
             return
 
-        self.val_metric_manager = HandValidationMetricManager(edge_index=self.edge_index, config=val_cfg)
+        recon_scale = float(val_cfg.get("recon_scale", val_cfg.get("recon", {}).get("scale_factor", 1.0)))
+
+        self.val_metric_manager = HandValidationMetricManager(
+            edge_index=self.edge_index,
+            config=val_cfg,
+            fixed_point_indices=getattr(self, "fixed_point_indices", None),
+            recon_scale=recon_scale,
+        )
 
     def encode_scene_tokens(self, scene_pc: torch.Tensor, return_xyz: bool = False):
         """Encode scene point cloud into tokens.
@@ -466,12 +547,24 @@ class HandFlowMatchingDiT(L.LightningModule):
         scene_pc: torch.Tensor,
         timesteps: torch.Tensor,
         scene_tokens: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_dict: bool = False,
+    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """Predict velocity by the selected strategy.
 
         Keeps the original encoding pathway, but delegates velocity logic to strategy.
         Optionally accepts pre-computed ``scene_tokens`` to avoid re-encoding during
         sampling, where the scene does not change across ODE evaluations.
+        
+        Args:
+            keypoints: Current keypoints (B, N, 3)
+            scene_pc: Scene point cloud (B, P, 3)
+            timesteps: Current timesteps (B,)
+            scene_tokens: Pre-computed scene tokens for caching
+            return_dict: If True, return dict with "velocity" and optionally "x_pred"
+            
+        Returns:
+            If return_dict=False: velocity tensor (B, N, 3)
+            If return_dict=True: dict with "velocity" and optionally "x_pred"
         """
         use_cross_bias = bool(getattr(self.dit, "hand_scene_bias", False))
         scene_xyz: Optional[torch.Tensor] = None
@@ -493,16 +586,21 @@ class HandFlowMatchingDiT(L.LightningModule):
             xyz=keypoints,
             scene_xyz=scene_xyz,
         )
-        # Delegate:
-        velocity = self.velocity_strategy.predict(
+        # Delegate: returns dict with "velocity" and optionally "x_pred"
+        result = self.velocity_strategy.predict(
             model=self,
             keypoints=keypoints,
             timesteps=timesteps,
             hand_tokens_out=hand_tokens_out,
         )
+        velocity = result["velocity"]
         # Anchor fixed points by zeroing their velocity to prevent drift during integration
         if hasattr(self, "fixed_point_indices") and self.fixed_point_indices.numel() > 0:
             velocity[:, self.fixed_point_indices, :] = 0
+            result["velocity"] = velocity
+        
+        if return_dict:
+            return result
         return velocity
 
     def _construct_flow_path(
@@ -532,7 +630,7 @@ class HandFlowMatchingDiT(L.LightningModule):
         else:
             source = torch.randn_like(target)
 
-        timesteps = torch.rand(B, device=device)
+        timesteps = self.training_time_sampler(batch_size=B, device=device, dtype=dtype)
         t_expanded = timesteps.view(B, 1, 1)
         noisy_sample = (1.0 - t_expanded) * source + t_expanded * target
         target_velocity = target - source
@@ -583,6 +681,30 @@ class HandFlowMatchingDiT(L.LightningModule):
                 batch_size=batch_size,
                 sync_dist=True,
             )
+            
+            # Log regression loss and its components if present
+            if "loss_regression" in loss_dict:
+                self.log(
+                    "train/loss_regression",
+                    loss_dict["loss_regression"].detach(),
+                    prog_bar=False,
+                    on_step=True,
+                    on_epoch=True,
+                    batch_size=batch_size,
+                    sync_dist=True,
+                )
+                # Log individual regression components (reg_l1, reg_chamfer, etc.)
+                for k, v in loss_dict.items():
+                    if k.startswith("reg_"):
+                        self.log(
+                            f"train/{k}",
+                            v.detach(),
+                            prog_bar=False,
+                            on_step=False,
+                            on_epoch=True,
+                            batch_size=batch_size,
+                            sync_dist=True,
+                        )
 
             if not torch.isfinite(loss):
                 # Log which components are NaN/Inf for debugging
@@ -680,9 +802,40 @@ class HandFlowMatchingDiT(L.LightningModule):
             Tuple of (loss, loss_dict)
         """
         _, timesteps, noisy_sample, target_velocity = self._construct_flow_path(target)
-        pred_velocity = self.predict_velocity(noisy_sample, scene_pc, timesteps)
+        
+        # Use return_dict=True to get x_pred when prediction_target='x'
+        need_regression = self.lambda_regression > 0.0 and self.regression_loss_fn is not None
+        pred_result = self.predict_velocity(
+            noisy_sample, scene_pc, timesteps, 
+            return_dict=need_regression
+        )
+        
+        if need_regression:
+            pred_velocity = pred_result["velocity"]
+            x_pred = pred_result.get("x_pred")
+        else:
+            pred_velocity = pred_result
+            x_pred = None
+        
+        # Flow matching loss
         loss_dict = self.loss_fn(v_hat=pred_velocity, v_star=target_velocity, y_tau=noisy_sample)
         loss = loss_dict["loss"]
+        
+        # Add regression loss if enabled and x_pred available
+        if need_regression and x_pred is not None:
+            reg_loss, reg_components = self.regression_loss_fn(
+                pred_xyz=x_pred,
+                gt_xyz=target,
+                edge_rest_lengths=self.edge_rest_lengths,
+                active_edge_mask=getattr(self, "active_edge_mask", None),
+            )
+            loss = loss + self.lambda_regression * reg_loss
+            loss_dict["loss_regression"] = reg_loss
+            # Add individual regression components for logging
+            for k, v in reg_components.items():
+                loss_dict[f"reg_{k}"] = v
+        
+        loss_dict["loss"] = loss
         return loss, loss_dict
 
     def _compute_val_metrics(
@@ -821,6 +974,30 @@ class HandFlowMatchingDiT(L.LightningModule):
                 sync_dist=True,
                 batch_size=batch_size,
             )
+            
+            # Log regression loss and its components if present
+            if "loss_regression" in loss_dict:
+                self.log(
+                    "val/loss_regression",
+                    loss_dict["loss_regression"],
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=batch_size,
+                )
+                # Log individual regression components (reg_l1, reg_chamfer, etc.)
+                for k, v in loss_dict.items():
+                    if k.startswith("reg_"):
+                        self.log(
+                            f"val/{k}",
+                            v,
+                            prog_bar=False,
+                            on_step=False,
+                            on_epoch=True,
+                            sync_dist=True,
+                            batch_size=batch_size,
+                        )
             
             with torch.no_grad():
                 # Keep edge-length computation in the same space as edge_rest_lengths.

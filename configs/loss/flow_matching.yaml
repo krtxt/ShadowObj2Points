@@ -1,5 +1,66 @@
+# Flow Matching Loss Configuration
+# =================================
+#
+# Uses component registry for modular loss computation.
+# Components with weight=0 are not computed (saves compute).
+#
+# Available Flow Matching Components:
+# - loss_fm: MSE between predicted and target velocity (always enabled)
+# - loss_tangent: Tangent regularization for rigid body constraint
+
+# Flow matching component weights
+# Set loss_tangent to 0.0 to disable tangent regularization
+weights:
+  loss_fm: 1.0
+  loss_tangent: 1.0
+
+# Legacy alias (backwards compatible)
 lambda_tangent: 1.0
 
+# =============================================================================
+# Direct Regression Loss (for prediction_target="x" mode)
+# =============================================================================
+# When > 0, adds DeterministicRegressionLoss on x_pred vs gt_xyz
+lambda_regression: 0.0
+
+# Regression loss configuration (used when lambda_regression > 0)
+# Uses component registry - components with weight=0 are skipped
+regression:
+  recon:
+    enabled: true
+    l1:
+      enabled: true
+    chamfer:
+      enabled: true
+      use_pytorch3d: true
+    direction:
+      enabled: true
+      mode: cos
+      eps: 1.0e-6
+    edge_len:
+      enabled: true
+      eps: 1.0e-6
+  # Weights for regression loss components (weight=0 skips computation)
+  weights:
+    l1: 1.0
+    chamfer: 1.0
+    direction: 0.5
+    edge_len: 0.5
+    bone: 0.0       # Set to 0 to skip bone loss computation
+    collision: 0.0  # Set to 0 to skip collision loss computation
+
+# =============================================================================
+# Collision Loss Hyperparameters (for regression loss when collision weight > 0)
+# =============================================================================
+collision_margin: 0.002           # Minimum clearance distance (meters)
+collision_max_scene_points: 2048  # Max scene points for collision check
+collision_capsule_radius: 0.008   # Finger capsule radius (meters)
+collision_capsule_circle_segments: 8
+collision_capsule_cap_segments: 3
+
+# =============================================================================
+# Validation Metrics
+# =============================================================================
 val_metrics:
   flow:
     enabled: true
@@ -10,10 +71,10 @@ val_metrics:
       edge_len_err: 0.0
   recon:
     enabled: true
-    smooth_l1:
+    scale_factor: 100.0   # Compute recon metrics in centimeters (inputs are meters)
+    l1:
       enabled: true
       weight: 1.0
-      beta: 0.01
     chamfer:
       enabled: true
       weight: 1.0

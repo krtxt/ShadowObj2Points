@@ -36,10 +36,9 @@ model:
 #       enabled: false        # 关闭 flow 相关 metric
 #     recon:
 #       enabled: true         # 保持原有重建指标
-#       smooth_l1:
+#       l1:
 #         enabled: true
 #         weight: 1.0
-#         beta: 0.01
 #       chamfer:
 #         enabled: true
 #         weight: 1.0

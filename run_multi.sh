@@ -18,9 +18,9 @@ export TORCH_NCCL_BLOCKING_WAIT=0
 # export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True
 
 # NCCL_P2P_DISABLE=1
-# NCCL_BLOCKING_WAIT=1
+# NCCL_BLOCKING_WAIT=1   0,1,2,3,
 
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # # 运行训练
 # python train.py \
@@ -57,24 +57,75 @@ export CUDA_VISIBLE_DEVICES=4,5,6,7
 #     datamodule.prefetch_factor=2 \
 #     datamodule.persistent_workers=false 
 
+# python train.py \
+#     model=flow_matching_hand_dit \
+#     backbone=ptv3_sparse_fourier \
+#     datamodule=handencoder_dm_dex \
+#     datamodule.use_scene_normals=true \
+#     experiments=multi_gpu \
+#     optimizer.lr=4e-4 \
+#     compile=true \
+#     experiment_name=exp_1202_fm_direct_free_pred_v_real \
+#     dit.qk_norm=true \
+#     dit.qk_norm_type='rms' \
+#     dit.norm_type='rms' \
+#     dit.activation_fn=swiglu \
+#     dit.hand_scene_bias.enabled=true \
+#     batch_size=720 \
+#     trainer.precision=bf16-mixed \
+#     velocity_strategy=direct_free \
+#     model.prediction_target=v \
+#     datamodule.num_workers=16 \
+#     datamodule.prefetch_factor=4 \
+#     datamodule.persistent_workers=false 
+
+# python train.py \
+#     model=flow_matching_hand_dit \
+#     backbone=ptv3_sparse_fourier \
+#     datamodule=handencoder_dm_dex \
+#     datamodule.use_scene_normals=true \
+#     experiments=multi_gpu \
+#     optimizer.lr=2e-4 \
+#     compile=true \
+#     experiment_name=exp_1202_fm_direct_free_pred_v \
+#     dit.qk_norm=true \
+#     dit.qk_norm_type='rms' \
+#     dit.norm_type='rms' \
+#     dit.activation_fn=swiglu \
+#     dit.hand_scene_bias.enabled=true \
+#     batch_size=360 \
+#     trainer.precision=bf16-mixed \
+#     velocity_strategy=direct_free \
+#     model.prediction_target=x \
+#     datamodule.num_workers=16 \
+#     datamodule.prefetch_factor=4 \
+#     datamodule.persistent_workers=false 
+
 python train.py \
     model=flow_matching_hand_dit \
+    model.prediction_target=x model.tau_min=1e-5 \
+    model.train_time_schedule.name=logit_normal \
+    model.train_time_schedule.params.mu=-0.8 \
+    model.train_time_schedule.params.sigma=1.6 \
+    model.train_time_schedule.params.t_min=1e-4 \
+    model.train_time_schedule.params.t_max=0.9999 \
+    model.sample_schedule=linear \
     backbone=ptv3_sparse_fourier \
     datamodule=handencoder_dm_dex \
     datamodule.use_scene_normals=true \
     experiments=multi_gpu \
     optimizer.lr=2e-4 \
     compile=true \
-    experiment_name=exp_1202_fm_direct_free_full \
+    experiment_name=exp_1204_fm_direct_free_pred_x \
     dit.qk_norm=true \
     dit.qk_norm_type='rms' \
     dit.norm_type='rms' \
     dit.activation_fn=swiglu \
     dit.hand_scene_bias.enabled=true \
-    batch_size=320 \
+    batch_size=720 \
     trainer.precision=bf16-mixed \
     velocity_strategy=direct_free \
-    model.prediction_target=x \
+    loss.lambda_tangent=0.0 \
     datamodule.num_workers=16 \
     datamodule.prefetch_factor=4 \
     datamodule.persistent_workers=false 

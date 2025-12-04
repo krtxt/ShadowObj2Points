@@ -1,18 +1,49 @@
+# =============================================================================
 # Flow Matching Loss Configuration
-# =================================
+# =============================================================================
 #
+# This config controls loss computation for FlowMatchingHandDiT model.
 # Uses component registry for modular loss computation.
-# Components with weight=0 are not computed (saves compute).
+# Components with weight=0 are NOT computed (saves compute).
 #
-# Available Flow Matching Components:
-# - loss_fm: MSE between predicted and target velocity (always enabled)
-# - loss_tangent: Tangent regularization for rigid body constraint
+# COORDINATE SPACES:
+# -----------------
+# - Normalized space: Data scaled to [-1, 1] via norm_min/norm_max (when use_norm_data=True)
+# - World space: Original coordinates in meters
+#
+# LOSS COMPUTATION SPACES:
+# ------------------------
+# | Component      | Space      | Notes                                      |
+# |----------------|------------|---------------------------------------------|
+# | loss_fm        | Normalized | Flow matching MSE on velocity              |
+# | loss_tangent   | Normalized | Tangent regularization                     |
+# | reg_l1         | Normalized | Position MAE, consistent with flow loss    |
+# | reg_chamfer    | Normalized | Chamfer distance                           |
+# | reg_direction  | Normalized | Cosine similarity (scale-invariant)        |
+# | reg_edge_len   | Normalized | Uses normalized edge_rest_lengths          |
+# | reg_bone       | Normalized | Uses normalized template_xyz               |
+# | reg_collision  | Centimeter | Via denorm_fn * scale (default: cm)        |
+#
+# VALIDATION METRICS SPACES:
+# --------------------------
+# | Metric         | Space      | Notes                                      |
+# |----------------|------------|---------------------------------------------|
+# | recon_l1       | World      | Scaled by scale_factor (default: cm)       |
+# | recon_chamfer  | World      | Scaled by scale_factor                     |
+# | recon_direction| World      | Cosine similarity (scale-invariant)        |
+# | recon_edge_len | World      | Scaled by scale_factor                     |
+# | flow_loss      | Normalized | Same as training loss                      |
+# | flow_loss_fm   | Normalized | Same as training loss                      |
+#
+# =============================================================================
 
-# Flow matching component weights
-# Set loss_tangent to 0.0 to disable tangent regularization
+# =============================================================================
+# Flow Matching Loss Weights
+# =============================================================================
+# Main flow matching components (computed in normalized space)
 weights:
-  loss_fm: 1.0
-  loss_tangent: 1.0
+  loss_fm: 1.0        # MSE between predicted and target velocity
+  loss_tangent: 1.0   # Tangent regularization for rigid body constraint
 
 # Legacy alias (backwards compatible)
 lambda_tangent: 1.0
@@ -20,48 +51,71 @@ lambda_tangent: 1.0
 # =============================================================================
 # Direct Regression Loss (for prediction_target="x" mode)
 # =============================================================================
-# When > 0, adds DeterministicRegressionLoss on x_pred vs gt_xyz
+# When lambda_regression > 0, adds DeterministicRegressionLoss on x_pred vs gt_xyz.
+# Requires prediction_target="x" in model config.
+# All regression components except collision are computed in normalized space.
 lambda_regression: 0.0
 
-# Regression loss configuration (used when lambda_regression > 0)
-# Uses component registry - components with weight=0 are skipped
+# Regression loss component configuration
 regression:
   recon:
-    enabled: true
+    enabled: false
     l1:
-      enabled: true
+      enabled: false
     chamfer:
-      enabled: true
+      enabled: false
       use_pytorch3d: true
     direction:
-      enabled: true
-      mode: cos
+      enabled: false
+      mode: cos         # "cos" for cosine similarity
       eps: 1.0e-6
     edge_len:
-      enabled: true
+      enabled: false
       eps: 1.0e-6
-  # Weights for regression loss components (weight=0 skips computation)
+  
+  # Component weights (weight=0 skips computation entirely)
   weights:
-    l1: 1.0
-    chamfer: 1.0
-    direction: 0.5
-    edge_len: 0.5
-    bone: 0.0       # Set to 0 to skip bone loss computation
-    collision: 0.0  # Set to 0 to skip collision loss computation
+    l1: 0.0           # Position regression (MAE) - normalized space
+    chamfer: 0.0      # Chamfer distance - normalized space
+    direction: 0.0    # Edge direction alignment - normalized space
+    edge_len: 0.0     # Edge length consistency - normalized space
+    bone: 0.0         # Bone length vs template - normalized space (disabled)
+    collision: 0.5    # Penetration penalty - WORLD space via denorm_fn (disabled)
 
 # =============================================================================
-# Collision Loss Hyperparameters (for regression loss when collision weight > 0)
+# Collision Loss Hyperparameters
 # =============================================================================
-collision_margin: 0.002           # Minimum clearance distance (meters)
+# Used when regression.weights.collision > 0
+# Computed in CENTIMETER space (denorm * scale) for numerical stability.
+# All distance parameters should be in centimeters.
+collision_scale: 100.0            # Scale factor: meters -> centimeters
+collision_margin: 0.2             # Minimum clearance distance (cm) = 2mm
+collision_capsule_radius: 0.8     # Finger capsule radius (cm) = 8mm
 collision_max_scene_points: 2048  # Max scene points for collision check
-collision_capsule_radius: 0.008   # Finger capsule radius (meters)
 collision_capsule_circle_segments: 8
 collision_capsule_cap_segments: 3
 
 # =============================================================================
-# Validation Metrics
+# Sampling Frequency Configuration
 # =============================================================================
+# Controls how often expensive loss/metric computations are performed.
+# Setting to null or 0 means compute on ALL batches (no sampling).
+
+# Training: Number of batches per epoch to compute regression loss (reg_*)
+# Useful when collision loss is expensive. null = compute on all batches.
+train_num_sample_batches_for_reg_loss: null
+
+# Validation: Number of batches per epoch to compute recon metrics
+# These require full sampling which is expensive. null = compute on all batches.
+val_num_sample_batches: 10
+
+# =============================================================================
+# Validation Metrics Configuration
+# =============================================================================
+# Computed on sampled batches during validation.
+# Recon metrics use WORLD space (denormalized) with optional scale_factor.
 val_metrics:
+  # Flow metrics (normalized space, same as training)
   flow:
     enabled: true
     weights:
@@ -69,9 +123,12 @@ val_metrics:
       loss_fm: 1.0
       loss_tangent: 0.0
       edge_len_err: 0.0
+  
+  # Reconstruction quality metrics (world space)
+  # Computed from: self.sample(scene_pc) vs raw_target (both in world space)
   recon:
     enabled: true
-    scale_factor: 100.0   # Compute recon metrics in centimeters (inputs are meters)
+    scale_factor: 100.0   # Output in centimeters (input is meters)
     l1:
       enabled: true
       weight: 1.0

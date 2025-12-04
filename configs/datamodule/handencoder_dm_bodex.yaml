@@ -33,6 +33,10 @@ use_scene_normals: false
 train_phase: train
 val_phase: test
 test_phase: test
+# Optional sample limits for quick debugging/tuning
+train_sample_limit: null
+val_sample_limit: null
+test_sample_limit: null
 
 # Graph construction options
 use_palm_star: false

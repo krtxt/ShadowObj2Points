@@ -126,6 +126,8 @@ python train.py \
     trainer.precision=bf16-mixed \
     velocity_strategy=direct_free \
     loss.lambda_tangent=0.0 \
+    loss.regression.weights.collision=0.5 \
+    loss.weights.loss_tangent=0.0 \
     datamodule.num_workers=16 \
     datamodule.prefetch_factor=4 \
     datamodule.persistent_workers=false 

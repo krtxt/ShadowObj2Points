@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 import torch
 import lightning.pytorch as L
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 
 # Optional OmegaConf support
 try:  # pragma: no cover
@@ -760,6 +760,10 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
         max_points: int = 4096,
         # Optional scene point cloud normals
         use_scene_normals: bool = False,
+        # Sample limiting for quick experiments
+        train_sample_limit: Optional[int] = None,
+        val_sample_limit: Optional[int] = None,
+        test_sample_limit: Optional[int] = None,
     ) -> None:
         super().__init__()
         
@@ -829,6 +833,9 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
         self.test_dataset: Optional[Dataset] = None
         self._prepared_constants: Optional[Dict[str, Any]] = None
         self._norm_xyz_bounds: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self.train_sample_limit = train_sample_limit
+        self.val_sample_limit = val_sample_limit
+        self.test_sample_limit = test_sample_limit
 
     @staticmethod
     def _parse_cache_max(v: Any) -> Optional[Union[int, str]]:
@@ -995,6 +1002,22 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
             self._cache_meta = meta
         return ds
 
+    def _limit_dataset(self, ds: Dataset, limit: Optional[int], phase: str) -> Dataset:
+        """Optionally truncate dataset length for quick experiments."""
+        if limit is None:
+            return ds
+        try:
+            max_n = int(limit)
+        except Exception:
+            return ds
+        if max_n <= 0:
+            return ds
+        total = len(ds)
+        if total <= max_n:
+            return ds
+        logger.info("HandEncoderDataModule: limiting %s dataset to %d of %d samples", phase, max_n, total)
+        return Subset(ds, list(range(max_n)))
+
     @torch.no_grad()
     def _build_canonical(self, hand_model: HandModel) -> Dict[str, Any]:
         """Constructs the canonical graph structure using the HandModel."""
@@ -1101,10 +1124,12 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
                 if len(cache) == 0:
                     raise RuntimeError(f"Training cache empty for phase {ph}.")
                 cache_anchor = cache.meta.get('stored_anchor') if hasattr(cache, 'meta') else None
-                self.train_dataset = _HandEncoderPreparedDataset(
+                train_ds = _HandEncoderPreparedDataset(
                     cache, cache_dataset=None, cached_stored_anchor=cache_anchor, **common_args
                 )
-                logger.info("Train dataset (cache-only): phase=%s, size=%d", ph, len(cache))
+                train_ds = self._limit_dataset(train_ds, self.train_sample_limit, "train")
+                self.train_dataset = train_ds
+                logger.info("Train dataset (cache-only): phase=%s, size=%d", ph, len(self.train_dataset))
             else:
                 # Normal mode: base + optional cache
                 base = self._make_base_dataset(ph)
@@ -1117,10 +1142,12 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
                         cache_anchor = cache.meta.get('stored_anchor')
                     except Exception:
                         cache_anchor = None
-                self.train_dataset = _HandEncoderPreparedDataset(
+                train_ds = _HandEncoderPreparedDataset(
                     base, cache_dataset=cache, cached_stored_anchor=cache_anchor, **common_args
                 )
-                logger.info("Train dataset: phase=%s, size=%d", ph, len(base))
+                train_ds = self._limit_dataset(train_ds, self.train_sample_limit, "train")
+                self.train_dataset = train_ds
+                logger.info("Train dataset: phase=%s, size=%d", ph, len(self.train_dataset))
             
             logger.info(
                 "Train DataLoader: batch_size=%d, num_workers=%d, pin_memory=%s, prefetch_factor=%d, "
@@ -1134,10 +1161,12 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
             if self.cache_only_mode:
                 cache = self._make_cached_dataset(self.val_phase)
                 cache_anchor = cache.meta.get('stored_anchor') if hasattr(cache, 'meta') else None
-                self.val_dataset = _HandEncoderPreparedDataset(
+                val_ds = _HandEncoderPreparedDataset(
                     cache, cache_dataset=None, cached_stored_anchor=cache_anchor, **common_args
                 )
-                logger.info("Val dataset (cache-only): phase=%s, size=%d", self.val_phase, len(cache))
+                val_ds = self._limit_dataset(val_ds, self.val_sample_limit, "val")
+                self.val_dataset = val_ds
+                logger.info("Val dataset (cache-only): phase=%s, size=%d", self.val_phase, len(self.val_dataset))
             else:
                 base = self._make_base_dataset(self.val_phase)
                 cache = self._make_cached_dataset(self.val_phase) if self.use_cached_keypoints else None
@@ -1147,20 +1176,24 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
                         cache_anchor = cache.meta.get('stored_anchor')
                     except Exception:
                         cache_anchor = None
-                self.val_dataset = _HandEncoderPreparedDataset(
+                val_ds = _HandEncoderPreparedDataset(
                     base, cache_dataset=cache, cached_stored_anchor=cache_anchor, **common_args
                 )
-                logger.info("Val dataset: phase=%s, size=%d", self.val_phase, len(base))
+                val_ds = self._limit_dataset(val_ds, self.val_sample_limit, "val")
+                self.val_dataset = val_ds
+                logger.info("Val dataset: phase=%s, size=%d", self.val_phase, len(self.val_dataset))
 
         # Test
         if stage in (None, 'test') and self.test_phase and self.test_dataset is None:
             if self.cache_only_mode:
                 cache = self._make_cached_dataset(self.test_phase)
                 cache_anchor = cache.meta.get('stored_anchor') if hasattr(cache, 'meta') else None
-                self.test_dataset = _HandEncoderPreparedDataset(
+                test_ds = _HandEncoderPreparedDataset(
                     cache, cache_dataset=None, cached_stored_anchor=cache_anchor, **common_args
                 )
-                logger.info("Test dataset (cache-only): phase=%s, size=%d", self.test_phase, len(cache))
+                test_ds = self._limit_dataset(test_ds, self.test_sample_limit, "test")
+                self.test_dataset = test_ds
+                logger.info("Test dataset (cache-only): phase=%s, size=%d", self.test_phase, len(self.test_dataset))
             else:
                 base = self._make_base_dataset(self.test_phase)
                 cache = self._make_cached_dataset(self.test_phase) if self.use_cached_keypoints else None
@@ -1170,10 +1203,12 @@ class HandEncoderDataModule(L.LightningDataModule if L is not None else object):
                         cache_anchor = cache.meta.get('stored_anchor')
                     except Exception:
                         cache_anchor = None
-                self.test_dataset = _HandEncoderPreparedDataset(
+                test_ds = _HandEncoderPreparedDataset(
                     base, cache_dataset=cache, cached_stored_anchor=cache_anchor, **common_args
                 )
-                logger.info("Test dataset: phase=%s, size=%d", self.test_phase, len(base))
+                test_ds = self._limit_dataset(test_ds, self.test_sample_limit, "test")
+                self.test_dataset = test_ds
+                logger.info("Test dataset: phase=%s, size=%d", self.test_phase, len(self.test_dataset))
 
     def get_graph_constants(self) -> Dict[str, torch.Tensor]:
         if self._prepared_constants is None:

@@ -117,6 +117,17 @@ class ValidationSummaryCallback(Callback):
                 meta_parts.append(f"PredTarget: {pt}")
             if meta_parts:
                 console.print(f"[metric]Meta[/metric]: [value]{' | '.join(meta_parts)}[/value]")
+        
+        # Sampling frequency info (read directly from model)
+        sampling_parts = []
+        if hasattr(pl_module, "val_num_sample_batches"):
+            val_sample = pl_module.val_num_sample_batches
+            sampling_parts.append(f"ValReconSample: {val_sample if val_sample else 'all'}")
+        if hasattr(pl_module, "train_num_sample_batches_for_reg_loss"):
+            train_sample = pl_module.train_num_sample_batches_for_reg_loss
+            sampling_parts.append(f"TrainRegSample: {train_sample if train_sample else 'all'}")
+        if sampling_parts:
+            console.print(f"[metric]Sampling[/metric]: [value]{' | '.join(sampling_parts)}[/value]")
 
     def _collect_metrics(
         self, trainer: L.Trainer, pl_module: L.LightningModule

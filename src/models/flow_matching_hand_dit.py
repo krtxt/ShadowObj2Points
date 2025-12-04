@@ -124,13 +124,40 @@ class HandFlowMatchingDiT(L.LightningModule):
         )
         self._setup_loss(loss_cfg)
         self._setup_val_metrics(loss_cfg)
+        self._setup_sampling_frequency(loss_cfg, val_num_sample_batches)
         self.optimizer_cfg = optimizer_cfg
         self._val_step_losses: List[float] = []  # Store scalars, not tensors
-        # Validation sampling config: how many batches to sample for recon metrics
-        self.val_num_sample_batches: int = val_num_sample_batches
-        self._val_total_batches: int = 0  # Discovered during first validation epoch
-        self._val_sample_count: int = 0   # Counter for current epoch
         self._log_model_init_summary()
+    
+    def _setup_sampling_frequency(
+        self, 
+        loss_cfg: Optional[DictConfig], 
+        val_num_sample_batches_fallback: int = 10
+    ) -> None:
+        """Setup sampling frequency for expensive loss/metric computations.
+        
+        Reads from loss_cfg if available, otherwise uses fallback values.
+        """
+        # Validation: number of batches to sample for recon metrics
+        val_sample = None
+        if loss_cfg is not None:
+            val_sample = loss_cfg.get("val_num_sample_batches", None)
+        self.val_num_sample_batches: Optional[int] = (
+            int(val_sample) if val_sample not in (None, 0) else None
+        ) or val_num_sample_batches_fallback
+        self._val_total_batches: int = 0
+        self._val_sample_count: int = 0
+        
+        # Training: number of batches to sample for regression loss
+        train_sample = None
+        if loss_cfg is not None:
+            train_sample = loss_cfg.get("train_num_sample_batches_for_reg_loss", None)
+        # None or 0 means compute on ALL batches
+        self.train_num_sample_batches_for_reg_loss: Optional[int] = (
+            int(train_sample) if train_sample not in (None, 0) else None
+        )
+        self._train_total_batches: int = 0
+        self._train_reg_sample_count: int = 0
 
     def _validate_norm_bounds(self) -> None:
         """Ensure normalization bounds are available and correctly shaped."""
@@ -651,7 +678,9 @@ class HandFlowMatchingDiT(L.LightningModule):
             target, _, scene_pc = self._prepare_batch_data(batch, stage="train")
             batch_size = int(target.size(0))
 
-            loss, loss_dict = self._compute_step_loss(target, scene_pc)
+            loss, loss_dict = self._compute_step_loss(
+                target, scene_pc, batch_idx=batch_idx, is_training=True
+            )
 
             # Log BEFORE NaN check for debugging
             self.log(
@@ -791,30 +820,73 @@ class HandFlowMatchingDiT(L.LightningModule):
             
         return target, raw_target, scene_pc
 
+    def _should_compute_reg_loss(self, batch_idx: int, is_training: bool) -> bool:
+        """Determine if regression loss should be computed for this batch.
+        
+        Uses sampling frequency to skip expensive regression loss computation
+        on some batches during training.
+        """
+        if not is_training:
+            return True  # Always compute during validation
+        
+        num_sample = self.train_num_sample_batches_for_reg_loss
+        if num_sample is None:
+            return True  # No limit, compute on all batches
+        
+        # Track total batches for stride calculation
+        self._train_total_batches = max(self._train_total_batches, batch_idx + 1)
+        
+        if self._train_total_batches > 0:
+            stride = max(1, self._train_total_batches // num_sample)
+            should_sample = (batch_idx % stride == 0) and (self._train_reg_sample_count < num_sample)
+        else:
+            # First epoch: sample conservatively
+            stride = max(1, 50 // num_sample)  # Assume ~50 batches
+            should_sample = (batch_idx % stride == 0) and (self._train_reg_sample_count < num_sample)
+        
+        if should_sample:
+            self._train_reg_sample_count += 1
+        
+        return should_sample
+    
     def _compute_step_loss(
         self, 
         target: torch.Tensor, 
-        scene_pc: torch.Tensor
+        scene_pc: torch.Tensor,
+        batch_idx: int = 0,
+        is_training: bool = True,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Compute flow matching loss for a step.
+        
+        Args:
+            target: Target keypoints (B, N, 3)
+            scene_pc: Scene point cloud (B, P, 3 or 6)
+            batch_idx: Current batch index (for sampling frequency)
+            is_training: Whether this is a training step
         
         Returns:
             Tuple of (loss, loss_dict)
         """
         _, timesteps, noisy_sample, target_velocity = self._construct_flow_path(target)
         
-        # Use return_dict=True to get x_pred when prediction_target='x'
-        need_regression = self.lambda_regression > 0.0 and self.regression_loss_fn is not None
-        pred_result = self.predict_velocity(
-            noisy_sample, scene_pc, timesteps, 
-            return_dict=need_regression
+        # Check if we should compute regression loss (based on sampling frequency)
+        should_compute_reg = (
+            self.lambda_regression > 0.0 
+            and self.regression_loss_fn is not None
+            and self._should_compute_reg_loss(batch_idx, is_training)
         )
         
-        if need_regression:
+        # Use return_dict=True to get x_pred when prediction_target='x'
+        pred_result = self.predict_velocity(
+            noisy_sample, scene_pc, timesteps, 
+            return_dict=should_compute_reg
+        )
+        
+        if should_compute_reg:
             pred_velocity = pred_result["velocity"]
             x_pred = pred_result.get("x_pred")
         else:
-            pred_velocity = pred_result
+            pred_velocity = pred_result if not isinstance(pred_result, dict) else pred_result["velocity"]
             x_pred = None
         
         # Flow matching loss
@@ -822,12 +894,18 @@ class HandFlowMatchingDiT(L.LightningModule):
         loss = loss_dict["loss"]
         
         # Add regression loss if enabled and x_pred available
-        if need_regression and x_pred is not None:
+        if should_compute_reg and x_pred is not None:
+            # Provide denorm_fn for collision loss to work in world space
+            denorm_fn = self._denorm_xyz if self.use_norm_data else None
+            # Extract xyz only from scene_pc (may have normals in last 3 dims)
+            scene_pc_xyz = scene_pc[..., :3] if scene_pc is not None else None
             reg_loss, reg_components = self.regression_loss_fn(
                 pred_xyz=x_pred,
                 gt_xyz=target,
                 edge_rest_lengths=self.edge_rest_lengths,
                 active_edge_mask=getattr(self, "active_edge_mask", None),
+                scene_pc=scene_pc_xyz,
+                denorm_fn=denorm_fn,
             )
             loss = loss + self.lambda_regression * reg_loss
             loss_dict["loss_regression"] = reg_loss
@@ -931,6 +1009,10 @@ class HandFlowMatchingDiT(L.LightningModule):
             }
         )
 
+    def on_train_epoch_start(self) -> None:
+        """Reset training sample counter at the start of each epoch."""
+        self._train_reg_sample_count = 0
+    
     def on_validation_epoch_start(self) -> None:
         """Reset validation loss buffer at the start of each epoch."""
         self._val_step_losses = []
@@ -948,7 +1030,9 @@ class HandFlowMatchingDiT(L.LightningModule):
             target, raw_target, scene_pc = self._prepare_batch_data(batch, stage="val")
             batch_size = int(target.size(0))
 
-            loss, loss_dict = self._compute_step_loss(target, scene_pc)
+            loss, loss_dict = self._compute_step_loss(
+                target, scene_pc, batch_idx=batch_idx, is_training=False
+            )
             
             if not torch.isfinite(loss):
                 # Log detailed NaN info for debugging

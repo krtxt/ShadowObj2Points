@@ -308,23 +308,30 @@ class TangentRegularizationComponent(LossComponent):
 # =============================================================================
 
 class CollisionLossComponent(LossComponent):
-    """Penetration loss against scene geometry using capsule SDF."""
+    """Penetration loss against scene geometry using capsule SDF.
+    
+    Computes in scaled world space (default: centimeters) for numerical stability.
+    All distance parameters (margin, capsule_radius) should be in the same unit
+    as the scale (e.g., centimeters when scale=100).
+    """
     
     name = "collision"
     
     def __init__(
         self,
-        margin: float = 0.0,
-        capsule_radius: float = 0.008,
+        margin: float = 0.2,           # 2mm in centimeters
+        capsule_radius: float = 0.8,   # 8mm in centimeters
         capsule_circle_segments: int = 8,
         capsule_cap_segments: int = 2,
         max_scene_points: Optional[int] = None,
+        scale: float = 100.0,          # Convert meters to centimeters
     ):
         self.margin = margin
         self.capsule_radius = capsule_radius
         self.capsule_circle_segments = capsule_circle_segments
         self.capsule_cap_segments = capsule_cap_segments
         self.max_scene_points = max_scene_points
+        self.scale = scale
     
     @property
     def required_inputs(self) -> Set[str]:
@@ -346,16 +353,14 @@ class CollisionLossComponent(LossComponent):
         if scene_pc is None or scene_pc.shape[1] == 0:
             return torch.tensor(0.0, device=pred_xyz.device)
         
-        # Work in world space if denorm_fn provided
+        # Work in scaled world space (e.g., centimeters) for numerical stability
         pred_w = denorm_fn(pred_xyz) if denorm_fn is not None else pred_xyz
         scene_w = denorm_fn(scene_pc) if denorm_fn is not None else scene_pc
         
-        template_v, template_f = _get_capsule_template(
-            device=pred_w.device,
-            dtype=pred_w.dtype,
-            circle_segments=self.capsule_circle_segments,
-            cap_segments=self.capsule_cap_segments,
-        )
+        # Apply scale (default: meters -> centimeters)
+        if self.scale != 1.0:
+            pred_w = pred_w * self.scale
+            scene_w = scene_w * self.scale
         
         batch_size = pred_w.shape[0]
         i, j = edge_index
@@ -380,40 +385,108 @@ class CollisionLossComponent(LossComponent):
         else:
             sample_idx = None
         
-        losses = []
-        if active_edges is not None:
-            starts = pred_w[:, i[active_edges]]
-            ends = pred_w[:, j[active_edges]]
-            verts = _capsule_vertices_from_edges(
-                template_vertices=template_v,
-                starts=starts.reshape(-1, 3),
-                ends=ends.reshape(-1, 3),
-                radius=self.capsule_radius,
-                cap_scale=1.5,
-            ).reshape(batch_size, -1, template_v.shape[0], 3)
-            
-            num_edges = active_edges.numel()
-            faces = template_f.unsqueeze(0) + (
-                torch.arange(num_edges, device=pred_w.device).view(-1, 1, 1) * template_v.shape[0]
+        # Try fp16 first, fallback to fp32 if NaN
+        result = self._compute_collision_inner(
+            pred_w, scene_w, i, j, active_edges, sample_idx, batch_size, use_fp32=False
+        )
+        
+        # Fallback to fp32 if NaN
+        if not torch.isfinite(result):
+            result = self._compute_collision_inner(
+                pred_w, scene_w, i, j, active_edges, sample_idx, batch_size, use_fp32=True
             )
-            faces = faces.reshape(-1, 3)
+        
+        # Final guard: return 0 if still NaN
+        if not torch.isfinite(result):
+            return torch.tensor(0.0, device=pred_xyz.device)
+        return result
+    
+    def _compute_collision_inner(
+        self,
+        pred_w: torch.Tensor,
+        scene_w: torch.Tensor,
+        i: torch.Tensor,
+        j: torch.Tensor,
+        active_edges: torch.Tensor,
+        sample_idx: Optional[torch.Tensor],
+        batch_size: int,
+        use_fp32: bool = False,
+    ) -> torch.Tensor:
+        """Inner collision computation with optional fp32 mode.
+        
+        Uses batched computation when possible for better performance.
+        """
+        dtype = torch.float32 if use_fp32 else pred_w.dtype
+        
+        template_v, template_f = _get_capsule_template(
+            device=pred_w.device,
+            dtype=dtype,
+            circle_segments=self.capsule_circle_segments,
+            cap_segments=self.capsule_cap_segments,
+        )
+        
+        if active_edges is None or active_edges.numel() == 0:
+            return torch.tensor(float('nan'), device=pred_w.device)
+        
+        # Build capsule vertices for all batches at once
+        starts = pred_w[:, i[active_edges]].to(dtype)  # (B, E, 3)
+        ends = pred_w[:, j[active_edges]].to(dtype)    # (B, E, 3)
+        
+        num_edges = active_edges.numel()
+        num_verts_per_capsule = template_v.shape[0]
+        
+        # Flatten for _capsule_vertices_from_edges: (B*E, 3)
+        verts = _capsule_vertices_from_edges(
+            template_vertices=template_v,
+            starts=starts.reshape(-1, 3),
+            ends=ends.reshape(-1, 3),
+            radius=self.capsule_radius,
+            cap_scale=1.5,
+        )  # (B*E, V, 3)
+        
+        # Reshape to (B, E*V, 3) for per-batch processing
+        verts = verts.reshape(batch_size, num_edges * num_verts_per_capsule, 3)
+        
+        # Build faces once (same topology for all batches)
+        faces = template_f.unsqueeze(0) + (
+            torch.arange(num_edges, device=pred_w.device).view(-1, 1, 1) * num_verts_per_capsule
+        )
+        faces = faces.reshape(-1, 3)  # (E*F, 3)
+        
+        # Sample scene points uniformly across batch
+        if sample_idx is not None:
+            # Use pre-computed sample indices
+            scene_sampled = torch.gather(
+                scene_w.to(dtype), 1, 
+                sample_idx.unsqueeze(-1).expand(-1, -1, 3)
+            )  # (B, S, 3)
+        else:
+            scene_sampled = scene_w.to(dtype)  # (B, P, 3)
+        
+        # Compute per-batch (kaolin's unbatched kernel is actually fast, 
+        # the overhead was Python loop + repeated face_vertices indexing)
+        # Pre-compute face_vertices for each batch
+        losses = []
+        for b in range(batch_size):
+            scene_pts = scene_sampled[b]
+            if scene_pts.shape[0] == 0:
+                continue
             
-            for b in range(batch_size):
-                scene_pts = scene_w[b]
-                if sample_idx is not None:
-                    scene_pts = scene_pts[sample_idx[b]]
-                if scene_pts.shape[0] == 0:
-                    continue
-                
-                vertices = verts[b].reshape(-1, 3)
+            try:
+                vertices = verts[b]  # (E*V, 3)
                 face_vertices = index_vertices_by_faces(vertices, faces)
                 sdf, dist_sign, _, _ = compute_sdf(scene_pts, face_vertices)
-                signed_dist = sdf * dist_sign.sign().to(sdf.dtype)
+                signed_dist = sdf * dist_sign.sign().to(dtype)
                 penetration = torch.relu(self.margin - signed_dist)
-                losses.append(penetration.mean())
+                
+                if torch.isfinite(penetration).all():
+                    losses.append(penetration.mean())
+            except Exception:
+                continue
         
         if not losses:
-            return torch.tensor(0.0, device=pred_xyz.device)
+            return torch.tensor(float('nan'), device=pred_w.device)
+        
         return torch.stack(losses).mean()
 
 
@@ -504,12 +577,37 @@ class LossManager:
                 continue
             try:
                 value = component.compute(ctx)
+                
+                # NaN protection: retry with fp32 if needed
+                if not torch.isfinite(value):
+                    value = self._compute_with_fp32(component, ctx)
+                
+                # Skip if still NaN
+                if not torch.isfinite(value):
+                    logger.warning(f"Component '{name}' returned NaN, skipping")
+                    continue
+                
                 if return_weighted:
                     value = value * self.weights[name]
                 results[name] = value
             except Exception as e:
                 logger.warning(f"Failed to compute component '{name}': {e}")
         return results
+    
+    def _compute_with_fp32(self, component: LossComponent, ctx: Dict[str, Any]) -> torch.Tensor:
+        """Retry component computation with fp32 tensors."""
+        # Convert tensor inputs to fp32
+        ctx_fp32 = {}
+        for k, v in ctx.items():
+            if isinstance(v, torch.Tensor) and v.is_floating_point():
+                ctx_fp32[k] = v.float()
+            else:
+                ctx_fp32[k] = v
+        
+        try:
+            return component.compute(ctx_fp32)
+        except Exception:
+            return torch.tensor(float('nan'))
     
     def compute_total(self, ctx: Dict[str, Any]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Compute weighted total loss and individual components.
@@ -1179,12 +1277,13 @@ class DeterministicRegressionLoss(nn.Module):
                     if k not in ("enabled", "weight")
                 }
         
-        # Collision config
+        # Collision config (default: centimeter space with scale=100)
         collision_cfg = {
-            "margin": float(cfg.get("collision_margin", 0.0)),
-            "capsule_radius": float(cfg.get("collision_capsule_radius", 0.008)),
+            "margin": float(cfg.get("collision_margin", 0.2)),           # 2mm in cm
+            "capsule_radius": float(cfg.get("collision_capsule_radius", 0.8)),  # 8mm in cm
             "capsule_circle_segments": int(cfg.get("collision_capsule_circle_segments", 8)),
             "capsule_cap_segments": int(cfg.get("collision_capsule_cap_segments", 2)),
+            "scale": float(cfg.get("collision_scale", 100.0)),           # meters -> cm
         }
         max_pts = int(cfg.get("collision_max_scene_points", 0))
         if max_pts > 0:

@@ -6,6 +6,39 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+
+class TimestepEmbedding(nn.Module):
+    """Maps scalar timesteps t in [0,1] to embedding vectors (B, dim).
+    
+    Used for conditioning on time in diffusion/flow models,
+    or as a static context embedding in deterministic models.
+    
+    Args:
+        dim: Output embedding dimension
+        scale_factor: Hidden layer expansion factor (default: 4)
+    """
+    
+    def __init__(self, dim: int, scale_factor: int = 4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(1, dim * scale_factor),
+            nn.SiLU(),
+            nn.Linear(dim * scale_factor, dim),
+        )
+
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            timesteps: (B,) or (B, 1) timestep values
+            
+        Returns:
+            Timestep embeddings of shape (B, dim)
+        """
+        if timesteps.dim() == 1:
+            timesteps = timesteps.unsqueeze(-1)
+        return self.net(timesteps)
+
+
 class FourierPositionalEmbedding(nn.Module):
     """Fourier positional encoding for 3D coordinates.
     

@@ -122,10 +122,13 @@ class ValidationSummaryCallback(Callback):
         sampling_parts = []
         if hasattr(pl_module, "val_num_sample_batches"):
             val_sample = pl_module.val_num_sample_batches
-            sampling_parts.append(f"ValReconSample: {val_sample if val_sample else 'all'}")
+            sampling_parts.append(f"Recon: {val_sample if val_sample else 'all'}")
+        if hasattr(pl_module, "trajectory_num_sample_batches"):
+            traj_sample = pl_module.trajectory_num_sample_batches
+            sampling_parts.append(f"Traj: {traj_sample if traj_sample else 'all'}")
         if hasattr(pl_module, "train_num_sample_batches_for_reg_loss"):
             train_sample = pl_module.train_num_sample_batches_for_reg_loss
-            sampling_parts.append(f"TrainRegSample: {train_sample if train_sample else 'all'}")
+            sampling_parts.append(f"TrainReg: {train_sample if train_sample else 'all'}")
         if sampling_parts:
             console.print(f"[metric]Sampling[/metric]: [value]{' | '.join(sampling_parts)}[/value]")
 
@@ -175,14 +178,20 @@ class ValidationSummaryCallback(Callback):
                     if key not in val_detailed_loss:
                         val_detailed_loss[key] = v
 
-        # Flow metrics
+        # Flow metrics (including trajectory quality metrics)
         val_flow_metrics = {}
-        for key in ("val/flow_loss", "val/flow_loss_fm", "val/flow_loss_tangent",
-                    "val/flow_edge_len_err", "val/flow_total"):
+        for key in (
+            "val/flow_loss", "val/flow_loss_fm", "val/flow_loss_tangent",
+            "val/flow_edge_len_err", "val/flow_total",
+            # Trajectory quality metrics
+            "val/flow_plr",                  # Path Length Ratio (arc_length / euclidean)
+            "val/flow_transport_cost",       # Kinetic energy (integral of ||v||^2)
+            "val/flow_velocity_consistency", # Avg cosine similarity between adjacent v
+        ):
             if (v := get_metric(key)) is not None:
                 val_flow_metrics[key.split("/", 1)[-1]] = v
 
-        # Quality metrics
+        # Quality metrics (recon)
         val_quality_metrics = {}
         for key in (
             "val/recon_l1",
@@ -190,6 +199,7 @@ class ValidationSummaryCallback(Callback):
             "val/recon_direction",
             "val/recon_edge_len",  # actual logged name
             "val/recon_edge_len_err",  # backward compatibility if ever used
+            "val/recon_collision",  # collision with scene (cm space)
             "val/recon_total",
         ):
             if (v := get_metric(key)) is not None:

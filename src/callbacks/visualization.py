@@ -23,10 +23,17 @@ class HandVisCallback(ImageLogger):
         num_samples: int = 4,
         log_key: str = "val/hand_samples",
         sample_num_steps: Optional[int] = None,
+        save_to_logger: bool = False,
+        save_to_disk: bool = True,
+        output_dir: Optional[str] = None,
+        html_subdir: str = "val_visualizations",
     ) -> None:
         super().__init__(
             num_samples=num_samples,
             log_key=log_key,
             sample_steps=sample_num_steps,
+            save_to_logger=save_to_logger,
+            save_to_disk=save_to_disk,
+            output_dir=output_dir,
+            html_subdir=html_subdir,
         )
-

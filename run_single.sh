@@ -1,9 +1,10 @@
 #!/bin/bash
 
-export CUDA_VISIBLE_DEVICES=6
+export CUDA_VISIBLE_DEVICES=2
 
 
 python train.py \
+    experiments=profiler \
     model=flow_matching_hand_dit \
     model.prediction_target=x model.tau_min=1e-5 \
     model.train_time_schedule.name=logit_normal \
@@ -35,6 +36,6 @@ python train.py \
     loss.train_num_sample_batches_for_reg_loss=20 \
     loss.weights.loss_tangent=0.2 \
     datamodule.num_workers=16 \
-    datamodule.prefetch_factor=4 \
+    datamodule.prefetch_factor=2 \
     datamodule.persistent_workers=false 
 

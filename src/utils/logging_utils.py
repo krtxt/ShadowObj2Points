@@ -286,14 +286,14 @@ def log_validation_summary(epoch: int,
 
         quality_table = Table(
             show_header=True,
-            header_style="bold green",
+            header_style="bold #78833f",
             box=box.MINIMAL,
             pad_edge=True,
             expand=False,
-            border_style="green",
+            border_style="bold #78833f",
             title="Quality Metrics",
         )
-        quality_table.add_column("Metric", style="good", no_wrap=True)
+        quality_table.add_column("Metric", style="#78833f", no_wrap=True)
         quality_table.add_column("Value", style="value", justify="right")
 
         for k, v in val_quality_metrics.items():
@@ -309,14 +309,14 @@ def log_validation_summary(epoch: int,
 
         flow_table = Table(
             show_header=True,
-            header_style="bold blue",
+            header_style="bold #055D67",
             box=box.MINIMAL,
             pad_edge=True,
             expand=False,
-            border_style="blue",
+            border_style="bold #055D67",
             title="Flow Metrics",
         )
-        flow_table.add_column("Metric", style="metric", no_wrap=True)
+        flow_table.add_column("Metric", style="#055D67", no_wrap=True)
         flow_table.add_column("Value", style="value", justify="right")
 
         for k, v in val_flow_metrics.items():
@@ -332,14 +332,14 @@ def log_validation_summary(epoch: int,
 
         reg_table = Table(
             show_header=True,
-            header_style="bold yellow",
+            header_style="bold #FFAB91",
             box=box.MINIMAL,
             pad_edge=True,
             expand=False,
-            border_style="yellow",
+            border_style="bold #FFAB91",
             title="Regression Loss",
         )
-        reg_table.add_column("Component", style="warn", no_wrap=True)
+        reg_table.add_column("Component", style="#FFAB91", no_wrap=True)
         reg_table.add_column("Value", style="value", justify="right")
 
         for k, v in val_regression_metrics.items():

@@ -1,4 +1,5 @@
 # models/deterministic_hand_dit.py
+"""Deterministic Graph-aware DiT for direct hand pose regression."""
 
 import logging
 from copy import deepcopy
@@ -6,39 +7,18 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import lightning.pytorch as L
 from hydra.utils import instantiate as hydra_instantiate
 from omegaconf import DictConfig, OmegaConf
 
 from .components.hand_encoder import build_hand_encoder
 from .components.graph_dit import build_dit
+from .components.embeddings import TimestepEmbedding
 from .backbone import build_backbone
 from .components.graph_config import GraphConfig
 from .components.losses import HandValidationMetricManager, DeterministicRegressionLoss
 
 logger = logging.getLogger(__name__)
-
-
-class TimestepEmbedding(nn.Module):
-    """
-    Project scalar inputs to a vector space.
-    Used here as a static context embedding rather than dynamic time.
-    """
-    def __init__(self, dim: int, scale_factor: int = 4):
-        super().__init__()
-        hidden_dim = dim * scale_factor
-        self.net = nn.Sequential(
-            nn.Linear(1, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Support both (B,) and (B, 1)
-        if x.dim() == 1:
-            x = x.unsqueeze(-1)
-        return self.net(x)
 
 
 class HandDeterministicDiT(L.LightningModule):

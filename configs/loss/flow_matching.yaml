@@ -103,7 +103,7 @@ collision_capsule_cap_segments: 3
 
 # Training: Number of batches per epoch to compute regression loss (reg_*)
 # Useful when collision loss is expensive. null = compute on all batches.
-train_num_sample_batches_for_reg_loss: null
+train_num_sample_batches_for_reg_loss: 25
 
 # Validation: Number of batches per epoch to compute recon metrics
 # These require full sampling which is expensive. null = compute on all batches.
@@ -123,6 +123,19 @@ val_metrics:
       loss_fm: 1.0
       loss_tangent: 0.0
       edge_len_err: 0.0
+    
+    # Trajectory quality metrics (computed during sampling)
+    # These measure how well the model learns rectified/straight flows
+    # Note: Adds one extra forward pass per sampling step when enabled
+    trajectory_metrics: true   # Master switch for trajectory metrics
+    trajectory_num_sample_batches: 10  # How many batches per epoch (null = same as val_num_sample_batches)
+    trajectory:
+      plr:                     # Path Length Ratio (arc_length / euclidean_distance)
+        enabled: true          # PLR ~= 1.0 means straight trajectory
+      transport_cost:          # Kinetic energy (integral of ||v||^2 dt)
+        enabled: true          # Lower = more efficient transport
+      velocity_consistency:    # Avg cosine similarity between adjacent velocities
+        enabled: true          # Higher = more consistent velocity direction
   
   # Reconstruction quality metrics (world space)
   # Computed from: self.sample(scene_pc) vs raw_target (both in world space)
@@ -145,3 +158,13 @@ val_metrics:
       enabled: true
       weight: 1.0
       eps: 1.0e-6
+    # Collision metric: penetration between predicted hand and scene
+    # Computed in CENTIMETER space (same as reg_collision)
+    collision:
+      enabled: true
+      scale: 100.0              # meters -> centimeters
+      margin: 0.2               # Minimum clearance distance (cm) = 2mm
+      capsule_radius: 0.8       # Finger capsule radius (cm) = 8mm
+      max_scene_points: 2048    # Max scene points for collision check
+      capsule_circle_segments: 8
+      capsule_cap_segments: 2

@@ -21,6 +21,8 @@ export TORCH_NCCL_BLOCKING_WAIT=0
 # NCCL_BLOCKING_WAIT=1   0,1,2,3,
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# export CUDA_VISIBLE_DEVICES=4,5,6,7
+
 
 # # 运行训练
 # python train.py \
@@ -105,8 +107,8 @@ python train.py \
     model=flow_matching_hand_dit \
     model.prediction_target=x model.tau_min=1e-5 \
     model.train_time_schedule.name=logit_normal \
-    model.train_time_schedule.params.mu=-0.8 \
-    model.train_time_schedule.params.sigma=1.6 \
+    +model.train_time_schedule.params.mu=-0.8 \
+    +model.train_time_schedule.params.sigma=1.6 \
     model.train_time_schedule.params.t_min=1e-4 \
     model.train_time_schedule.params.t_max=0.9999 \
     model.sample_schedule=linear \
@@ -114,7 +116,7 @@ python train.py \
     datamodule=handencoder_dm_dex \
     datamodule.use_scene_normals=true \
     experiments=multi_gpu \
-    optimizer.lr=2e-4 \
+    optimizer.lr=1.5e-4 \
     compile=true \
     experiment_name=exp_1204_fm_direct_free_pred_x \
     dit.qk_norm=true \
@@ -125,11 +127,12 @@ python train.py \
     batch_size=720 \
     trainer.precision=bf16-mixed \
     velocity_strategy=direct_free \
-    loss.lambda_tangent=0.0 \
-    loss.regression.weights.collision=0.5 \
-    loss.weights.loss_tangent=0.0 \
+    loss.lambda_tangent=0.2 \
+    loss.lambda_regression=0.01 \
+    loss.regression.weights.collision=1.0 \
+    loss.weights.loss_tangent=0.2 \
     datamodule.num_workers=16 \
-    datamodule.prefetch_factor=4 \
+    datamodule.prefetch_factor=6 \
     datamodule.persistent_workers=false 
 
 

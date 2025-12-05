@@ -49,21 +49,28 @@ rich_progress_bar:
   #   metrics: "bold #FFA500"
   theme:
     _target_: lightning.pytorch.callbacks.progress.rich_progress.RichProgressBarTheme
-    description: "bold italic #AEC6CF"
-    progress_bar: "#D3D3D3"
-    progress_bar_finished: "#B0C4DE"
-    progress_bar_pulse: "#F0F8FF"
-    batch_progress: "bold #FFFFFF"
-    time: "#228B22"
-    processing_speed: "#4682B4"
-    metrics: "bold #F4A460"
+    description: "bold italic #4C8DF6"
+    progress_bar: "#2f519f"
+    progress_bar_finished: "#153e79"
+    progress_bar_pulse: "#61aede"
+    batch_progress: "bold #88c6eb"
+    time: "#124999"
+    processing_speed: "#3499ce"
+    metrics: "bold #c9e7f2"
 
 # Image Logger
 # image_logger:
 #   _target_: callbacks.image_logger.ImageLogger
-#   num_samples: 4
+#   num_samples: 5
 #   log_key: "val/hand_samples"
+#   sample_steps: null
+#   save_to_logger: false
+#   save_to_disk: true
+#   output_dir: ${paths.output_dir}
+#   html_subdir: "val_visualizations"
+#   scene_pc_max_points: 2048
 image_logger: null
+
 
 # Device Stats Monitor (GPU/CPU usage)
 device_stats_monitor: null

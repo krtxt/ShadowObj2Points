@@ -215,6 +215,8 @@ class ValidationSummaryCallback(Callback):
             "val/reg_edge_len",
             "val/reg_bone",
             "val/reg_collision",
+            "val/reg_fingertip_contact",
+            "val/reg_active_points_repulsion",
         ):
             if (v := get_metric(key)) is not None:
                 val_regression_metrics[key.split("/", 1)[-1]] = v

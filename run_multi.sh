@@ -1,5 +1,4 @@
 #!/bin/bash
-# run_training.sh
 # export HYDRA_FULL_ERROR=1
 # export NCCL_DEBUG=INFO
 # export TORCH_DISTRIBUTED_DEBUG=DETAIL 
@@ -20,8 +19,9 @@ export TORCH_NCCL_BLOCKING_WAIT=0
 # NCCL_P2P_DISABLE=1
 # NCCL_BLOCKING_WAIT=1   0,1,2,3,
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=1,2,3,4
 
 
 # # 运行训练
@@ -112,13 +112,14 @@ python train.py \
     model.train_time_schedule.params.t_min=1e-4 \
     model.train_time_schedule.params.t_max=0.9999 \
     model.sample_schedule=linear \
+    loss=flow_matching_curriculum \
     backbone=ptv3_sparse_fourier \
     datamodule=handencoder_dm_dex \
     datamodule.use_scene_normals=true \
     experiments=multi_gpu \
-    optimizer.lr=1.5e-4 \
+    optimizer.lr=2e-4 \
     compile=true \
-    experiment_name=exp_1204_fm_direct_free_pred_x \
+    experiment_name=exp_1205_full_fm_direct_free_pred_x \
     dit.qk_norm=true \
     dit.qk_norm_type='rms' \
     dit.norm_type='rms' \
@@ -127,12 +128,8 @@ python train.py \
     batch_size=720 \
     trainer.precision=bf16-mixed \
     velocity_strategy=direct_free \
-    loss.lambda_tangent=0.2 \
-    loss.lambda_regression=0.01 \
-    loss.regression.weights.collision=1.0 \
-    loss.weights.loss_tangent=0.2 \
     datamodule.num_workers=16 \
-    datamodule.prefetch_factor=6 \
+    datamodule.prefetch_factor=1 \
     datamodule.persistent_workers=false 
 
 

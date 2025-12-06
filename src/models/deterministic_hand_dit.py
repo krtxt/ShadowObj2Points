@@ -207,6 +207,11 @@ class HandDeterministicDiT(L.LightningModule):
         """Map [-1, 1] back to world coordinates."""
         if not self.use_norm_data:
             return norm_xyz
+        # Handle 6D input (xyz + normals): only denorm xyz, keep normals unchanged
+        if norm_xyz.shape[-1] == 6:
+            xyz_part = norm_xyz[..., :3]
+            normals_part = norm_xyz[..., 3:]
+            return torch.cat([self._denorm_xyz(xyz_part), normals_part], dim=-1)
         # Formula: (x + 1) / 2 * (max - min) + min
         unscaled = (torch.clamp(norm_xyz, -1.0, 1.0) + 1.0) * 0.5
         range_width = torch.clamp(self.norm_max - self.norm_min, min=1e-6)
@@ -425,14 +430,13 @@ class HandDeterministicDiT(L.LightningModule):
 
         pred = self.predict_hand_xyz(scene)
         denorm_fn = self._denorm_xyz if self.use_norm_data else None
-        # Loss manager expects xyz only (3D), truncate if scene has normals (6D)
-        scene_xyz = scene[..., :3] if scene.size(-1) > 3 else scene
+        # Pass full scene (with normals if available) for contact/repulsion losses
         loss, components = self.loss_manager(
             pred_xyz=pred,
             gt_xyz=target,
             edge_rest_lengths=self.edge_rest_lengths,
             active_edge_mask=getattr(self, "active_edge_mask", None),
-            scene_pc=scene_xyz,
+            scene_pc=scene,
             denorm_fn=denorm_fn,
             epoch=self.current_epoch,
         )
@@ -477,14 +481,13 @@ class HandDeterministicDiT(L.LightningModule):
 
         pred = self.predict_hand_xyz(scene)
         denorm_fn = self._denorm_xyz if self.use_norm_data else None
-        # Loss manager expects xyz only (3D), truncate if scene has normals (6D)
-        scene_xyz = scene[..., :3] if scene.size(-1) > 3 else scene
+        # Pass full scene (with normals if available) for contact/repulsion losses
         loss, components = self.loss_manager(
             pred_xyz=pred,
             gt_xyz=target,
             edge_rest_lengths=self.edge_rest_lengths,
             active_edge_mask=getattr(self, "active_edge_mask", None),
-            scene_pc=scene_xyz,
+            scene_pc=scene,
             denorm_fn=denorm_fn,
             epoch=self.current_epoch,
         )

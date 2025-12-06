@@ -1,6 +1,6 @@
 #!/bin/bash
 
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=3
 
 
 python train.py \
@@ -13,6 +13,7 @@ python train.py \
     model.train_time_schedule.params.t_min=1e-4 \
     model.train_time_schedule.params.t_max=0.9999 \
     model.sample_schedule=linear \
+    loss=flow_matching_curriculum \
     backbone=ptv3_sparse_fourier \
     datamodule=handencoder_dm_dex \
     datamodule.use_scene_normals=true \
@@ -20,14 +21,14 @@ python train.py \
     datamodule.val_sample_limit=10800 \
     datamodule.test_sample_limit=10800 \
     optimizer.lr=1e-4 \
-    compile=true \
+    compile=false \
     experiment_name=debug_1204_fm_direct_free_pred_x \
     dit.qk_norm=true \
     dit.qk_norm_type='rms' \
     dit.norm_type='rms' \
     dit.activation_fn=swiglu \
     dit.hand_scene_bias.enabled=true \
-    batch_size=360 \
+    batch_size=64 \
     trainer.precision=bf16-mixed \
     velocity_strategy=direct_free \
     loss.lambda_tangent=0.2 \

@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Union
 logger = logging.getLogger(__name__)
 
 
-# Default weights when curriculum is disabled.
+# Default weights for deterministic regression when curriculum is disabled.
 # These keys correspond to registered LossComponent names in LOSS_COMPONENT_REGISTRY.
 # Components with weight=0 are not computed by LossManager (saves compute).
 DEFAULT_WEIGHTS = {
@@ -22,6 +22,27 @@ DEFAULT_WEIGHTS = {
     "edge_len": 1.0,     # Edge length consistency for skeleton proportions
     "bone": 0.0,         # Bone length regularization vs template (weight=0 skips computation)
     "collision": 0.25,   # Penetration penalty against scene geometry
+    "fingertip_contact": 0.0,      # Fingertip-to-surface contact distance constraint
+    "active_points_repulsion": 0.0,  # Repulsion loss for non-fingertip points
+}
+
+# Default weights for flow matching loss when curriculum is disabled.
+# Includes flow-specific terms (loss_fm, loss_tangent) and regression terms.
+FM_DEFAULT_WEIGHTS = {
+    # Flow matching core losses
+    "loss_fm": 1.0,          # MSE between predicted and target velocity
+    "loss_tangent": 1.0,     # Tangent regularization for rigid body constraint
+    # Overall regression weight multiplier
+    "lambda_regression": 0.0,  # Disabled by default
+    # Regression component weights (used when lambda_regression > 0)
+    "l1": 2.0,
+    "chamfer": 1.0,
+    "direction": 0.0,
+    "edge_len": 0.0,
+    "bone": 0.0,
+    "collision": 0.5,
+    "fingertip_contact": 0.0,
+    "active_points_repulsion": 0.0,
 }
 
 LEGACY_WEIGHT_ALIASES = {
@@ -43,6 +64,8 @@ DEFAULT_STAGES = [
             "edge_len": 0.5,
             "bone": 0.0,
             "collision": 0.0,
+            "fingertip_contact": 0.0,
+            "active_points_repulsion": 0.0,
         },
     },
     {
@@ -55,6 +78,8 @@ DEFAULT_STAGES = [
             "edge_len": 1.0,
             "bone": 0.5,
             "collision": 0.0,
+            "fingertip_contact": 0.0,
+            "active_points_repulsion": 0.0,
         },
     },
     {
@@ -67,6 +92,8 @@ DEFAULT_STAGES = [
             "edge_len": 1.0,
             "bone": 1.0,
             "collision": 0.25,
+            "fingertip_contact": 0.0,
+            "active_points_repulsion": 0.0,
         },
     },
 ]
@@ -83,6 +110,13 @@ class LossScheduler:
     - edge_len: Relative edge length error. Maintains skeleton proportions.
     - bone: Bone length deviation from template. Structural regularization.
     - collision: Penetration depth penalty. Prevents hand-object intersection.
+    - fingertip_contact: Constrains fingertip-to-surface distance within a range.
+    - active_points_repulsion: Repulsion for non-fingertip points to avoid penetration.
+
+    Flow Matching Additional Terms:
+    - loss_fm: MSE between predicted and target velocity.
+    - loss_tangent: Tangent regularization for rigid body constraint.
+    - lambda_regression: Overall multiplier for regression loss components.
 
     Training Strategy:
     1. Reconstruction phase: Learn approximate positions with l1 + chamfer.
@@ -96,6 +130,7 @@ class LossScheduler:
         stages: Optional[List[Dict]] = None,
         warmup_epochs: int = 5,
         default_weights: Optional[Dict[str, float]] = None,
+        mode: str = "deterministic",
     ):
         """
         Args:
@@ -103,10 +138,19 @@ class LossScheduler:
             stages: List of stage configs, each with 'name', 'epochs', 'weights'.
             warmup_epochs: Number of epochs for smooth transition between stages.
             default_weights: Weights to use when curriculum is disabled.
+            mode: "deterministic" or "flow_matching" - determines default weight keys.
         """
         self.enabled = enabled
         self.warmup_epochs = max(0, warmup_epochs)
-        self.default_weights = self._normalize_weight_keys(default_weights or DEFAULT_WEIGHTS.copy())
+        self.mode = mode
+        
+        # Select base weights based on mode
+        if mode == "flow_matching":
+            base_weights = FM_DEFAULT_WEIGHTS.copy()
+        else:
+            base_weights = DEFAULT_WEIGHTS.copy()
+        
+        self.default_weights = self._normalize_weight_keys(default_weights or base_weights, mode=mode)
 
         if enabled and stages:
             self.stages = self._validate_stages(stages)
@@ -117,24 +161,28 @@ class LossScheduler:
         self._current_stage_name = None
         self._logged_stage = None
 
-    def _normalize_weight_keys(self, weights: Dict[str, float]) -> Dict[str, float]:
+    def _normalize_weight_keys(self, weights: Dict[str, float], mode: Optional[str] = None) -> Dict[str, float]:
         """Normalize legacy weight keys to current names."""
+        mode = mode or self.mode
+        valid_keys = FM_DEFAULT_WEIGHTS if mode == "flow_matching" else DEFAULT_WEIGHTS
+        
         normalized: Dict[str, float] = {}
         for k, v in weights.items():
             key = LEGACY_WEIGHT_ALIASES.get(k, k)
-            if key in DEFAULT_WEIGHTS:
+            if key in valid_keys:
                 normalized[key] = float(v)
             else:
-                logger.warning(f"Unknown loss key '{k}', ignored.")
+                logger.warning(f"Unknown loss key '{k}' for mode '{mode}', ignored.")
         # Ensure all default keys exist
-        for k, v in DEFAULT_WEIGHTS.items():
+        for k, v in valid_keys.items():
             normalized.setdefault(k, float(v))
         return normalized
 
     def _validate_stages(self, stages: List[Dict]) -> List[Dict]:
         """Validate and normalize stage configurations."""
         validated = []
-        all_keys = set(DEFAULT_WEIGHTS.keys())
+        base_weights = FM_DEFAULT_WEIGHTS if self.mode == "flow_matching" else DEFAULT_WEIGHTS
+        all_keys = set(base_weights.keys())
 
         for i, stage in enumerate(stages):
             name = stage.get("name", f"stage_{i}")
@@ -142,7 +190,7 @@ class LossScheduler:
             weights = self._normalize_weight_keys(stage.get("weights", {}))
 
             # Ensure all weight keys are present
-            full_weights = DEFAULT_WEIGHTS.copy()
+            full_weights = base_weights.copy()
             for k, v in weights.items():
                 if k in all_keys:
                     full_weights[k] = float(v)

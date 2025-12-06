@@ -13,16 +13,18 @@
 #
 # LOSS COMPUTATION SPACES:
 # ------------------------
-# | Component      | Space      | Notes                                      |
-# |----------------|------------|---------------------------------------------|
-# | loss_fm        | Normalized | Flow matching MSE on velocity              |
-# | loss_tangent   | Normalized | Tangent regularization                     |
-# | reg_l1         | Normalized | Position MAE, consistent with flow loss    |
-# | reg_chamfer    | Normalized | Chamfer distance                           |
-# | reg_direction  | Normalized | Cosine similarity (scale-invariant)        |
-# | reg_edge_len   | Normalized | Uses normalized edge_rest_lengths          |
-# | reg_bone       | Normalized | Uses normalized template_xyz               |
-# | reg_collision  | Centimeter | Via denorm_fn * scale (default: cm)        |
+# | Component                   | Space       | Notes                                        |
+# |-----------------------------|-------------|-----------------------------------------------|
+# | loss_fm                     | Normalized  | Flow matching MSE on velocity                 |
+# | loss_tangent                | Normalized  | Tangent regularization                        |
+# | reg_l1                      | Normalized  | Position MAE, consistent with flow loss       |
+# | reg_chamfer                 | Normalized  | Chamfer distance                              |
+# | reg_direction               | Normalized  | Cosine similarity (scale-invariant)           |
+# | reg_edge_len                | Normalized  | Uses normalized edge_rest_lengths             |
+# | reg_bone                    | Normalized  | Uses normalized template_xyz                  |
+# | reg_collision               | Centimeter  | Via denorm_fn * scale (default: cm)           |
+# | reg_fingertip_contact       | Centimeter  | Needs scene normals; signed distance on tips  |
+# | reg_active_points_repulsion | Centimeter  | Needs scene normals; pushes non-fingertip pts |
 #
 # VALIDATION METRICS SPACES:
 # --------------------------
@@ -53,7 +55,8 @@ lambda_tangent: 1.0
 # =============================================================================
 # When lambda_regression > 0, adds DeterministicRegressionLoss on x_pred vs gt_xyz.
 # Requires prediction_target="x" in model config.
-# All regression components except collision are computed in normalized space.
+# Regression components in world/cm space: collision, fingertip_contact, active_points_repulsion.
+# Others remain in normalized space.
 lambda_regression: 0.0
 
 # Regression loss component configuration
@@ -81,19 +84,42 @@ regression:
     edge_len: 0.0     # Edge length consistency - normalized space
     bone: 0.0         # Bone length vs template - normalized space (disabled)
     collision: 0.5    # Penetration penalty - WORLD space via denorm_fn (disabled)
+    fingertip_contact: 0.0       # Fingertip-to-surface contact distance - WORLD space
+    active_points_repulsion: 0.0 # Repulsion for non-fingertip points - WORLD space
 
 # =============================================================================
 # Collision Loss Hyperparameters
 # =============================================================================
 # Used when regression.weights.collision > 0
+# Uses analytical point-to-capsule distance (no mesh SDF).
 # Computed in CENTIMETER space (denorm * scale) for numerical stability.
 # All distance parameters should be in centimeters.
 collision_scale: 100.0            # Scale factor: meters -> centimeters
-collision_margin: 0.2             # Minimum clearance distance (cm) = 2mm
+collision_margin: 0.1             # Minimum clearance distance (cm) = 2mm
 collision_capsule_radius: 0.8     # Finger capsule radius (cm) = 8mm
 collision_max_scene_points: 2048  # Max scene points for collision check
-collision_capsule_circle_segments: 8
-collision_capsule_cap_segments: 3
+collision_chunk_size: 4096        # Points per chunk for memory efficiency
+
+# =============================================================================
+# Fingertip Contact Loss Hyperparameters
+# =============================================================================
+# Used when regression.weights.fingertip_contact > 0
+# Constrains fingertip-to-surface distance within [min_dist, max_dist] range.
+# Uses surface normals to compute signed distance.
+# Computed in CENTIMETER space for numerical stability.
+fingertip_contact_scale: 100.0    # Scale factor: meters -> centimeters
+fingertip_contact_min_dist: 0.6   # Min allowed distance (cm) - closer triggers penalty
+fingertip_contact_max_dist: 1.0   # Max allowed distance (cm) - farther triggers penalty
+
+# =============================================================================
+# Active Points Repulsion Loss Hyperparameters
+# =============================================================================
+# Used when regression.weights.active_points_repulsion > 0
+# Repulsion loss for non-fingertip active hand points.
+# Only penalizes points too close to or penetrating the object.
+# Computed in CENTIMETER space for numerical stability.
+active_points_repulsion_scale: 100.0    # Scale factor: meters -> centimeters
+active_points_repulsion_min_dist: 0.6   # Min allowed distance (cm) - closer triggers penalty
 
 # =============================================================================
 # Sampling Frequency Configuration
@@ -103,7 +129,7 @@ collision_capsule_cap_segments: 3
 
 # Training: Number of batches per epoch to compute regression loss (reg_*)
 # Useful when collision loss is expensive. null = compute on all batches.
-train_num_sample_batches_for_reg_loss: 25
+train_num_sample_batches_for_reg_loss: 50
 
 # Validation: Number of batches per epoch to compute recon metrics
 # These require full sampling which is expensive. null = compute on all batches.
@@ -159,6 +185,7 @@ val_metrics:
       weight: 1.0
       eps: 1.0e-6
     # Collision metric: penetration between predicted hand and scene
+    # Uses analytical point-to-capsule distance (no mesh SDF)
     # Computed in CENTIMETER space (same as reg_collision)
     collision:
       enabled: true
@@ -166,5 +193,4 @@ val_metrics:
       margin: 0.2               # Minimum clearance distance (cm) = 2mm
       capsule_radius: 0.8       # Finger capsule radius (cm) = 8mm
       max_scene_points: 2048    # Max scene points for collision check
-      capsule_circle_segments: 8
-      capsule_cap_segments: 2
+      chunk_size: 4096          # Points per chunk for memory efficiency

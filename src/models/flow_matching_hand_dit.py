@@ -253,7 +253,11 @@ class HandFlowMatchingDiT(L.LightningModule):
         )
     
     def _setup_loss(self, loss_cfg: Optional[DictConfig]) -> None:
-        """Setup loss function from configuration."""
+        """Setup loss function from configuration.
+        
+        Note: Curriculum learning is only supported with the default FlowMatchingLoss.
+        Custom loss classes specified via _target_ will not receive curriculum config.
+        """
         from .components.losses import DeterministicRegressionLoss
         
         if loss_cfg is None:
@@ -261,6 +265,7 @@ class HandFlowMatchingDiT(L.LightningModule):
             self.lambda_tangent = 1.0
             self.regression_loss_fn = None
             self.lambda_regression = 0.0
+            self._curriculum_enabled = False
             return
         
         cfg_dict = OmegaConf.to_container(loss_cfg, resolve=True) if isinstance(loss_cfg, DictConfig) else deepcopy(loss_cfg)
@@ -268,9 +273,18 @@ class HandFlowMatchingDiT(L.LightningModule):
         # Remove validation-only config
         cfg_dict.pop("val_metrics", None)
         
-        # Extract regression loss config
+        # Extract curriculum config for unified scheduling
+        curriculum_cfg = cfg_dict.pop("curriculum", None)
+        self._curriculum_enabled = curriculum_cfg.get("enabled", False) if curriculum_cfg else False
+        
+        # Extract regression loss config (preserve for later merge)
         regression_cfg = cfg_dict.pop("regression", None)
         self.lambda_regression = float(cfg_dict.pop("lambda_regression", 0.0))
+        
+        # Inject top-level lambda_regression into curriculum stages if missing
+        # This prevents silent regression disabling when curriculum is enabled
+        if self._curriculum_enabled and curriculum_cfg:
+            curriculum_cfg = self._inject_lambda_regression_defaults(curriculum_cfg, self.lambda_regression)
         
         # Extract flow matching weights
         flow_weights = cfg_dict.pop("weights", None)
@@ -279,6 +293,14 @@ class HandFlowMatchingDiT(L.LightningModule):
         target = cfg_dict.pop("_target_", None)
         
         if target:
+            # Warn that curriculum is not supported with custom loss classes
+            if self._curriculum_enabled:
+                logging.getLogger(__name__).warning(
+                    "Curriculum learning is not supported with custom _target_ loss classes. "
+                    "Curriculum will be disabled for the flow matching loss. "
+                    "Use the default FlowMatchingLoss to enable curriculum scheduling."
+                )
+                self._curriculum_enabled = False
             hydra_cfg = OmegaConf.create({"_target_": target, **cfg_dict})
             self.loss_fn = hydra_instantiate(hydra_cfg, edge_index=self.edge_index)
         else:
@@ -287,23 +309,47 @@ class HandFlowMatchingDiT(L.LightningModule):
                 lambda_tangent=lambda_tangent,
                 loss_clamp=loss_clamp,
                 weights=flow_weights,
+                curriculum_config=curriculum_cfg,
             )
         
         self.lambda_tangent = float(getattr(self.loss_fn, "lambda_tangent", lambda_tangent))
         
-        # Setup regression loss if enabled
+        # Setup regression loss if enabled (or if curriculum will enable it)
         self.regression_loss_fn = None
-        if self.lambda_regression > 0.0:
+        should_setup_regression = self.lambda_regression > 0.0 or self._curriculum_enabled
+        
+        if should_setup_regression:
             if self.prediction_target != "x":
                 logging.getLogger(__name__).warning(
-                    f"lambda_regression={self.lambda_regression} requires prediction_target='x'. Disabling."
+                    f"lambda_regression={self.lambda_regression} or curriculum requires prediction_target='x'. Disabling regression."
                 )
-                self.lambda_regression = 0.0
+                if not self._curriculum_enabled:
+                    self.lambda_regression = 0.0
             else:
                 reg_cfg = dict(regression_cfg or {})
+                # Merge curriculum config: prefer regression-specific curriculum if provided
+                if curriculum_cfg:
+                    existing_reg_curriculum = reg_cfg.get("curriculum")
+                    if existing_reg_curriculum and existing_reg_curriculum.get("enabled", False):
+                        # Keep regression-specific curriculum, just log info
+                        logging.getLogger(__name__).info(
+                            "Using regression-specific curriculum config instead of top-level curriculum."
+                        )
+                    else:
+                        # Use top-level curriculum for regression
+                        reg_cfg["curriculum"] = curriculum_cfg
+                # Copy collision hyperparameters (only those actually used by CollisionLossComponent)
                 for key in ["collision_margin", "collision_max_scene_points", 
-                            "collision_capsule_radius", "collision_capsule_circle_segments",
-                            "collision_capsule_cap_segments"]:
+                            "collision_capsule_radius", "collision_scale", "collision_chunk_size"]:
+                    if key in cfg_dict:
+                        reg_cfg[key] = cfg_dict[key]
+                # Copy fingertip contact hyperparameters
+                for key in ["fingertip_contact_min_dist", "fingertip_contact_max_dist", 
+                            "fingertip_contact_scale"]:
+                    if key in cfg_dict:
+                        reg_cfg[key] = cfg_dict[key]
+                # Copy active points repulsion hyperparameters
+                for key in ["active_points_repulsion_min_dist", "active_points_repulsion_scale"]:
                     if key in cfg_dict:
                         reg_cfg[key] = cfg_dict[key]
                 self.regression_loss_fn = DeterministicRegressionLoss(
@@ -311,6 +357,33 @@ class HandFlowMatchingDiT(L.LightningModule):
                     config=reg_cfg,
                     fixed_point_indices=getattr(self, "fixed_point_indices", None),
                 )
+    
+    def _inject_lambda_regression_defaults(self, curriculum_cfg: Dict, top_level_lambda: float) -> Dict:
+        """Inject top-level lambda_regression into curriculum stages that don't specify it.
+        
+        This prevents silent regression disabling when users enable curriculum but forget
+        to specify lambda_regression in each stage.
+        """
+        if not curriculum_cfg or "stages" not in curriculum_cfg:
+            return curriculum_cfg
+        
+        modified = deepcopy(curriculum_cfg)
+        warned = False
+        
+        for stage in modified.get("stages", []):
+            weights = stage.get("weights", {})
+            if "lambda_regression" not in weights:
+                if top_level_lambda > 0.0 and not warned:
+                    logging.getLogger(__name__).warning(
+                        f"Curriculum stage '{stage.get('name', 'unnamed')}' missing lambda_regression. "
+                        f"Defaulting to top-level value: {top_level_lambda}. "
+                        f"Consider explicitly specifying lambda_regression in each stage."
+                    )
+                    warned = True
+                weights["lambda_regression"] = top_level_lambda
+                stage["weights"] = weights
+        
+        return modified
     
     def _setup_val_metrics(self, loss_cfg: Optional[DictConfig]) -> None:
         """Setup validation metric manager."""
@@ -542,8 +615,77 @@ class HandFlowMatchingDiT(L.LightningModule):
                     self.log(f"train/{k}", v.detach(), prog_bar=False, on_step=False, on_epoch=True, batch_size=batch_size, sync_dist=True)
     
     def on_train_epoch_start(self) -> None:
-        """Reset training sample counter."""
+        """Reset training sample counter and update curriculum weights."""
         self._train_reg_sample_mgr.reset()
+        
+        # Update curriculum schedulers with current epoch
+        epoch = self.current_epoch
+        
+        if hasattr(self.loss_fn, "set_epoch"):
+            self.loss_fn.set_epoch(epoch)
+        
+        if self.regression_loss_fn is not None and hasattr(self.regression_loss_fn, "set_epoch"):
+            self.regression_loss_fn.set_epoch(epoch)
+        
+        # Log current weights if curriculum is enabled
+        if getattr(self, "_curriculum_enabled", False):
+            weights = self._get_curriculum_weights()
+            for name, weight in weights.items():
+                self.log(f"loss_weight/{name}", weight, on_step=False, on_epoch=True, sync_dist=True)
+            
+            # Store curriculum stage in run_info for ValidationSummaryCallback
+            stage_name = self._get_curriculum_stage_name()
+            if stage_name:
+                if not hasattr(self, "run_info"):
+                    self.run_info = {}
+                self.run_info["curriculum"] = {"stage": stage_name, "epoch": epoch}
+    
+    def _get_curriculum_weights(self) -> Dict[str, float]:
+        """Get combined curriculum weights from all loss components."""
+        weights = {}
+        
+        # Flow matching weights
+        if hasattr(self.loss_fn, "get_current_weights"):
+            fm_weights = self.loss_fn.get_current_weights()
+            for k in ("loss_fm", "loss_tangent"):
+                if k in fm_weights:
+                    weights[k] = fm_weights[k]
+            # Get lambda_regression from FM weights if available
+            if "lambda_regression" in fm_weights:
+                weights["lambda_regression"] = fm_weights["lambda_regression"]
+        
+        # Regression component weights
+        if self.regression_loss_fn is not None and hasattr(self.regression_loss_fn, "get_current_weights"):
+            reg_weights = self.regression_loss_fn.get_current_weights()
+            for k in ("l1", "chamfer", "direction", "edge_len", "bone", "collision", 
+                      "fingertip_contact", "active_points_repulsion"):
+                if k in reg_weights:
+                    weights[f"reg_{k}"] = reg_weights[k]
+        
+        return weights
+    
+    def _get_curriculum_stage_name(self) -> Optional[str]:
+        """Get current curriculum stage name."""
+        if hasattr(self.loss_fn, "scheduler"):
+            return self.loss_fn.scheduler.get_current_stage_name()
+        return None
+    
+    def _sync_curriculum_epoch(self) -> None:
+        """Sync curriculum schedulers to current epoch.
+        
+        Called from validation hooks to ensure correct weights when running
+        validation-only (without training) on checkpoints.
+        """
+        if not getattr(self, "_curriculum_enabled", False):
+            return
+        
+        epoch = self.current_epoch
+        
+        if hasattr(self.loss_fn, "set_epoch"):
+            self.loss_fn.set_epoch(epoch)
+        
+        if self.regression_loss_fn is not None and hasattr(self.regression_loss_fn, "set_epoch"):
+            self.regression_loss_fn.set_epoch(epoch)
 
     # =========================================================================
     # Validation Methods
@@ -596,10 +738,18 @@ class HandFlowMatchingDiT(L.LightningModule):
                     self.log(f"val/{k}", v, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch_size)
     
     def on_validation_epoch_start(self) -> None:
-        """Reset validation counters."""
+        """Reset validation counters and sync curriculum epoch.
+        
+        Note: This ensures curriculum weights are correct when running validation-only
+        (e.g., trainer.validate on a checkpoint) without a preceding training epoch.
+        """
         self._val_step_losses = []
         self._val_sample_mgr.reset()
         self._traj_sample_mgr.reset()
+        
+        # Sync curriculum epoch for validation-only runs
+        # This ensures correct weights when validating checkpoints mid-training
+        self._sync_curriculum_epoch()
     
     def _compute_val_metrics(
         self, loss_dict: Dict[str, torch.Tensor], flow_edge_len_err: torch.Tensor,
@@ -623,16 +773,26 @@ class HandFlowMatchingDiT(L.LightningModule):
         
         if should_sample_recon or should_sample_traj:
             with torch.no_grad():
-                # Sample with trajectory metrics only when needed
-                pred_xyz, traj_stats = self.sample(
-                    scene_pc, 
-                    compute_trajectory_metrics=should_sample_traj
-                )
+                traj_stats = None
+                if should_sample_traj:
+                    pred_xyz, traj_stats = self.sample(
+                        scene_pc,
+                        compute_trajectory_metrics=True,
+                    )
+                else:
+                    pred_xyz = self.sample(scene_pc, compute_trajectory_metrics=False)
                 
                 # Recon metrics (including collision if enabled)
                 if should_sample_recon:
+                    # sample() already returns denormalized pred_xyz when use_norm_data is True,
+                    # so denormalize scene_pc here to keep all recon metrics in original space.
+                    scene_pc_for_metrics = (
+                        self._denorm_xyz(scene_pc)
+                        if self.use_norm_data and scene_pc is not None
+                        else scene_pc
+                    )
                     recon_metrics = self.val_metric_manager.compute_recon_metrics(
-                        pred_xyz=pred_xyz, gt_xyz=raw_target, scene_pc=scene_pc
+                        pred_xyz=pred_xyz, gt_xyz=raw_target, scene_pc=scene_pc_for_metrics
                     )
                     for name, value in recon_metrics.items():
                         self.log(f"val/recon_{name}", value, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch_size)
@@ -683,9 +843,12 @@ class HandFlowMatchingDiT(L.LightningModule):
         """Compute flow matching loss for a step."""
         _, timesteps, noisy_sample, target_velocity = self._construct_flow_path(target)
         
+        # Get current lambda_regression (may be adjusted by curriculum)
+        current_lambda_reg = self._get_current_lambda_regression()
+        
         # Check if we should compute regression loss
         should_compute_reg = (
-            self.lambda_regression > 0.0 
+            current_lambda_reg > 0.0 
             and self.regression_loss_fn is not None
             and (not is_training or self._train_reg_sample_mgr.should_sample(batch_idx))
         )
@@ -707,19 +870,32 @@ class HandFlowMatchingDiT(L.LightningModule):
         # Add regression loss
         if should_compute_reg and x_pred is not None:
             denorm_fn = self._denorm_xyz if self.use_norm_data else None
-            scene_pc_xyz = scene_pc[..., :3] if scene_pc is not None else None
+            # Pass full scene_pc (with normals if available) for contact/repulsion losses
             reg_loss, reg_components = self.regression_loss_fn(
                 pred_xyz=x_pred, gt_xyz=target, edge_rest_lengths=self.edge_rest_lengths,
                 active_edge_mask=getattr(self, "active_edge_mask", None),
-                scene_pc=scene_pc_xyz, denorm_fn=denorm_fn,
+                scene_pc=scene_pc, denorm_fn=denorm_fn,
             )
-            loss = loss + self.lambda_regression * reg_loss
+            loss = loss + current_lambda_reg * reg_loss
             loss_dict["loss_regression"] = reg_loss
             for k, v in reg_components.items():
                 loss_dict[f"reg_{k}"] = v
         
         loss_dict["loss"] = loss
         return loss, loss_dict
+    
+    def _get_current_lambda_regression(self) -> float:
+        """Get current lambda_regression, possibly adjusted by curriculum."""
+        if not getattr(self, "_curriculum_enabled", False):
+            return self.lambda_regression
+        
+        # Try to get from flow matching loss scheduler
+        if hasattr(self.loss_fn, "get_current_weights"):
+            weights = self.loss_fn.get_current_weights()
+            if "lambda_regression" in weights:
+                return float(weights["lambda_regression"])
+        
+        return self.lambda_regression
 
     # =========================================================================
     # Sampling Methods

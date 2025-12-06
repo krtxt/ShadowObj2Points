@@ -199,6 +199,7 @@ def log_validation_summary(epoch: int,
     # console.print("") 
     # console.print("")  # blank line
     console.rule(f"[header]🚩 Epoch {epoch} - Validation Results[/header]", style="cyan")
+    # console.print("")
 
     # --- Main Metrics Table ---
     main_table = Table(
@@ -259,7 +260,7 @@ def log_validation_summary(epoch: int,
 
     # --- Set-level Metrics ---
     if isinstance(val_set_metrics, dict) and len(val_set_metrics) > 0:
-        console.print("")  # blank line
+        # console.print("")  # blank line
         console.print("[metric]📊 Set Metrics[/metric]")
 
         set_metrics_table = Table(
@@ -281,7 +282,7 @@ def log_validation_summary(epoch: int,
 
     # --- Quality / Reconstruction Metrics ---
     if isinstance(val_quality_metrics, dict) and len(val_quality_metrics) > 0:
-        console.print("")  # blank line
+        # console.print("")  # blank line
         console.print("[metric]⛲ Quality Metrics[/metric]")
 
         quality_table = Table(
@@ -304,7 +305,7 @@ def log_validation_summary(epoch: int,
 
     # --- Flow Matching Metrics ---
     if isinstance(val_flow_metrics, dict) and len(val_flow_metrics) > 0:
-        console.print("")  # blank line
+        # console.print("")  # blank line
         console.print("[metric]🫗 Flow Matching Metrics[/metric]")
 
         flow_table = Table(
@@ -327,7 +328,7 @@ def log_validation_summary(epoch: int,
 
     # --- Regression Loss Metrics ---
     if isinstance(val_regression_metrics, dict) and len(val_regression_metrics) > 0:
-        console.print("")  # blank line
+        # console.print("")  # blank line
         console.print("[metric]📐 Regression Loss Components[/metric]")
 
         reg_table = Table(
@@ -350,7 +351,7 @@ def log_validation_summary(epoch: int,
 
     # --- Diversity Metrics ---
     if isinstance(val_diversity_metrics, dict) and len(val_diversity_metrics) > 0:
-        console.print("")  # blank line
+        # console.print("")  # blank line
         console.print("[metric]🎲 Diversity Metrics[/metric]")
 
         diversity_table = Table(

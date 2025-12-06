@@ -22,7 +22,7 @@ from kaolin.metrics.trianglemesh import (
     CUSTOM_index_vertices_by_faces as index_vertices_by_faces,
 )
 
-from .loss_scheduler import LossScheduler, DEFAULT_WEIGHTS, LEGACY_WEIGHT_ALIASES
+from .loss_scheduler import LossScheduler, DEFAULT_WEIGHTS, FM_DEFAULT_WEIGHTS, LEGACY_WEIGHT_ALIASES
 
 # Optional: PyTorch3D for Chamfer distance
 try:
@@ -245,14 +245,23 @@ class L1LossComponent(LossComponent):
     def compute(self, ctx: Dict[str, Any]) -> torch.Tensor:
         pred_xyz, gt_xyz = ctx["pred_xyz"], ctx["gt_xyz"]
         fixed_point_mask = ctx.get("fixed_point_mask")
+        device, dtype = pred_xyz.device, pred_xyz.dtype
         
-        if fixed_point_mask is not None and fixed_point_mask.any():
-            keep_mask = ~fixed_point_mask.to(pred_xyz.device)
-            pred_xyz, gt_xyz = pred_xyz[:, keep_mask, :], gt_xyz[:, keep_mask, :]
+        # Build per-point validity mask (supports global 1D or per-batch 2D masks)
+        if fixed_point_mask is not None:
+            mask = fixed_point_mask.to(device)
+            if mask.dim() == 1:
+                valid_mask = (~mask).view(1, -1).expand(pred_xyz.shape[0], -1)
+            else:
+                valid_mask = ~mask
+        else:
+            valid_mask = torch.ones(pred_xyz.shape[:2], device=device, dtype=torch.bool)
         
-        if pred_xyz.numel() == 0:
-            return torch.tensor(0.0, device=ctx["pred_xyz"].device)
-        return F.l1_loss(pred_xyz, gt_xyz)
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=device, dtype=dtype)
+        
+        diff = (pred_xyz - gt_xyz).abs()
+        return diff[valid_mask].mean()
 
 
 class ChamferLossComponent(LossComponent):
@@ -281,9 +290,14 @@ class ChamferLossComponent(LossComponent):
         if pred_xyz.numel() == 0:
             return torch.tensor(0.0, device=ctx["pred_xyz"].device)
         if not _PYTORCH3D_AVAILABLE:
-            return torch.tensor(float("nan"), device=ctx["pred_xyz"].device)
+            raise ImportError("pytorch3d is required for ChamferLossComponent but is not installed")
 
-        val, _ = chamfer_distance(pred_xyz.float(), gt_xyz.float(), point_reduction="mean", batch_reduction="mean")
+        val, _ = chamfer_distance(
+            pred_xyz.float(),
+            gt_xyz.float(),
+            point_reduction="mean",
+            batch_reduction="mean",
+        )
         return val
 
 
@@ -303,9 +317,17 @@ class DirectionLossComponent(LossComponent):
     def compute(self, ctx: Dict[str, Any]) -> torch.Tensor:
         pred_xyz, gt_xyz = ctx["pred_xyz"], ctx["gt_xyz"]
         edge_index = ctx["edge_index"].to(pred_xyz.device)
+        active_edge_mask = ctx.get("active_edge_mask")
         
-        v_gt = F.normalize(gt_xyz[:, edge_index[1]] - gt_xyz[:, edge_index[0]] + self.eps, dim=-1)
-        v_pd = F.normalize(pred_xyz[:, edge_index[1]] - pred_xyz[:, edge_index[0]] + self.eps, dim=-1)
+        if active_edge_mask is not None:
+            mask = active_edge_mask.to(pred_xyz.device)
+            if mask.dim() == 1:
+                edge_index = edge_index[:, mask]
+        if edge_index.numel() == 0:
+            return torch.tensor(0.0, device=pred_xyz.device, dtype=pred_xyz.dtype)
+        
+        v_gt = F.normalize(gt_xyz[:, edge_index[1]] - gt_xyz[:, edge_index[0]], dim=-1, eps=self.eps)
+        v_pd = F.normalize(pred_xyz[:, edge_index[1]] - pred_xyz[:, edge_index[0]], dim=-1, eps=self.eps)
         
         if self.mode == "l2":
             return (v_pd - v_gt).norm(p=2, dim=-1).mean()
@@ -328,10 +350,20 @@ class EdgeLenLossComponent(LossComponent):
     def compute(self, ctx: Dict[str, Any]) -> torch.Tensor:
         pred_xyz, gt_xyz = ctx["pred_xyz"], ctx["gt_xyz"]
         edge_index = ctx["edge_index"].to(pred_xyz.device)
+        active_edge_mask = ctx.get("active_edge_mask")
         
-        len_gt = (gt_xyz[:, edge_index[0]] - gt_xyz[:, edge_index[1]]).norm(dim=-1)
-        len_pd = (pred_xyz[:, edge_index[0]] - pred_xyz[:, edge_index[1]]).norm(dim=-1)
-        return ((len_pd - len_gt).abs() / (len_gt + self.eps)).mean()
+        i, j = edge_index
+        if active_edge_mask is not None:
+            mask = active_edge_mask.to(pred_xyz.device)
+            if mask.dim() == 1:
+                i, j = i[mask], j[mask]
+        if i.numel() == 0:
+            return torch.tensor(0.0, device=pred_xyz.device, dtype=pred_xyz.dtype)
+        
+        len_gt = (gt_xyz[:, i] - gt_xyz[:, j]).norm(dim=-1)
+        len_pd = (pred_xyz[:, i] - pred_xyz[:, j]).norm(dim=-1)
+        denom = len_gt.clamp_min(self.eps)
+        return ((len_pd - len_gt).abs() / denom).mean()
 
 
 class BoneLossComponent(LossComponent):
@@ -352,13 +384,20 @@ class BoneLossComponent(LossComponent):
         if edge_rest_lengths is None:
             return torch.tensor(0.0, device=pred_xyz.device)
         
+        edge_rest_lengths = edge_rest_lengths.to(device=pred_xyz.device, dtype=pred_xyz.dtype)
         i, j = edge_index
-        lengths = torch.linalg.norm(pred_xyz[:, i] - pred_xyz[:, j], dim=-1)
-        target = edge_rest_lengths.view(1, -1).to(pred_xyz.device)
-        
-        rel_err = (lengths - target) / (target + 1e-6)
         if active_edge_mask is not None:
-            rel_err = rel_err[:, active_edge_mask.to(pred_xyz.device)]
+            mask = active_edge_mask.to(pred_xyz.device)
+            if mask.dim() == 1:
+                i, j = i[mask], j[mask]
+                edge_rest_lengths = edge_rest_lengths[mask]
+        if i.numel() == 0:
+            return torch.tensor(0.0, device=pred_xyz.device, dtype=pred_xyz.dtype)
+        
+        lengths = torch.linalg.norm(pred_xyz[:, i] - pred_xyz[:, j], dim=-1)
+        target = edge_rest_lengths.view(1, -1)
+        
+        rel_err = (lengths - target) / target.clamp_min(1e-6)
         return rel_err.pow(2).mean()
 
 
@@ -398,6 +437,14 @@ class TangentRegularizationComponent(LossComponent):
     def compute(self, ctx: Dict[str, Any]) -> torch.Tensor:
         v_hat, y_tau = ctx["v_hat"], ctx["y_tau"]
         edge_index = ctx["edge_index"].to(v_hat.device)
+        active_edge_mask = ctx.get("active_edge_mask")
+        
+        if active_edge_mask is not None:
+            mask = active_edge_mask.to(v_hat.device)
+            if mask.dim() == 1:
+                edge_index = edge_index[:, mask]
+        if edge_index.numel() == 0:
+            return torch.tensor(0.0, device=v_hat.device, dtype=v_hat.dtype)
         
         i, j = edge_index
         diff_y = y_tau[:, i] - y_tau[:, j]
@@ -412,7 +459,19 @@ class TangentRegularizationComponent(LossComponent):
 # =============================================================================
 
 class CollisionLossComponent(LossComponent):
-    """Penetration loss against scene geometry using capsule SDF.
+    """Penetration loss using analytical point-to-capsule distance.
+    
+    Capsule geometry: line segment + hemispherical caps at both ends.
+    This is equivalent to: all points within distance `radius` from the line segment.
+    
+    Distance to capsule surface = distance to line segment - radius
+      - Negative: point is inside the capsule (penetration)
+      - Positive: point is outside the capsule
+    
+    This method is:
+      - Mathematically exact (no mesh topology issues)
+      - Fully vectorized and GPU-accelerated
+      - Supports batched computation
     
     Computes in scaled world space (default: centimeters) for numerical stability.
     """
@@ -423,123 +482,531 @@ class CollisionLossComponent(LossComponent):
         self,
         margin: float = 0.2,
         capsule_radius: float = 0.8,
-        capsule_circle_segments: int = 8,
-        capsule_cap_segments: int = 2,
         max_scene_points: Optional[int] = None,
         scale: float = 100.0,
+        chunk_size: int = 4096,
     ):
+        """
+        Args:
+            margin: penetration margin in scaled units (cm by default)
+            capsule_radius: capsule radius in scaled units (cm by default)
+            max_scene_points: if set, randomly sample this many scene points
+            scale: coordinate scale factor (100 = meters to cm)
+            chunk_size: max points per chunk for memory efficiency
+        """
         self.margin = margin
         self.capsule_radius = capsule_radius
-        self.capsule_circle_segments = capsule_circle_segments
-        self.capsule_cap_segments = capsule_cap_segments
         self.max_scene_points = max_scene_points
         self.scale = scale
+        self.chunk_size = chunk_size
     
     @property
     def required_inputs(self) -> Set[str]:
         return {"pred_xyz", "edge_index", "scene_pc"}
     
     def is_available(self, ctx: Dict[str, Any]) -> bool:
-        if not super().is_available(ctx):
-            return False
-        scene_pc = ctx.get("scene_pc")
-        return scene_pc is not None and scene_pc.numel() > 0 and scene_pc.shape[1] > 0
+        return super().is_available(ctx)
     
     def compute(self, ctx: Dict[str, Any]) -> torch.Tensor:
         pred_xyz, scene_pc = ctx["pred_xyz"], ctx["scene_pc"]
         edge_index = ctx["edge_index"].to(pred_xyz.device)
         denorm_fn = ctx.get("denorm_fn")
         active_edge_mask = ctx.get("active_edge_mask")
-        
-        if scene_pc is None or scene_pc.shape[1] == 0:
-            return torch.tensor(0.0, device=pred_xyz.device)
-        
-        # Transform to world space and scale
+
+        if scene_pc is None or scene_pc.numel() == 0 or scene_pc.shape[1] == 0:
+            raise ValueError("scene_pc is required for collision loss and must be non-empty")
+
+        if scene_pc.shape[-1] < 3:
+            raise ValueError(
+                f"scene_pc must have at least 3 channels (xyz), got shape {scene_pc.shape}"
+            )
+
+        # Transform to world space and scale to cm
         pred_w = denorm_fn(pred_xyz) if denorm_fn else pred_xyz
-        scene_w = denorm_fn(scene_pc) if denorm_fn else scene_pc
+        scene_xyz = scene_pc[..., :3]
+        scene_w = denorm_fn(scene_xyz) if denorm_fn else scene_xyz
         if self.scale != 1.0:
-            pred_w, scene_w = pred_w * self.scale, scene_w * self.scale
+            pred_w = pred_w * self.scale
+            scene_w = scene_w * self.scale
+
+        # Only use xyz coordinates
+        scene_w = scene_w[..., :3]
         
         batch_size = pred_w.shape[0]
         i, j = edge_index
         
-        # Handle edge mask
+        # Filter to active edges only
         if active_edge_mask is not None:
             mask = active_edge_mask.to(pred_w.device)
-            active_edges = torch.nonzero(mask, as_tuple=False).squeeze(-1) if mask.dim() == 1 else None
-        else:
-            active_edges = torch.arange(i.numel(), device=pred_w.device)
+            if mask.dim() == 1:
+                active_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                if active_idx.numel() == 0:
+                    return torch.tensor(0.0, device=pred_xyz.device)
+                i, j = i[active_idx], j[active_idx]
         
-        if active_edges is not None and active_edges.numel() == 0:
-            return torch.tensor(0.0, device=pred_xyz.device)
-        
-        # Sample scene points
+        # Sample scene points if needed
         num_scene_pts = scene_w.shape[1]
-        sample_idx = None
         if self.max_scene_points and num_scene_pts > self.max_scene_points:
-            sample_idx = torch.randint(0, num_scene_pts, (batch_size, self.max_scene_points), device=pred_w.device)
+            # Deterministic even-spacing subset (keeps ordering stable across calls)
+            stride = max(num_scene_pts // self.max_scene_points, 1)
+            sample_idx = torch.arange(0, num_scene_pts, stride, device=pred_w.device)[: self.max_scene_points]
+            scene_w = scene_w[:, sample_idx, :]
         
-        # Compute collision (with fp32 fallback)
-        result = self._compute_inner(pred_w, scene_w, i, j, active_edges, sample_idx, batch_size, use_fp32=False)
+        # Compute collision using analytical method
+        result = self._compute_analytical(pred_w, scene_w, i, j)
+        
+        # Fallback to fp32 if result is not finite
         if not torch.isfinite(result):
-            result = self._compute_inner(pred_w, scene_w, i, j, active_edges, sample_idx, batch_size, use_fp32=True)
+            result = self._compute_analytical(
+                pred_w.float(), scene_w.float(), i, j
+            )
+        
         return result if torch.isfinite(result) else torch.tensor(0.0, device=pred_xyz.device)
     
-    def _compute_inner(
-        self, pred_w: torch.Tensor, scene_w: torch.Tensor,
-        i: torch.Tensor, j: torch.Tensor, active_edges: torch.Tensor,
-        sample_idx: Optional[torch.Tensor], batch_size: int, use_fp32: bool = False,
+    def _compute_analytical(
+        self,
+        pred_w: torch.Tensor,
+        scene_w: torch.Tensor,
+        i: torch.Tensor,
+        j: torch.Tensor,
     ) -> torch.Tensor:
-        dtype = torch.float32 if use_fp32 else pred_w.dtype
-        template_v, template_f = _get_capsule_template(
-            pred_w.device, dtype, self.capsule_circle_segments, self.capsule_cap_segments
-        )
+        """Compute collision loss using analytical point-to-capsule distance.
         
-        if active_edges is None or active_edges.numel() == 0:
-            return torch.tensor(float('nan'), device=pred_w.device)
+        Args:
+            pred_w: (B, N, 3) hand keypoints in scaled space
+            scene_w: (B, P, 3) scene points in scaled space
+            i, j: (E,) edge endpoint indices
         
-        # Build capsule vertices
-        starts = pred_w[:, i[active_edges]].to(dtype)
-        ends = pred_w[:, j[active_edges]].to(dtype)
-        num_edges = active_edges.numel()
-        num_verts_per_capsule = template_v.shape[0]
+        Returns:
+            Scalar loss (mean penetration across batch)
+        """
+        B, P, _ = scene_w.shape
+        E = i.numel()
         
-        verts = _capsule_vertices_from_edges(
-            template_v, starts.reshape(-1, 3), ends.reshape(-1, 3), self.capsule_radius, cap_scale=1.5
-        ).reshape(batch_size, num_edges * num_verts_per_capsule, 3)
+        if E == 0 or P == 0:
+            return torch.tensor(0.0, device=pred_w.device, dtype=pred_w.dtype)
         
-        # Build faces
-        faces = template_f.unsqueeze(0) + (
-            torch.arange(num_edges, device=pred_w.device).view(-1, 1, 1) * num_verts_per_capsule
-        )
-        faces = faces.reshape(-1, 3)
+        # Get segment endpoints: (B, E, 3)
+        seg_start = pred_w[:, i, :]
+        seg_end = pred_w[:, j, :]
         
-        # Sample scene points
-        if sample_idx is not None:
-            scene_sampled = torch.gather(scene_w.to(dtype), 1, sample_idx.unsqueeze(-1).expand(-1, -1, 3))
+        # Compute point-to-segment distances
+        # For memory efficiency, process in chunks if P is large
+        if P * E > self.chunk_size * 64:
+            return self._compute_chunked(scene_w, seg_start, seg_end)
+        
+        # Full vectorized computation: (B, P, E)
+        signed_dist = self._point_to_capsule_distance(scene_w, seg_start, seg_end)
+        
+        # Penetration loss
+        penetration = torch.relu(self.margin - signed_dist)
+        return penetration.mean()
+    
+    def _point_to_capsule_distance(
+        self,
+        points: torch.Tensor,
+        seg_start: torch.Tensor,
+        seg_end: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute signed distance from points to capsules (vectorized).
+        
+        Args:
+            points: (B, P, 3) query points
+            seg_start: (B, E, 3) segment start points
+            seg_end: (B, E, 3) segment end points
+        
+        Returns:
+            signed_dist: (B, P) signed distance to nearest capsule surface
+                        Negative = inside (penetration), Positive = outside
+        """
+        # Expand for broadcasting: points (B, P, 1, 3), segments (B, 1, E, 3)
+        p = points[:, :, None, :]       # (B, P, 1, 3)
+        a = seg_start[:, None, :, :]    # (B, 1, E, 3)
+        b = seg_end[:, None, :, :]      # (B, 1, E, 3)
+        
+        ab = b - a                       # (B, 1, E, 3)
+        ap = p - a                       # (B, P, E, 3)
+        
+        # Project point onto line: t = dot(ap, ab) / dot(ab, ab)
+        ab_sq = (ab * ab).sum(dim=-1, keepdim=True).clamp(min=1e-8)  # (B, 1, E, 1)
+        t = (ap * ab).sum(dim=-1, keepdim=True) / ab_sq              # (B, P, E, 1)
+        
+        # Clamp t to [0, 1] to get closest point on segment
+        # This handles the hemispherical caps automatically:
+        #   t < 0 -> closest point is segment start (hemisphere)
+        #   t > 1 -> closest point is segment end (hemisphere)
+        #   0 <= t <= 1 -> closest point is on the cylinder
+        t = t.clamp(0, 1)
+        
+        # Closest point on segment
+        closest = a + t * ab             # (B, P, E, 3)
+        
+        # Distance to segment axis
+        dist_to_axis = (p - closest).norm(dim=-1)  # (B, P, E)
+        
+        # Distance to capsule surface = dist to axis - radius
+        dist_to_capsule = dist_to_axis - self.capsule_radius  # (B, P, E)
+        
+        # Take minimum across all capsules (nearest capsule for each point)
+        signed_dist, _ = dist_to_capsule.min(dim=-1)  # (B, P)
+        
+        return signed_dist
+    
+    def _compute_chunked(
+        self,
+        scene_w: torch.Tensor,
+        seg_start: torch.Tensor,
+        seg_end: torch.Tensor,
+    ) -> torch.Tensor:
+        """Memory-efficient chunked computation for large point clouds."""
+        B, P, _ = scene_w.shape
+        device = scene_w.device
+        dtype = scene_w.dtype
+        
+        total_pen = torch.zeros(B, device=device, dtype=dtype)
+        
+        for start in range(0, P, self.chunk_size):
+            end = min(start + self.chunk_size, P)
+            chunk = scene_w[:, start:end, :]
+            
+            signed_dist = self._point_to_capsule_distance(chunk, seg_start, seg_end)
+            pen = torch.relu(self.margin - signed_dist)
+            total_pen += pen.sum(dim=-1)
+        
+        return total_pen.mean() / P
+
+
+# =============================================================================
+# Section 5b: Fingertip Contact Loss Component
+# =============================================================================
+
+class FingertipContactLossComponent(LossComponent):
+    """Fingertip contact loss constraining fingertip-to-surface distance.
+    
+    For each fingertip point:
+    1. Find the nearest point on object point cloud
+    2. Use surface normal to determine signed distance (inside/outside)
+    3. Penalize if signed distance is outside [min_dist, max_dist] range
+    
+    Signed distance convention (projection onto surface normal):
+        - Positive: fingertip is outside the object surface
+        - Negative: fingertip penetrates the object (inside)
+        - Zero: fingertip is exactly on the surface plane
+    
+    Note: scene_pc normals are assumed to be in world space and point outward.
+    If denorm_fn applies rotation, normals should be pre-transformed accordingly.
+    
+    Computes in centimeter space for numerical stability.
+    """
+    
+    name = "fingertip_contact"
+    
+    # Fingertip indices: Thumb, Index, Middle, Ring, Pinky
+    FINGERTIP_INDICES = [22, 9, 12, 15, 19]
+    FINGERTIP_NAMES = ["thumb", "index", "middle", "ring", "pinky"]
+    MIN_REQUIRED_POINTS = max(FINGERTIP_INDICES) + 1  # 23
+    
+    def __init__(
+        self,
+        min_dist: float = 0.6,
+        max_dist: float = 1.0,
+        fingertip_thresholds: Optional[Dict[str, Tuple[float, float]]] = None,
+        scale: float = 100.0,
+        loss_type: str = "huber",
+        fingertip_indices: Optional[List[int]] = None,
+    ):
+        """
+        Args:
+            min_dist: minimum allowed distance in cm (closer triggers penalty)
+            max_dist: maximum allowed distance in cm (farther triggers penalty)
+            fingertip_thresholds: per-finger (min, max) thresholds, e.g. {"thumb": (0.5, 1.2)}
+            scale: coordinate scale factor (100 = meters to cm)
+            loss_type: "huber" for smooth penalty, "l2" for squared penalty
+            fingertip_indices: custom fingertip indices (overrides default)
+        """
+        self.default_min_dist = min_dist
+        self.default_max_dist = max_dist
+        self.scale = scale
+        self.loss_type = loss_type
+        
+        # Allow custom fingertip indices
+        if fingertip_indices is not None:
+            self.fingertip_indices = fingertip_indices
+            self.min_required_points = max(fingertip_indices) + 1
         else:
-            scene_sampled = scene_w.to(dtype)
+            self.fingertip_indices = self.FINGERTIP_INDICES
+            self.min_required_points = self.MIN_REQUIRED_POINTS
         
-        # Per-batch SDF computation
-        losses = []
-        for b in range(batch_size):
-            scene_pts = scene_sampled[b]
-            if scene_pts.shape[0] == 0:
-                continue
-            try:
-                vertices = verts[b]
-                face_vertices = index_vertices_by_faces(vertices, faces)
-                sdf, dist_sign, _, _ = compute_sdf(scene_pts, face_vertices)
-                signed_dist = sdf * dist_sign.sign().to(dtype)
-                penetration = torch.relu(self.margin - signed_dist)
-                if torch.isfinite(penetration).all():
-                    losses.append(penetration.mean())
-            except Exception:
-                continue
+        # Per-finger threshold configuration
+        self.fingertip_thresholds: Dict[str, Tuple[float, float]] = {}
+        for i, name in enumerate(self.FINGERTIP_NAMES):
+            if fingertip_thresholds and name in fingertip_thresholds:
+                self.fingertip_thresholds[name] = fingertip_thresholds[name]
+            else:
+                self.fingertip_thresholds[name] = (min_dist, max_dist)
+    
+    @property
+    def required_inputs(self) -> Set[str]:
+        return {"pred_xyz", "scene_pc"}
+    
+    def is_available(self, ctx: Dict[str, Any]) -> bool:
+        if not super().is_available(ctx):
+            return False
+        scene_pc = ctx.get("scene_pc")
+        if scene_pc is None or scene_pc.numel() == 0:
+            return False
+        # Check pred_xyz has enough points (shape validation happens in compute)
+        pred_xyz = ctx.get("pred_xyz")
+        if pred_xyz is not None and pred_xyz.shape[1] < self.min_required_points:
+            return False
+        return True
+    
+    def compute(self, ctx: Dict[str, Any]) -> torch.Tensor:
+        pred_xyz = ctx["pred_xyz"]  # (B, N, 3)
+        scene_pc = ctx["scene_pc"]  # (B, P, 6) xyz + normal
+        denorm_fn = ctx.get("denorm_fn")
         
-        if not losses:
-            return torch.tensor(float('nan'), device=pred_w.device)
-        return torch.stack(losses).mean()
+        # Validate scene_pc shape
+        if scene_pc.shape[-1] < 6:
+            raise ValueError(
+                f"scene_pc must have shape (B, P, 6) with xyz and normals, "
+                f"got shape {scene_pc.shape}"
+            )
+        
+        # Validate pred_xyz has enough points for fingertip indices
+        if pred_xyz.shape[1] < self.min_required_points:
+            raise ValueError(
+                f"pred_xyz must have at least {self.min_required_points} points "
+                f"to access fingertip indices {self.fingertip_indices}, "
+                f"got shape {pred_xyz.shape}"
+            )
+        
+        # Transform to world space and scale to cm
+        pred_w = denorm_fn(pred_xyz) if denorm_fn else pred_xyz
+        scene_xyz = scene_pc[..., :3]
+        scene_w = denorm_fn(scene_xyz) if denorm_fn else scene_xyz
+        # Note: normals assumed to be in world space already (outward-pointing)
+        # If denorm_fn includes rotation, normals should be pre-rotated in data pipeline
+        scene_normals = scene_pc[..., 3:6]
+        
+        if self.scale != 1.0:
+            pred_w = pred_w * self.scale
+            scene_w = scene_w * self.scale
+        
+        B = pred_w.shape[0]
+        device = pred_xyz.device
+        dtype = pred_xyz.dtype
+        
+        total_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        num_valid = 0
+        
+        for i, finger_idx in enumerate(self.fingertip_indices):
+            name = self.FINGERTIP_NAMES[i] if i < len(self.FINGERTIP_NAMES) else f"finger_{i}"
+            min_d, max_d = self.fingertip_thresholds.get(name, (self.default_min_dist, self.default_max_dist))
+            
+            # Get fingertip point: (B, 3)
+            fingertip = pred_w[:, finger_idx, :]
+            
+            # Find nearest point using squared distances (avoid sqrt for argmin)
+            # fingertip: (B, 1, 3), scene_w: (B, P, 3)
+            diff = fingertip.unsqueeze(1) - scene_w  # (B, P, 3)
+            dists_sq = (diff * diff).sum(dim=-1)  # (B, P)
+            nearest_idx = dists_sq.argmin(dim=-1)  # (B,)
+            
+            # Gather nearest point and normal
+            batch_idx = torch.arange(B, device=device)
+            nearest_point = scene_w[batch_idx, nearest_idx]  # (B, 3)
+            nearest_normal = scene_normals[batch_idx, nearest_idx]  # (B, 3)
+            
+            # Normalize the normal vector (in case it's not unit length)
+            nearest_normal = F.normalize(nearest_normal, dim=-1, eps=1e-8)
+            
+            # Compute signed distance as projection onto surface normal
+            # This correctly measures penetration depth along the normal direction
+            # positive = outside (same direction as normal), negative = inside (penetrating)
+            to_fingertip = fingertip - nearest_point  # (B, 3)
+            signed_dist = (to_fingertip * nearest_normal).sum(dim=-1)  # (B,)
+            
+            # Compute penalty for out-of-range distances
+            # penalty_near: penalize if signed_dist < min_d (too close or penetrating)
+            # penalty_far: penalize if signed_dist > max_d (too far)
+            penalty_near = F.relu(min_d - signed_dist)  # (B,)
+            penalty_far = F.relu(signed_dist - max_d)  # (B,)
+            
+            # Combine penalties
+            if self.loss_type == "huber":
+                # Huber loss: linear for large deviations, quadratic for small
+                loss_near = F.smooth_l1_loss(penalty_near, torch.zeros_like(penalty_near), reduction='mean')
+                loss_far = F.smooth_l1_loss(penalty_far, torch.zeros_like(penalty_far), reduction='mean')
+            else:  # l2
+                loss_near = (penalty_near ** 2).mean()
+                loss_far = (penalty_far ** 2).mean()
+            
+            finger_loss = loss_near + loss_far
+            if torch.isfinite(finger_loss):
+                total_loss = total_loss + finger_loss
+                num_valid += 1
+        
+        if num_valid == 0:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+        
+        return total_loss / num_valid
+
+
+# =============================================================================
+# Section 5c: Active Points Repulsion Loss Component
+# =============================================================================
+
+class ActivePointsRepulsionLossComponent(LossComponent):
+    """Repulsion loss for active (non-fixed, non-fingertip) hand points.
+    
+    Penalizes active points that are too close to or penetrating the object surface.
+    Unlike FingertipContactLossComponent, this only pushes points away (no pull-in).
+    
+    For each active point:
+    1. Find the nearest point on object point cloud
+    2. Use surface normal to determine signed distance
+    3. Penalize if signed distance < min_dist (too close or penetrating)
+    
+    Signed distance convention (projection onto surface normal):
+        - Positive: point is outside the object surface
+        - Negative: point penetrates the object (inside)
+    
+    Note: scene_pc normals are assumed to be in world space and point outward.
+    
+    Computes in centimeter space for numerical stability.
+    """
+    
+    name = "active_points_repulsion"
+    
+    # Default fingertip indices to exclude
+    FINGERTIP_INDICES = [22, 9, 12, 15, 19]
+    
+    def __init__(
+        self,
+        min_dist: float = 0.6,
+        scale: float = 100.0,
+        loss_type: str = "huber",
+        exclude_fingertips: bool = True,
+        fingertip_indices: Optional[List[int]] = None,
+    ):
+        """
+        Args:
+            min_dist: minimum allowed distance in cm (closer triggers penalty)
+            scale: coordinate scale factor (100 = meters to cm)
+            loss_type: "huber" for smooth penalty, "l2" for squared penalty
+            exclude_fingertips: whether to exclude fingertip points (default True)
+            fingertip_indices: custom fingertip indices to exclude
+        """
+        self.min_dist = min_dist
+        self.scale = scale
+        self.loss_type = loss_type
+        self.exclude_fingertips = exclude_fingertips
+        
+        if fingertip_indices is not None:
+            self.fingertip_indices = set(fingertip_indices)
+        else:
+            self.fingertip_indices = set(self.FINGERTIP_INDICES)
+    
+    @property
+    def required_inputs(self) -> Set[str]:
+        return {"pred_xyz", "scene_pc"}
+    
+    def is_available(self, ctx: Dict[str, Any]) -> bool:
+        if not super().is_available(ctx):
+            return False
+        scene_pc = ctx.get("scene_pc")
+        return scene_pc is not None and scene_pc.numel() > 0
+    
+    def _get_active_indices(
+        self, 
+        num_points: int, 
+        fixed_point_mask: Optional[torch.Tensor],
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Get indices of active points (non-fixed, non-fingertip)."""
+        all_indices = set(range(num_points))
+        
+        # Exclude fixed points
+        if fixed_point_mask is not None:
+            fixed_indices = set(torch.nonzero(fixed_point_mask, as_tuple=False).squeeze(-1).tolist())
+            all_indices -= fixed_indices
+        
+        # Exclude fingertips
+        if self.exclude_fingertips:
+            all_indices -= self.fingertip_indices
+        
+        if not all_indices:
+            return torch.tensor([], dtype=torch.long, device=device)
+        
+        return torch.tensor(sorted(all_indices), dtype=torch.long, device=device)
+    
+    def compute(self, ctx: Dict[str, Any]) -> torch.Tensor:
+        pred_xyz = ctx["pred_xyz"]  # (B, N, 3)
+        scene_pc = ctx["scene_pc"]  # (B, P, 6) xyz + normal
+        denorm_fn = ctx.get("denorm_fn")
+        fixed_point_mask = ctx.get("fixed_point_mask")
+        
+        # Validate scene_pc shape
+        if scene_pc.shape[-1] < 6:
+            raise ValueError(
+                f"scene_pc must have shape (B, P, 6) with xyz and normals, "
+                f"got shape {scene_pc.shape}"
+            )
+        
+        B, N, _ = pred_xyz.shape
+        device = pred_xyz.device
+        dtype = pred_xyz.dtype
+        
+        # Get active point indices
+        active_indices = self._get_active_indices(N, fixed_point_mask, device)
+        
+        if active_indices.numel() == 0:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+        
+        # Transform to world space and scale to cm
+        pred_w = denorm_fn(pred_xyz) if denorm_fn else pred_xyz
+        scene_xyz = scene_pc[..., :3]
+        scene_w = denorm_fn(scene_xyz) if denorm_fn else scene_xyz
+        scene_normals = scene_pc[..., 3:6]
+        
+        if self.scale != 1.0:
+            pred_w = pred_w * self.scale
+            scene_w = scene_w * self.scale
+        
+        # Get active points: (B, A, 3) where A = num active points
+        active_points = pred_w[:, active_indices, :]  # (B, A, 3)
+        A = active_points.shape[1]
+        
+        # Find nearest scene point for each active point
+        # active_points: (B, A, 1, 3), scene_w: (B, 1, P, 3)
+        diff = active_points.unsqueeze(2) - scene_w.unsqueeze(1)  # (B, A, P, 3)
+        dists_sq = (diff * diff).sum(dim=-1)  # (B, A, P)
+        nearest_idx = dists_sq.argmin(dim=-1)  # (B, A)
+        
+        # Gather nearest points and normals
+        batch_idx = torch.arange(B, device=device).view(B, 1).expand(B, A)
+        nearest_points = scene_w[batch_idx, nearest_idx]  # (B, A, 3)
+        nearest_normals = scene_normals[batch_idx, nearest_idx]  # (B, A, 3)
+        
+        # Normalize normals
+        nearest_normals = F.normalize(nearest_normals, dim=-1, eps=1e-8)
+        
+        # Compute signed distance as projection onto surface normal
+        to_point = active_points - nearest_points  # (B, A, 3)
+        signed_dist = (to_point * nearest_normals).sum(dim=-1)  # (B, A)
+        
+        # Penalty: only penalize if signed_dist < min_dist (too close or penetrating)
+        # No penalty for being far away
+        penalty = F.relu(self.min_dist - signed_dist)  # (B, A)
+        
+        # Compute loss
+        if self.loss_type == "huber":
+            loss = F.smooth_l1_loss(penalty, torch.zeros_like(penalty), reduction='mean')
+        else:  # l2
+            loss = (penalty ** 2).mean()
+        
+        return loss if torch.isfinite(loss) else torch.tensor(0.0, device=device, dtype=dtype)
 
 
 # =============================================================================
@@ -555,6 +1022,8 @@ register_loss_component(BoneLossComponent())
 register_loss_component(FlowMatchingMSEComponent())
 register_loss_component(TangentRegularizationComponent())
 register_loss_component(CollisionLossComponent())
+register_loss_component(FingertipContactLossComponent())
+register_loss_component(ActivePointsRepulsionLossComponent())
 
 
 # =============================================================================
@@ -643,6 +1112,8 @@ class FlowMatchingLoss(nn.Module):
     """Flow Matching loss with structure-preserving tangent regularization.
     
     L_total = ||v_pred - v_target||^2 + lambda * ||(v_pred_rel . y_curr_rel)||^2
+    
+    Supports curriculum learning via LossScheduler for dynamic weight adjustment.
     """
     
     def __init__(
@@ -651,6 +1122,7 @@ class FlowMatchingLoss(nn.Module):
         lambda_tangent: float = 1.0,
         loss_clamp: float = 100.0,
         weights: Optional[Dict[str, float]] = None,
+        curriculum_config: Optional[Dict] = None,
     ) -> None:
         super().__init__()
         if edge_index.dim() != 2 or edge_index.size(0) != 2:
@@ -662,18 +1134,64 @@ class FlowMatchingLoss(nn.Module):
         self._weights = weights if weights else {"loss_fm": 1.0, "loss_tangent": float(lambda_tangent)}
         self.lambda_tangent = self._weights.get("loss_tangent", 0.0)
         
-        component_configs = {
+        self._component_configs = {
             "loss_fm": {"loss_clamp": loss_clamp},
             "loss_tangent": {"loss_clamp": loss_clamp},
         }
-        self._manager = LossManager(self._weights, component_configs)
+        
+        # Initialize curriculum scheduler
+        self.scheduler = self._init_scheduler(curriculum_config, weights)
+        self._current_epoch = 0
+        self._cached_manager: Optional[LossManager] = None
+        self._cached_weights: Optional[Dict[str, float]] = None
+        
+        logger.info(f"FlowMatchingLoss initialized: {self.scheduler}")
+    
+    def _init_scheduler(self, curriculum_config: Optional[Dict], weights: Optional[Dict[str, float]]) -> LossScheduler:
+        """Initialize loss scheduler for curriculum learning."""
+        cfg = curriculum_config or {}
+        
+        # Build default weights from FM defaults
+        default_weights = {"loss_fm": 1.0, "loss_tangent": self.lambda_tangent}
+        if weights:
+            default_weights.update({k: v for k, v in weights.items() if k in ("loss_fm", "loss_tangent")})
+        
+        return LossScheduler(
+            enabled=cfg.get("enabled", False),
+            stages=cfg.get("stages"),
+            warmup_epochs=cfg.get("warmup_epochs", 5),
+            default_weights=default_weights,
+            mode="flow_matching",
+        )
+    
+    def set_epoch(self, epoch: int) -> None:
+        """Update current epoch for curriculum scheduling."""
+        self._current_epoch = epoch
+        self.scheduler.set_epoch(epoch)
+        self._cached_manager = None
+        self._cached_weights = None
+    
+    def get_current_weights(self) -> Dict[str, float]:
+        """Get current loss weights (after curriculum adjustment)."""
+        return self.scheduler.get_weights()
+    
+    def _get_manager(self) -> LossManager:
+        """Get or create LossManager with current weights."""
+        current_weights = self.scheduler.get_weights()
+        # Only use flow matching weights for FlowMatchingLoss
+        fm_weights = {k: v for k, v in current_weights.items() if k in ("loss_fm", "loss_tangent")}
+        
+        if self._cached_manager is None or self._cached_weights != fm_weights:
+            self._cached_weights = fm_weights.copy()
+            self._cached_manager = LossManager(fm_weights, self._component_configs)
+        return self._cached_manager
 
     def forward(self, v_hat: torch.Tensor, v_star: torch.Tensor, y_tau: torch.Tensor) -> Dict[str, torch.Tensor]:
         if v_hat.shape != v_star.shape or v_hat.shape != y_tau.shape:
             raise ValueError(f"Shape mismatch: v_hat={v_hat.shape}, v_star={v_star.shape}, y_tau={y_tau.shape}")
         
         ctx = {"v_hat": v_hat, "v_star": v_star, "y_tau": y_tau, "edge_index": self.edge_index}
-        total, components = self._manager.compute_total(ctx)
+        total, components = self._get_manager().compute_total(ctx)
         return {"loss": total, **components}
 
 
@@ -726,17 +1244,29 @@ class DeterministicRegressionLoss(nn.Module):
             if sub.get("enabled", True):
                 configs[name] = {k: v for k, v in sub.items() if k not in ("enabled", "weight")}
         
-        # Collision config
+        # Collision config (analytical method, no mesh needed)
         configs["collision"] = {
             "margin": float(cfg.get("collision_margin", 0.2)),
             "capsule_radius": float(cfg.get("collision_capsule_radius", 0.8)),
-            "capsule_circle_segments": int(cfg.get("collision_capsule_circle_segments", 8)),
-            "capsule_cap_segments": int(cfg.get("collision_capsule_cap_segments", 2)),
             "scale": float(cfg.get("collision_scale", 100.0)),
+            "chunk_size": int(cfg.get("collision_chunk_size", 4096)),
         }
         max_pts = int(cfg.get("collision_max_scene_points", 0))
         if max_pts > 0:
             configs["collision"]["max_scene_points"] = max_pts
+        
+        # Fingertip contact config
+        configs["fingertip_contact"] = {
+            "min_dist": float(cfg.get("fingertip_contact_min_dist", 0.6)),
+            "max_dist": float(cfg.get("fingertip_contact_max_dist", 1.0)),
+            "scale": float(cfg.get("fingertip_contact_scale", 100.0)),
+        }
+        
+        # Active points repulsion config
+        configs["active_points_repulsion"] = {
+            "min_dist": float(cfg.get("active_points_repulsion_min_dist", 0.6)),
+            "scale": float(cfg.get("active_points_repulsion_scale", 100.0)),
+        }
         
         return configs
     
@@ -869,8 +1399,7 @@ class HandValidationMetricManager:
         self._recon_collision_margin = float(collision_cfg.get("margin", 0.2))  # cm
         self._recon_collision_capsule_radius = float(collision_cfg.get("capsule_radius", 0.8))  # cm
         self._recon_collision_max_scene_points = collision_cfg.get("max_scene_points", 2048)
-        self._recon_collision_circle_segments = int(collision_cfg.get("capsule_circle_segments", 8))
-        self._recon_collision_cap_segments = int(collision_cfg.get("capsule_cap_segments", 2))
+        self._recon_collision_chunk_size = int(collision_cfg.get("chunk_size", 4096))
         
         return weights, configs
 
@@ -945,14 +1474,13 @@ class HandValidationMetricManager:
         pred_cm = pred_xyz * self._recon_collision_scale
         scene_cm = scene_pc[..., :3] * self._recon_collision_scale  # Only xyz, ignore normals
         
-        # Use CollisionLossComponent logic
+        # Use CollisionLossComponent logic (analytical method)
         collision_component = CollisionLossComponent(
             margin=self._recon_collision_margin,
             capsule_radius=self._recon_collision_capsule_radius,
-            capsule_circle_segments=self._recon_collision_circle_segments,
-            capsule_cap_segments=self._recon_collision_cap_segments,
             max_scene_points=self._recon_collision_max_scene_points,
             scale=1.0,  # Already scaled to cm
+            chunk_size=self._recon_collision_chunk_size,
         )
         
         # Build context for collision computation

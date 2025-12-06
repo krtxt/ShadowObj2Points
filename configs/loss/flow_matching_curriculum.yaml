@@ -1,0 +1,224 @@
+# =============================================================================
+# Flow Matching Curriculum Learning Loss Configuration
+# =============================================================================
+#
+# This config enables multi-stage curriculum learning for FlowMatchingHandDiT.
+# 
+# LOSS HIERARCHY:
+# ---------------
+# Total Loss = (loss_fm * w_fm + loss_tangent * w_tangent) 
+#            + lambda_regression * (l1 * w_l1 + chamfer * w_chamfer + ...
+#                                  + collision * w_collision
+#                                  + fingertip_contact * w_fingertip_contact
+#                                  + active_points_repulsion * w_active_points_repulsion)
+#
+# TRAINING STRATEGY:
+# ------------------
+# Stage 1 (flow_learning): Learn velocity field with basic position constraints
+#   - Focus on loss_fm to learn the flow matching objective
+#   - Add l1 and chamfer for basic position guidance
+#   - Light collision to prevent gross penetrations early
+#
+# Stage 2 (reconstruction): Refine hand shape with structural constraints  
+#   - Reduce flow constraints as model has learned the basic flow
+#   - Increase reconstruction constraints (l1, chamfer, direction, edge_len)
+#   - Gradually increase collision penalty
+#
+# Stage 3 (physics): Focus on physical plausibility
+#   - Maintain moderate flow constraints for fine-tuning
+#   - Reduce reconstruction weight (already learned)
+#   - Heavy collision penalty for penetration-free grasps
+#
+# NOTES:
+# ------
+# - Requires prediction_target="x" in model config for regression losses
+# - Normalized space: l1, chamfer, direction, edge_len, bone
+# - Centimeter/world space: collision, fingertip_contact, active_points_repulsion (needs normals)
+# =============================================================================
+
+# =============================================================================
+# Flow Matching Loss Weights (non-curriculum defaults)
+# =============================================================================
+weights:
+  loss_fm: 1.0        # MSE between predicted and target velocity
+  loss_tangent: 1.0   # Tangent regularization for rigid body constraint
+
+# Legacy alias (backwards compatible)
+lambda_tangent: 1.0
+
+# =============================================================================
+# Curriculum Learning Configuration
+# =============================================================================
+curriculum:
+  enabled: true
+  warmup_epochs: 5    # Smooth transition epochs between stages
+
+  stages:
+    # Stage 1: Learn flow matching velocity prediction
+    # Focus: loss_fm is the primary signal; add light regression for position guidance
+    - name: flow_learning
+      epochs: [0, 150]
+      weights:
+        # Flow matching (high weight - primary learning objective)
+        loss_fm: 1.0
+        loss_tangent: 0.2         # Light tangent constraint initially
+        # Regression multiplier (low - just for guidance)
+        lambda_regression: 0.05
+        # Regression components
+        l1: 2.0                   # Position guidance
+        chamfer: 1.0              # Shape distribution
+        direction: 0.0            # Skip initially
+        edge_len: 0.0             # Skip initially
+        bone: 0.0                 # Skip
+        collision: 0.01            # Light collision to prevent gross errors
+        fingertip_contact: 0.01    # Disabled initially
+        active_points_repulsion: 0.01 # Disabled initially
+
+    # Stage 2: 
+    # Focus: 
+    - name: pull
+      epochs: [150, 200]
+      weights:
+        # Flow matching (reduced - model has learned basic flow)
+        loss_fm: 0.8
+        loss_tangent: 0.2         # Moderate tangent for structure
+        # Regression multiplier (increased)
+        lambda_regression: 1.0
+        # Regression components
+        l1: 0.5                   # Reduced from initial
+        chamfer: 0.5              # Reduced
+        direction: 0.0            # Add direction constraint
+        edge_len: 0.0             # Add edge length constraint
+        bone: 0.0                 # Still skip bone
+        collision: 1.0            # Increased collision
+        fingertip_contact: 1000.0    # Disabled
+        active_points_repulsion: 1.0  # Disabled
+
+    # Stage 3: 
+    # Focus: 
+    - name: push
+      epochs: [200, null]          # null means until end of training
+      weights:
+        # Flow matching (moderate - maintain flow quality)
+        loss_fm: 0.8
+        loss_tangent: 0.2
+        # Regression multiplier (high for collision focus)
+        lambda_regression: 1.0
+        # Regression components (reduced recon, high collision)
+        l1: 1.0                   # Reduced
+        chamfer: 0.5              # Reduced
+        direction: 0.0            # Maintain
+        edge_len: 0.0             # Maintain
+        bone: 0.0                 # Still skip
+        collision: 1000.0            # Heavy collision penalty
+        fingertip_contact: 1.0    # Disabled
+        active_points_repulsion: 1000.0  # Disabled
+
+# =============================================================================
+# Direct Regression Loss Configuration
+# =============================================================================
+# This section configures regression loss components used when lambda_regression > 0
+lambda_regression: 0.0  # Default (overridden by curriculum)
+
+regression:
+  recon:
+    enabled: true
+    l1:
+      enabled: true
+    chamfer:
+      enabled: true
+      use_pytorch3d: true
+    direction:
+      enabled: true
+      mode: cos
+      eps: 1.0e-6
+    edge_len:
+      enabled: true
+      eps: 1.0e-6
+  
+  weights:
+    l1: 2.0
+    chamfer: 1.0
+    direction: 0.0
+    edge_len: 0.0
+    bone: 0.0
+    collision: 0.5
+    fingertip_contact: 0.0
+    active_points_repulsion: 0.0
+
+# =============================================================================
+# Collision Loss Hyperparameters
+# =============================================================================
+collision_scale: 100.0            # Scale factor: meters -> centimeters
+collision_margin: 0.1             # Minimum clearance distance (cm) = 2mm
+collision_capsule_radius: 0.8     # Finger capsule radius (cm) = 8mm
+collision_max_scene_points: 1024  # Max scene points for collision check
+collision_chunk_size: 4096        # Points per chunk for memory efficiency
+
+# =============================================================================
+# Fingertip Contact Loss Hyperparameters
+# =============================================================================
+fingertip_contact_scale: 100.0    # Scale factor: meters -> centimeters
+fingertip_contact_min_dist: 0.6   # Min allowed distance (cm) - closer triggers penalty
+fingertip_contact_max_dist: 1.0   # Max allowed distance (cm) - farther triggers penalty
+
+# =============================================================================
+# Active Points Repulsion Loss Hyperparameters
+# =============================================================================
+active_points_repulsion_scale: 100.0    # Scale factor: meters -> centimeters
+active_points_repulsion_min_dist: 0.6   # Min allowed distance (cm) - closer triggers penalty
+
+# =============================================================================
+# Sampling Frequency Configuration
+# =============================================================================
+train_num_sample_batches_for_reg_loss: 50
+val_num_sample_batches: 25
+
+# =============================================================================
+# Validation Metrics Configuration
+# =============================================================================
+val_metrics:
+  flow:
+    enabled: true
+    weights:
+      loss: 1.0
+      loss_fm: 1.0
+      loss_tangent: 0.0
+      edge_len_err: 0.0
+    
+    trajectory_metrics: true
+    trajectory_num_sample_batches: 10
+    trajectory:
+      plr:
+        enabled: true
+      transport_cost:
+        enabled: true
+      velocity_consistency:
+        enabled: true
+  
+  recon:
+    enabled: true
+    scale_factor: 100.0
+    l1:
+      enabled: true
+      weight: 1.0
+    chamfer:
+      enabled: true
+      weight: 1.0
+      use_pytorch3d: true
+    direction:
+      enabled: true
+      weight: 1.0
+      mode: cos
+      eps: 1.0e-6
+    edge_len:
+      enabled: true
+      weight: 1.0
+      eps: 1.0e-6
+    collision:
+      enabled: true
+      scale: 100.0
+      margin: 0.2
+      capsule_radius: 0.8
+      max_scene_points: 2048
+      chunk_size: 4096

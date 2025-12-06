@@ -92,14 +92,14 @@ recon:
 # =============================================================================
 # Collision Loss Hyperparameters
 # =============================================================================
+# Uses analytical point-to-capsule distance (no mesh SDF).
 # Computed in CENTIMETER space (denorm * scale) for numerical stability.
 # All distance parameters should be in centimeters.
 collision_scale: 100.0            # Scale factor: meters -> centimeters
 collision_margin: 0.2             # Minimum clearance distance (cm) = 2mm
 collision_capsule_radius: 0.8     # Finger capsule radius (cm) = 8mm
 collision_max_scene_points: 2048  # Max scene points for collision check
-collision_capsule_circle_segments: 8
-collision_capsule_cap_segments: 3
+collision_chunk_size: 4096        # Points per chunk for memory efficiency
 
 # =============================================================================
 # Validation Metrics (independent of training loss)

@@ -696,7 +696,9 @@ class HandModel:
             dis_local, dis_signs, _, _ = compute_sdf(obj_flat, hand_face_verts)
             
             dis_local = torch.sqrt(dis_local + 1e-8)
-            pen = dis_local * (-dis_signs)
+            # Note: compute_sdf returns dist_sign=-1 for outside, +1 for inside
+            # We want pen > 0 for inside (penetration), so use dis_signs directly
+            pen = dis_local * dis_signs
             penetrations.append(pen.reshape(obj_pcd.shape[0], obj_pcd.shape[1]))
 
         if not penetrations:

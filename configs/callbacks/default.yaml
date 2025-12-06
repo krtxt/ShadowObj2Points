@@ -33,20 +33,35 @@ model_summary:
   max_depth: 2
 
 # Progress Bar
+# rich_progress_bar:
+#   _target_: lightning.pytorch.callbacks.RichProgressBar
+#   leave: true
+#   refresh_rate: 1
+#   # theme:
+#   #   _target_: lightning.pytorch.callbacks.progress.rich_progress.RichProgressBarTheme
+#   #   description: "bold italic #FF00FF"
+#   #   progress_bar: "#6A0DAD"
+#   #   progress_bar_finished: "#FF0000"
+#   #   progress_bar_pulse: "#00FF00"
+#   #   batch_progress: "bold #FF00FF"
+#   #   time: "#9370DB"
+#   #   processing_speed: "#00FFFF"
+#   #   metrics: "bold #FFA500"
+#   theme:
+#     _target_: lightning.pytorch.callbacks.progress.rich_progress.RichProgressBarTheme
+#     description: "bold italic #4C8DF6"
+#     progress_bar: "#2f519f"
+#     progress_bar_finished: "#153e79"
+#     progress_bar_pulse: "#61aede"
+#     batch_progress: "bold #88c6eb"
+#     time: "#124999"
+#     processing_speed: "#3499ce"
+#     metrics: "bold #c9e7f2"
 rich_progress_bar:
-  _target_: lightning.pytorch.callbacks.RichProgressBar
+  _target_: src.callbacks.spinner_progress_bar.SpinnerRichProgressBar
+  spinner_speed: 15.0
   leave: true
   refresh_rate: 1
-  # theme:
-  #   _target_: lightning.pytorch.callbacks.progress.rich_progress.RichProgressBarTheme
-  #   description: "bold italic #FF00FF"
-  #   progress_bar: "#6A0DAD"
-  #   progress_bar_finished: "#FF0000"
-  #   progress_bar_pulse: "#00FF00"
-  #   batch_progress: "bold #FF00FF"
-  #   time: "#9370DB"
-  #   processing_speed: "#00FFFF"
-  #   metrics: "bold #FFA500"
   theme:
     _target_: lightning.pytorch.callbacks.progress.rich_progress.RichProgressBarTheme
     description: "bold italic #4C8DF6"
@@ -57,6 +72,7 @@ rich_progress_bar:
     time: "#124999"
     processing_speed: "#3499ce"
     metrics: "bold #c9e7f2"
+
 
 # Image Logger
 # image_logger:

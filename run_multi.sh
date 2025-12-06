@@ -20,8 +20,8 @@ export TORCH_NCCL_BLOCKING_WAIT=0
 # NCCL_BLOCKING_WAIT=1   0,1,2,3,
 
 # export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-# export CUDA_VISIBLE_DEVICES=4,5,6,7
-export CUDA_VISIBLE_DEVICES=1,2,3,4
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+# export CUDA_VISIBLE_DEVICES=1,2,3,4
 
 
 # # 运行训练
@@ -116,7 +116,6 @@ python train.py \
     backbone=ptv3_sparse_fourier \
     datamodule=handencoder_dm_dex \
     datamodule.use_scene_normals=true \
-    experiments=multi_gpu \
     optimizer.lr=2e-4 \
     compile=true \
     experiment_name=exp_1205_full_fm_direct_free_pred_x \
@@ -130,8 +129,11 @@ python train.py \
     velocity_strategy=direct_free \
     datamodule.num_workers=16 \
     datamodule.prefetch_factor=1 \
-    datamodule.persistent_workers=false 
-
+    datamodule.persistent_workers=false \
+    resume_run_dir=outputs/exp_1205_full_fm_direct_free_pred_x/2025-12-06_03-45-03 \
+    trainer.devices=4 \
+    resume_in_place=false
+    # experiments=multi_gpu \
 
 # python train.py \
 #     model=deterministic_hand_dit \
@@ -172,7 +174,7 @@ python train.py \
 #   datamodule.num_workers=16 datamodule.prefetch_factor=2 datamodule.persistent_workers=false
 
 # python train.py \
-#     resume_run_dir=outputs/exp_1129_fm_rigid_full/2025-11-29_21-34-47 \
+#     resume_run_dir=outputs/exp_1205_full_fm_direct_free_pred_x/2025-12-06_03-45-03 \
 #     trainer.devices=4 \
 #     datamodule.num_workers=16 datamodule.prefetch_factor=2 datamodule.persistent_workers=false \
-#     resume_in_place=false
+#     resume_in_place=true
